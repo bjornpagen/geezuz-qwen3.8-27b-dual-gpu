@@ -437,6 +437,11 @@ boundary.
     input render as the template's preserved thinking.
   - a custom tool reaches the model as a template tool with one string parameter, `input`, whose value the tool's
     grammar (lark or regex) or free text constrains; the call comes back as a `custom_tool_call` item.
+  - owner decisions on the audit (docs/API.md): a continuation (`previous_response_id`) must keep the stored
+    response's instructions, else a named 400, so it always takes the fast path; stream obfuscation is never
+    emitted, and a request asking for it (`include_obfuscation: true`) is refused; stored responses live in memory,
+    bounded and evicted lru (lost on restart; disk is experiment 2.9); `reasoning.effort` honours exactly the
+    template's levels (`none` = thinking off, `low`, `medium`, `xhigh`) and refuses the rest by name.
   - `/v1/models`, `/health`, `/status`, plus `X-Request-Id` tagging.
 
 ## 1.4b constrained decoding (every request, owner decision)
