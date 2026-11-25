@@ -19,26 +19,36 @@ import :decode_input;
 
 namespace engine::json {
 
-/** `reasoning.effort`: the template's four settings; the sdk's other efforts are refused by name. */
+struct EffortName {
+	std::string_view name;
+	Effort effort;
+};
+
+/** The template's efforts by their sdk names: what a request may ask for, and what a refusal lists. */
+inline constexpr auto served_efforts = std::to_array<EffortName>({
+    {.name = "none", .effort = Effort::None},
+    {.name = "low", .effort = Effort::Low},
+    {.name = "medium", .effort = Effort::Medium},
+    {.name = "xhigh", .effort = Effort::XHigh},
+});
+
+/** The sdk's efforts the template does not have. */
+inline constexpr auto unserved_efforts = std::to_array<std::string_view>({"minimal", "high", "max"});
+
+/** `reasoning.effort`: the template's four settings; the sdk's other efforts are refused by name, listing the four. */
 [[nodiscard]] auto effort(Body& value) -> Decoded<Effort> {
 	auto const read = text(value);
 	if (!read) {
 		return std::unexpected(read.error());
 	}
-	if (*read == "none") {
-		return Effort::None;
+	if (auto const served = std::ranges::find(served_efforts, *read, &EffortName::name); served != served_efforts.end()) {
+		return served->effort;
 	}
-	if (*read == "low") {
-		return Effort::Low;
-	}
-	if (*read == "medium") {
-		return Effort::Medium;
-	}
-	if (*read == "xhigh") {
-		return Effort::XHigh;
-	}
-	if (*read == "minimal" || *read == "high" || *read == "max") {
-		return refuse(Violation::Unsupported);
+	if (std::ranges::contains(unserved_efforts, *read)) {
+		return refuse(UnsupportedValue{
+		    .supported = served_efforts | std::views::transform([](EffortName const& named) { return std::string{named.name}; }) |
+		                 std::ranges::to<std::vector<std::string>>(),
+		});
 	}
 	return refuse(Violation::UnknownValue);
 }

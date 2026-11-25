@@ -318,8 +318,18 @@ auto put_usage(Members<O>& members, Usage const& usage) -> void {
 	});
 }
 
+/**
+ * Why a response being streamed failed: the sdk's `ResponseError`, whose `code` is one of the sdk's error codes. Only
+ * the `response.failed` event writes one; a failed response is never stored or answered whole.
+ */
+export struct Failure {
+	std::string_view code;
+	std::string_view message;
+};
+
+/** Writes `response`, as its own status has it, or as failed when `failure` is present. */
 template<Sink O>
-auto put_response(Members<O>& members, Response const& response) -> void {
+auto put_response(Members<O>& members, Response const& response, std::optional<Failure> failure) -> void {
 	members.string("id", response.id);
 	members.string("object", "response");
 	members.integer("created_at", response.created_at);
@@ -328,9 +338,17 @@ auto put_response(Members<O>& members, Response const& response) -> void {
 	} else {
 		members.null("completed_at");
 	}
-	members.string("status", spelling(response.status));
-	members.null("error");
-	if (response.status == ResponseStatus::Incomplete) {
+	if (failure) {
+		members.string("status", "failed");
+		members.object("error", [&failure](Members<O>& error) {
+			error.string("code", failure->code);
+			error.string("message", failure->message);
+		});
+	} else {
+		members.string("status", spelling(response.status));
+		members.null("error");
+	}
+	if (!failure && response.status == ResponseStatus::Incomplete) {
 		members.object("incomplete_details", [](Members<O>& details) { details.string("reason", "max_output_tokens"); });
 	} else {
 		members.null("incomplete_details");
@@ -389,12 +407,12 @@ auto put_response(Members<O>& members, Response const& response) -> void {
 
 /** Appends a whole response's JSON. */
 export [[nodiscard]] auto append(Buffer& buffer, Response const& response) -> core::Result<void, Overflow> {
-	return buffer.append([&response](auto& out) { write_object(out, [&response](auto& members) { put_response(members, response); }); });
+	return buffer.append([&response](auto& out) { write_object(out, [&response](auto& members) { put_response(members, response, std::nullopt); }); });
 }
 
 /** A whole response's JSON, in a string of exactly its size. */
 export [[nodiscard]] auto encode(Response const& response) -> std::string {
-	return encode([&response](auto& out) { write_object(out, [&response](auto& members) { put_response(members, response); }); });
+	return encode([&response](auto& out) { write_object(out, [&response](auto& members) { put_response(members, response, std::nullopt); }); });
 }
 
 export enum class Lifecycle : std::uint8_t {
@@ -408,6 +426,12 @@ export enum class Lifecycle : std::uint8_t {
 export struct ResponseEvent {
 	Lifecycle lifecycle;
 	Response const& response;
+};
+
+/** `response.failed`: the response as it stood when the engine behind it failed, with why. */
+export struct FailedEvent {
+	Response const& response;
+	Failure failure;
 };
 
 /** `response.output_item.added`: the item at `output_index`, before any of its content. */
@@ -475,7 +499,7 @@ export struct ErrorEvent {
 };
 
 /** One event of a streamed response. Its members are views, alive for the one call that writes it. */
-export using StreamEvent = std::variant<ResponseEvent, ItemAdded, ItemDone, PartAdded, PartDone, TextDelta, TextDone, ErrorEvent>;
+export using StreamEvent = std::variant<ResponseEvent, FailedEvent, ItemAdded, ItemDone, PartAdded, PartDone, TextDelta, TextDone, ErrorEvent>;
 
 [[nodiscard]] constexpr auto event_type(Lifecycle lifecycle) -> std::string_view {
 	switch (lifecycle) {
@@ -559,7 +583,12 @@ struct WriteEvent {
 
 	auto operator()(ResponseEvent const& event) const -> void {
 		members.string("type", event_type(event.lifecycle));
-		members.object("response", [&event](Members<O>& response) { put_response(response, event.response); });
+		members.object("response", [&event](Members<O>& response) { put_response(response, event.response, std::nullopt); });
+	}
+
+	auto operator()(FailedEvent const& event) const -> void {
+		members.string("type", "response.failed");
+		members.object("response", [&event](Members<O>& response) { put_response(response, event.response, event.failure); });
 	}
 
 	auto operator()(ItemAdded const& event) const -> void {

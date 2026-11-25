@@ -649,6 +649,8 @@ struct Refusal {
 	using P = json::PathStep;
 	auto const parse = [](json::ParseFault fault) { return json::DecodeFault{json::ParseError{.fault = fault}}; };
 	auto const zero = P{std::size_t{0}};
+	// The sdk's efforts the template lacks are refused listing the template's own, as the owner decided.
+	auto const served_efforts = json::DecodeFault{json::UnsupportedValue{.supported = {"none", "low", "medium", "xhigh"}}};
 	auto many_pairs = std::string{};
 	for (auto index = std::size_t{0}; index <= json::max_metadata_pairs; ++index) {
 		many_pairs += std::format(R"({}"k{}":"v")", index == 0 ? "" : ",", index);
@@ -669,9 +671,9 @@ struct Refusal {
 	    {.body = with(R"("user":"u")"), .error = at(Violation::Deprecated, {P{"user"}})},
 	    {.body = with(R"("prompt_cache_retention":"24h")"), .error = at(Violation::Deprecated, {P{"prompt_cache_retention"}})},
 	    {.body = with(R"("reasoning":{"generate_summary":"auto"})"), .error = at(Violation::Deprecated, {P{"reasoning"}, P{"generate_summary"}})},
-	    {.body = with(R"("reasoning":{"effort":"high"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"effort"}})},
-	    {.body = with(R"("reasoning":{"effort":"minimal"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"effort"}})},
-	    {.body = with(R"("reasoning":{"effort":"max"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"effort"}})},
+	    {.body = with(R"("reasoning":{"effort":"high"})"), .error = at(served_efforts, {P{"reasoning"}, P{"effort"}})},
+	    {.body = with(R"("reasoning":{"effort":"minimal"})"), .error = at(served_efforts, {P{"reasoning"}, P{"effort"}})},
+	    {.body = with(R"("reasoning":{"effort":"max"})"), .error = at(served_efforts, {P{"reasoning"}, P{"effort"}})},
 	    {.body = with(R"("reasoning":{"effort":"turbo"})"), .error = at(Violation::UnknownValue, {P{"reasoning"}, P{"effort"}})},
 	    {.body = with(R"("reasoning":{"summary":"auto"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"summary"}})},
 	    {.body = with(R"("reasoning":{"context":"current_turn"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"context"}})},

@@ -68,7 +68,17 @@ export struct TooLong {
 	[[nodiscard]] auto operator==(TooLong const&) const -> bool = default;
 };
 
-export using DecodeFault = std::variant<ParseError, Violation, WrongShape, Conflict, TooMany, TooLong>;
+/**
+ * The member holds a value of the api's vocabulary that the engine does not serve; it serves exactly `supported`, so
+ * the refusal can name them.
+ */
+export struct UnsupportedValue {
+	std::vector<std::string> supported;
+
+	[[nodiscard]] auto operator==(UnsupportedValue const&) const -> bool = default;
+};
+
+export using DecodeFault = std::variant<ParseError, Violation, WrongShape, Conflict, TooMany, TooLong, UnsupportedValue>;
 
 /** A member name or an array index on the way from the request to the refused member. */
 export using PathStep = std::variant<std::string, std::size_t>;
@@ -164,6 +174,13 @@ export [[nodiscard]] auto describe(DecodeError const& error) -> std::string {
 	}
 	if (std::holds_alternative<TooMany>(fault)) {
 		return std::format("{} holds more than {} items", subject, std::get<TooMany>(fault).limit);
+	}
+	if (std::holds_alternative<UnsupportedValue>(fault)) {
+		auto listed = std::string{};
+		for (auto const& value : std::get<UnsupportedValue>(fault).supported) {
+			listed += std::format("{}'{}'", listed.empty() ? "" : ", ", value);
+		}
+		return std::format("{} is not supported with this value; the supported values are {}", subject, listed);
 	}
 	return std::format("{} is longer than {} bytes", subject, std::get<TooLong>(fault).limit);
 }

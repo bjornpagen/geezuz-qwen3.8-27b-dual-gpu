@@ -509,12 +509,30 @@ enum class Shown : std::uint8_t {
 		auto const item_id = "item_" + std::to_string(rng());
 		auto const piece = model::random_text(rng, 30);
 		auto holds = true;
-		switch (rng() % 8) {
+		switch (rng() % 9) {
 		case 0: {
 			auto const response = random_response(rng, *scratch);
 			auto const which = rng() % lifecycles.size();
 			holds = event_agrees(*reader, json::ResponseEvent{.lifecycle = lifecycles[which], .response = response}, sequence,
 			                     object({{"type", text(lifecycle_types[which])}, {"response", response_fixture(response, *reader)}, {"sequence_number", integer(sequence)}}), rng);
+			break;
+		}
+		case 8: {
+			// A failed response is the documented response with the failed status, its error, and no incomplete details.
+			auto const response = random_response(rng, *scratch);
+			auto const code = model::random_text(rng, 10);
+			auto fixture = response_fixture(response, *reader);
+			for (auto& [name, member] : std::get<model::Members>(fixture.value)) {
+				if (name == "status") {
+					member = text("failed");
+				} else if (name == "error") {
+					member = object({{"code", text(code)}, {"message", text(piece)}});
+				} else if (name == "incomplete_details") {
+					member = null();
+				}
+			}
+			holds = event_agrees(*reader, json::FailedEvent{.response = response, .failure = {.code = code, .message = piece}}, sequence,
+			                     object({{"type", text("response.failed")}, {"response", std::move(fixture)}, {"sequence_number", integer(sequence)}}), rng);
 			break;
 		}
 		case 1: {
