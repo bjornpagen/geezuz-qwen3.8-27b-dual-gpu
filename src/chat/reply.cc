@@ -352,8 +352,9 @@ auto Parser::make(json::ChatRequest const& request) -> core::Result<Parser, json
 	auto signatures = std::vector<Signature>{};
 	for (auto const& tool : request.tools) {
 		auto signature = Signature{.name = tool.name, .parameters = {}};
-		if (tool.parameters) {
-			auto const schema = load(*reader, tool.parameters->text());
+		auto const function = core::alternative<json::FunctionTool>(tool.input);
+		if (function && function->parameters) {
+			auto const schema = load(*reader, function->parameters->text());
 			if (!schema) {
 				return std::unexpected(schema.error());
 			}

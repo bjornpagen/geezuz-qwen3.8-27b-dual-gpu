@@ -145,7 +145,7 @@ enum class Client : std::uint8_t {
 		auto const name = client(text(rng));
 		auto const definition =
 		    std::format(R"({{"type":"function","function":{{"name":"{}","description":"{}"}}}})", name, client(text(rng)));
-		request.tools.push_back(json::Tool{.name = name, .parameters = std::nullopt, .definition = json_text(reader, definition)});
+		request.tools.push_back(json::Tool{.name = name, .input = json::FunctionTool{.parameters = std::nullopt}, .definition = json_text(reader, definition)});
 	}
 	if (roll(2) == 0) {
 		request.messages.emplace_back(json::SystemMessage{.content = client(text(rng))});
