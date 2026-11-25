@@ -10,6 +10,7 @@
 #include "gemv/selfcheck.h"
 #include "prims/budget.h"
 #include "prims/selfcheck.h"
+#include "prims/selfcheck_record.h"
 #include "prims/shared.h"
 #include "prims/sync.h"
 #include "prims/thread.h"
@@ -20,6 +21,8 @@ using Producer = prims::Warps<0, 1>;
 using Consumers = prims::Warps<1, consumer_warps>;
 using Idle = prims::Warps<1 + consumer_warps, selfcheck::threads / 32 - 1 - consumer_warps>;
 using ConsumerBarrier = prims::NamedBarrier<1, consumer_warps>;
+using prims::selfcheck::pointer;
+using prims::selfcheck::record;
 
 /** The registers each thread of a one-block-per-SM kernel of `selfcheck::threads` may use. */
 inline constexpr int registers =
@@ -125,13 +128,6 @@ __attribute__((device, always_inline)) inline void run_gemm(prefill::Operands co
 	}
 }
 
-/** A device address the host passed as an integer, as the typed pointer it is. */
-template<class T>
-[[nodiscard]] __attribute__((device, always_inline)) inline auto pointer(selfcheck::Address address) -> T* {
-	/* SAFETY: the host fills every parameter with the device address of a buffer of exactly this element type. */
-	return __builtin_bit_cast(T*, address);
-}
-
 /** The gemv inputs a self-check or stream kernel's parameters name. */
 template<class Params>
 [[nodiscard]] __attribute__((device, always_inline)) inline auto gemv_inputs(Params const& params, selfcheck::Address gate_scales,
@@ -144,19 +140,6 @@ template<class Params>
 	    .fixups = pointer<float>(params.fixups),
 	    .fixup_flags = pointer<unsigned long long>(params.fixup_flags),
 	};
-}
-
-/** Counts one comparison into `report`, keeping the first mismatches verbatim. */
-__attribute__((device, always_inline)) inline void record(prims::selfcheck::Report* report, bool agrees,
-                                                          prims::selfcheck::Mismatch mismatch) {
-	using namespace engine::device::prims;
-	count(&report->checked, 1U);
-	if (!agrees) {
-		unsigned const slot = fetch_add(&report->mismatched, 1U);
-		if (slot < prims::selfcheck::kept_mismatches) {
-			report->first[slot] = mismatch;
-		}
-	}
 }
 
 }

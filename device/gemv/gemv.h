@@ -483,7 +483,7 @@ __attribute__((device, always_inline)) inline void product_pairs(prims::Accumula
 	float product[4] = {};
 #pragma unroll
 	for (int reg = 0; reg < 4; ++reg) {
-		product[reg] = math::silu(gate.reg[reg]) * up.reg[reg];
+		product[reg] = model::mlp_product(gate.reg[reg], up.reg[reg]);
 	}
 	// Registers: 0 (g, 2t), 1 (g, 2t + 1), 2 (g + 8, 2t), 3 (g + 8, 2t + 1).
 #pragma unroll

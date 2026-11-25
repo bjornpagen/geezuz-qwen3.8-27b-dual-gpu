@@ -462,7 +462,7 @@ export [[nodiscard]] auto product(Problem const& problem, std::span<float const>
 		for (auto output = std::size_t{0}; output < width; ++output) {
 			auto const gate = rows[row * width + output];
 			auto const up = rows[(count_rows + row) * width + output];
-			auto const bits = std::uint32_t{prims::round_to_bf16(prims::math::silu(gate) * up).bits};
+			auto const bits = std::uint32_t{prims::round_to_bf16(model::mlp_product(gate, up)).bits};
 			words.at((row * width + output) / 2) |= bits << (16U * static_cast<std::uint32_t>(output % 2));
 		}
 	}
@@ -479,8 +479,8 @@ export struct ResidualUpdate {
 
 /**
  * What `add_to_residual` leaves, run on every output tile of the hidden state: residual + (own + peer) per element,
- * and per tile and row the squares in lanes of 128 (lane l folds outputs 4l .. 4l + 3 by fma from +0, ascending),
- * met in the butterfly at distance 16, 8, 4, 2, 1. `own` and `peer` are [tile][row][128].
+ * and per tile and row the squares under `model::hidden_tile` (lane l folds outputs 4l .. 4l + 3 by fma from +0,
+ * ascending, then the butterfly at distance 16, 8, 4, 2, 1). `own` and `peer` are [tile][row][128].
  */
 export [[nodiscard]] auto residual_update(std::span<float const> own, std::span<float const> peer, std::span<float const> residual,
                                           int rows) -> ResidualUpdate {
@@ -492,26 +492,13 @@ export [[nodiscard]] auto residual_update(std::span<float const> own, std::span<
 	    ResidualUpdate{.residual = std::vector<float>(residual.begin(), residual.end()), .squares = std::vector<float>(tiles * count_rows)};
 	for (auto tile = std::size_t{0}; tile < tiles; ++tile) {
 		for (auto row = std::size_t{0}; row < count_rows; ++row) {
-			auto lanes = std::array<float, 32>{};
-			for (auto lane = std::size_t{0}; lane < 32; ++lane) {
-				auto sum = 0.0F;
-				for (auto word = std::size_t{0}; word < 4; ++word) {
-					auto const output = 4 * lane + word;
-					auto const from = (tile * count_rows + row) * width + output;
-					auto& value = update.residual.at(row * hidden + tile * width + output);
-					value = value + (own[from] + peer[from]);
-					sum = prims::math::fma(value, value, sum);
-				}
-				lanes.at(lane) = sum;
+			for (auto output = std::size_t{0}; output < width; ++output) {
+				auto const from = (tile * count_rows + row) * width + output;
+				auto& value = update.residual.at(row * hidden + tile * width + output);
+				value = value + (own[from] + peer[from]);
 			}
-			for (auto distance = std::size_t{16}; distance != 0; distance /= 2) {
-				auto next = lanes;
-				for (auto lane = std::size_t{0}; lane < 32; ++lane) {
-					next.at(lane) = lanes.at(lane) + lanes.at(lane ^ distance);
-				}
-				lanes = next;
-			}
-			update.squares.at(tile * count_rows + row) = lanes.front();
+			auto const updated = std::span{update.residual}.subspan(row * hidden, hidden);
+			update.squares.at(tile * count_rows + row) = model::lane_sum<model::hidden_tile>(updated, updated, tile * width);
 		}
 	}
 	return update;
