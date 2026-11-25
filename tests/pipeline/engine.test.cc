@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.grammar;
 import engine.http;
 import engine.kv;
 import engine.model;
@@ -17,6 +18,7 @@ namespace {
 
 namespace device = engine::device;
 namespace fake = engine::driver_double;
+namespace grammar = engine::grammar;
 namespace http = engine::http;
 namespace kv = engine::kv;
 namespace model = engine::model;
@@ -47,7 +49,7 @@ struct Job {
 
 [[nodiscard]] auto terminal(Output const& output) -> bool {
 	return std::holds_alternative<doubles::Ended>(output) || std::holds_alternative<doubles::Refused>(output) ||
-	       std::holds_alternative<doubles::Cancelled>(output);
+	       std::holds_alternative<doubles::Cancelled>(output) || std::holds_alternative<doubles::Overran>(output);
 }
 
 /** Whether the test drains the server's mailbox when the cards break down, or the server is behind then. */
@@ -66,16 +68,16 @@ struct Fault {
  * The engine on its own thread over the doubles, and the test's side of the mailbox it posts to: the test thread
  * stands where the reactor's owner would, posting submissions and cancellations and draining the engine's updates.
  */
-template<kv::Geometry G>
+template<kv::Geometry G, doubles::Rules R, class Gs>
 class Bench {
 public:
-	using Pipeline = pipeline::BasicPipeline<G, model::RowBudget::ThreeTiles, small, doubles::CardsDouble<G>, doubles::FrontDouble>;
+	using Pipeline = pipeline::BasicPipeline<G, model::RowBudget::ThreeTiles, small, doubles::CardsDouble<G, R>, doubles::FrontDouble<Gs>>;
 
-	Bench(fake::Machine machine, std::span<Job const> jobs, std::optional<Fault> fault)
+	Bench(fake::Machine machine, std::span<Job const> jobs, std::optional<Fault> fault, Gs grammars, grammar::Vocabulary const& vocabulary)
 	    : driver_{std::move(machine)},
 	      poller_{net::Poller::open().value()},
 	      mailbox_{std::make_unique<Mailbox>(poller_.waker())},
-	      pipeline_{launch(driver_, *mailbox_, jobs, fault)} {}
+	      pipeline_{launch(driver_, *mailbox_, jobs, fault, std::move(grammars), vocabulary)} {}
 
 	Bench(Bench const&) = delete;
 	auto operator=(Bench const&) -> Bench& = delete;
@@ -158,8 +160,8 @@ public:
 private:
 	using Mailbox = net::Mailbox<Update, http::max_posted_messages>;
 
-	[[nodiscard]] static auto launch(fake::Fake const& driver, Mailbox& mailbox, std::span<Job const> jobs, std::optional<Fault> fault)
-	    -> Pipeline {
+	[[nodiscard]] static auto launch(fake::Fake const& driver, Mailbox& mailbox, std::span<Job const> jobs, std::optional<Fault> fault, Gs grammars,
+	                                 grammar::Vocabulary const& vocabulary) -> Pipeline {
 		auto devices = device::Devices::open(driver.driver());
 		auto tokenizer = engine::tokenizer::load();
 		engine::core::invariant(devices.has_value() && tokenizer.has_value());
@@ -173,8 +175,9 @@ private:
 			    .behind = chosen.server == Server::Behind ? std::optional{http::Poster<Update>{mailbox}} : std::nullopt,
 			};
 		});
-		return Pipeline::start(http::Poster<Update>{mailbox}, std::move(*tokenizer),
-		                       doubles::CardsDouble<G>{std::move(*devices), std::move(scripts), breakdown}, doubles::FrontDouble{})
+		return Pipeline::start(http::Poster<Update>{mailbox}, std::move(*tokenizer), grammar::Vocabulary{vocabulary},
+		                       doubles::CardsDouble<G, R>{std::move(*devices), std::move(scripts), breakdown},
+		                       doubles::FrontDouble<Gs>{.grammars = std::move(grammars)})
 		    .value();
 	}
 
@@ -224,6 +227,18 @@ private:
 	std::size_t after_failure_ = 0;
 };
 
+/** A bench whose requests decode under the scripted grammar double. */
+template<kv::Geometry G>
+using Scripted = Bench<G, doubles::Rules::Scripted, doubles::ScriptedGrammars>;
+
+/** A bench whose requests decode under a real compiled grammar. */
+template<kv::Geometry G>
+using Compiled = Bench<G, doubles::Rules::Compiled, doubles::CompiledGrammars>;
+
+[[nodiscard]] auto scripted() -> doubles::ScriptedGrammars {
+	return doubles::ScriptedGrammars{.everything = doubles::Everything::make()};
+}
+
 /** `count` jobs with distinct random prompts of `prompt` tokens and scripts of up to `longest` tokens. */
 [[nodiscard]] auto workload(std::uint64_t seed, std::size_t count, std::size_t prompt, std::size_t longest, sched::Limit limit) -> std::vector<Job> {
 	auto random = engine::testing::generator(seed);
@@ -235,7 +250,7 @@ private:
 		}
 		auto const job_seed = random();
 		jobs.push_back(Job{
-		    .ask = {.tag = index + 1, .prompt = std::move(tokens), .seed = job_seed, .limit = limit},
+		    .ask = {.tag = index + 1, .prompt = std::move(tokens), .seed = job_seed, .limit = limit, .overrun_at = std::nullopt},
 		    .script = doubles::script(job_seed, 1 + (random() % longest)),
 		});
 	}
@@ -291,8 +306,8 @@ private:
 	return got == want;
 }
 
-template<kv::Geometry G>
-[[nodiscard]] auto run_all(Bench<G>& bench, std::span<Job const> jobs) -> bool {
+template<class B>
+[[nodiscard]] auto run_all(B& bench, std::span<Job const> jobs) -> bool {
 	for (auto const& job : jobs) {
 		bench.submit(job.ask);
 	}
@@ -309,9 +324,9 @@ template<kv::Geometry G>
 }
 
 /** Eight requests at once stream together, and each commits exactly its script, no token lost or repeated. */
-[[nodiscard]] auto eight_streams_commit_their_scripts(std::uint64_t seed) -> bool {
+[[nodiscard]] auto eight_streams_commit_their_scripts(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
 	auto const jobs = workload(seed, model::slots, 24, 80, sched::UntilContextFull{});
-	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{.pending_queries = 2}, jobs, std::nullopt);
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{.pending_queries = 2}, jobs, std::nullopt, scripted(), vocabulary);
 	auto const ran = run_all(*bench, jobs);
 	auto const idle = bench->pump(
 	    [&] {
@@ -325,9 +340,9 @@ template<kv::Geometry G>
 }
 
 /** A limit truncates the completion at exactly that many tokens; a turn that ends first stops there. */
-[[nodiscard]] auto limits_end_at_length(std::uint64_t seed) -> bool {
+[[nodiscard]] auto limits_end_at_length(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
 	auto jobs = workload(seed, 6, 12, 40, sched::AtMost{.tokens = 15});
-	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{}, jobs, std::nullopt);
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{}, jobs, std::nullopt, scripted(), vocabulary);
 	auto const lengths = std::ranges::count_if(jobs, [](Job const& job) {
 		return job.script.size() > 15;
 	});
@@ -335,11 +350,11 @@ template<kv::Geometry G>
 }
 
 /** A prompt that leaves no room is refused with its length, and the engine serves the next request as usual. */
-[[nodiscard]] auto a_prompt_too_long_is_refused() -> bool {
+[[nodiscard]] auto a_prompt_too_long_is_refused(grammar::Vocabulary const& vocabulary) -> bool {
 	auto jobs = workload(41, 2, 10, 20, sched::UntilContextFull{});
 	auto const longest = sched::room<roomy>(0);
 	jobs[0].ask.prompt.resize(longest, Token{5});
-	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{}, jobs, std::nullopt);
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{}, jobs, std::nullopt, scripted(), vocabulary);
 	bench->submit(jobs[0].ask);
 	auto const refused = bench->pump(
 	    [&] {
@@ -354,11 +369,11 @@ template<kv::Geometry G>
  * A request cancelled mid-stream is answered `cancelled`, says nothing after it, never finishes, and gives its slot
  * back: every slot is vacant after the next cycle boundary, and the next request runs as usual.
  */
-[[nodiscard]] auto cancellation_frees_the_slot() -> bool {
+[[nodiscard]] auto cancellation_frees_the_slot(grammar::Vocabulary const& vocabulary) -> bool {
 	auto jobs = workload(57, 2, 16, 1, sched::UntilContextFull{});
 	jobs[0].script = doubles::script(jobs[0].ask.seed, 340);
 	// Slow cards, so the request is still streaming when the cancellation reaches the engine.
-	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{.pending_queries = 3000}, jobs, std::nullopt);
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{.pending_queries = 3000}, jobs, std::nullopt, scripted(), vocabulary);
 	bench->submit(jobs[0].ask);
 	auto const streaming = bench->pump(
 	    [&] {
@@ -434,7 +449,7 @@ struct Shape {
 		});
 		auto const job_seed = random();
 		jobs.push_back(Job{
-		    .ask = {.tag = index + 1, .prompt = std::move(tokens), .seed = job_seed, .limit = sched::UntilContextFull{}},
+		    .ask = {.tag = index + 1, .prompt = std::move(tokens), .seed = job_seed, .limit = sched::UntilContextFull{}, .overrun_at = std::nullopt},
 		    .script = doubles::script(job_seed, 1 + (random() % shape.longest_script)),
 		});
 	}
@@ -502,7 +517,7 @@ enum class Client : std::uint8_t {
 
 /** Takes one step of a schedule, as the reactor's owner would. */
 struct Stepper {
-	Bench<roomy>& bench;
+	Scripted<roomy>& bench;
 	std::span<Job const> jobs;
 	std::set<std::uint64_t>& left;
 
@@ -533,11 +548,11 @@ struct Stepper {
 };
 
 /** Follows a schedule of the shape, drawn from `seed`, then checks every request's answer and that the engine ends idle. */
-[[nodiscard]] auto follow(std::uint64_t seed, Shape const& shape) -> bool {
+[[nodiscard]] auto follow(grammar::Vocabulary const& vocabulary, std::uint64_t seed, Shape const& shape) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto const [jobs, steps] = plan(random, shape);
 	auto const pending = random() % (shape.most_pending_queries + 1);
-	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{.pending_queries = pending}, jobs, std::nullopt);
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{.pending_queries = pending}, jobs, std::nullopt, scripted(), vocabulary);
 	auto left = std::set<std::uint64_t>{};
 	for (auto const& step : steps) {
 		std::visit(Stepper{.bench = *bench, .jobs = jobs, .left = left}, step);
@@ -576,13 +591,13 @@ static_assert(flood.jobs > sched::max_requests, "the flood outgrows the schedule
  * finishes: searched over generated schedules, with the cancellation landing on requests prefilling, decoding,
  * finishing, finished or refused. The engine ends idle and posts no failure.
  */
-[[nodiscard]] auto every_request_is_answered_once(std::uint64_t seed) -> bool {
-	return follow(seed, few);
+[[nodiscard]] auto every_request_is_answered_once(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
+	return follow(vocabulary, seed, few);
 }
 
 /** The same, under a flood. */
-[[nodiscard]] auto a_flood_is_answered_once(std::uint64_t seed) -> bool {
-	return follow(seed, flood);
+[[nodiscard]] auto a_flood_is_answered_once(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
+	return follow(vocabulary, seed, flood);
 }
 
 /**
@@ -590,12 +605,12 @@ static_assert(flood.jobs > sched::max_requests, "the flood outgrows the schedule
  * the scheduler's records are all held by requests far from done on slow cards, so the last one submitted must wait.
  * A request the scheduler holds is answered `cancelled` only once it lets the request go, at a cycle boundary.
  */
-[[nodiscard]] auto a_waiting_request_is_cancelled_at_once() -> bool {
+[[nodiscard]] auto a_waiting_request_is_cancelled_at_once(grammar::Vocabulary const& vocabulary) -> bool {
 	auto jobs = workload(71, sched::max_requests + 4, 4, 1, sched::UntilContextFull{});
 	for (auto& job : jobs) {
 		job.script = doubles::script(job.ask.seed, 300);
 	}
-	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{.pending_queries = 3000}, jobs, std::nullopt);
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{.pending_queries = 3000}, jobs, std::nullopt, scripted(), vocabulary);
 	for (auto const& job : jobs) {
 		bench->submit(job.ask);
 	}
@@ -624,11 +639,11 @@ static_assert(flood.jobs > sched::max_requests, "the flood outgrows the schedule
  * cards' error from `stop`. When the server is behind at that moment, the failure waits for it rather than being
  * dropped.
  */
-[[nodiscard]] auto a_breakdown_fails_closed(std::uint64_t seed, Server server) -> bool {
+[[nodiscard]] auto a_breakdown_fails_closed(grammar::Vocabulary const& vocabulary, std::uint64_t seed, Server server) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto const jobs = workload(random(), model::slots, 24, 60, sched::UntilContextFull{});
 	auto const fault = Fault{.verify = random() % 4, .server = server};
-	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{.pending_queries = random() % 4}, jobs, fault);
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{.pending_queries = random() % 4}, jobs, fault, scripted(), vocabulary);
 	for (auto const& job : jobs) {
 		bench->submit(job.ask);
 	}
@@ -662,20 +677,20 @@ static_assert(flood.jobs > sched::max_requests, "the flood outgrows the schedule
  * Under a pool too small for every request at once, the latest admitted requests are paused and resumed, and every
  * request still commits exactly its script.
  */
-[[nodiscard]] auto preemption_loses_no_token(std::uint64_t seed) -> bool {
+[[nodiscard]] auto preemption_loses_no_token(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
 	auto const jobs = workload(seed, model::slots, 40, 70, sched::UntilContextFull{});
-	auto bench = std::make_unique<Bench<tight>>(fake::Machine{.pending_queries = 1}, jobs, std::nullopt);
+	auto bench = std::make_unique<Scripted<tight>>(fake::Machine{.pending_queries = 1}, jobs, std::nullopt, scripted(), vocabulary);
 	auto const ran = run_all(*bench, jobs);
 	auto const& latest = bench->latest();
 	return ran && latest && latest->counters.preemptions > 0 && bench->stop();
 }
 
 /** The same workload, run twice on fresh engines, produces the same outputs for every request. */
-[[nodiscard]] auto outputs_are_deterministic(std::uint64_t seed) -> bool {
+[[nodiscard]] auto outputs_are_deterministic(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
 	auto const jobs = workload(seed, 5, 30, 50, sched::UntilContextFull{});
 	auto runs = std::array<std::vector<std::vector<Output>>, 2>{};
 	for (auto& run : runs) {
-		auto bench = std::make_unique<Bench<tight>>(fake::Machine{.pending_queries = 1}, jobs, std::nullopt);
+		auto bench = std::make_unique<Scripted<tight>>(fake::Machine{.pending_queries = 1}, jobs, std::nullopt, scripted(), vocabulary);
 		if (!run_all(*bench, jobs) || !bench->stop()) {
 			return false;
 		}
@@ -686,31 +701,123 @@ static_assert(flood.jobs > sched::max_requests, "the flood outgrows the schedule
 	return runs[0] == runs[1];
 }
 
+/** The output grammar of a request for free text without reasoning or tools, as the boundary compiles it. */
+[[nodiscard]] auto plain_text() -> grammar::Grammar {
+	return grammar::compile(grammar::OutputRequest{
+	                            .reasoning = grammar::Reasoning::Direct,
+	                            .tools = {},
+	                            .tool_choice = grammar::Calls::None,
+	                            .parallel = grammar::Parallel::Many,
+	                            .format = grammar::PlainText{},
+	                        })
+	    .value();
+}
+
+/**
+ * A completion the grammar allows, drawn at random: at least `length` tokens, each one the mask allows at its
+ * position (and below the cards double's script range), then the end of the turn where the grammar accepts it.
+ */
+[[nodiscard]] auto walk(grammar::Grammar const& compiled, grammar::Vocabulary const& vocabulary, std::mt19937_64& random, std::size_t length)
+    -> std::vector<Token> {
+	auto matcher = grammar::Matcher::make(compiled, grammar::engine_layout);
+	auto tokens = std::vector<Token>{};
+	while (tokens.size() < length || !matcher.accepting()) {
+		auto const view = matcher.mask(vocabulary).value();
+		auto allowed = std::vector<Token>{};
+		for (auto token = Token{0}; token < doubles::script_range; ++token) {
+			if (view.allows(token)) {
+				allowed.push_back(token);
+			}
+		}
+		engine::core::invariant(!allowed.empty());
+		auto const token = allowed[random() % allowed.size()];
+		engine::core::invariant(matcher.advance(vocabulary, token).has_value());
+		tokens.push_back(token);
+	}
+	tokens.push_back(engine::tokenizer::id(engine::tokenizer::Added::im_end));
+	return tokens;
+}
+
+/**
+ * Eight streams under a real compiled grammar, its matcher and the engine's vocabulary: every verify row's mask, in
+ * each card's row order, allows the token the completion commits there, and each request commits exactly its walk.
+ */
+[[nodiscard]] auto a_compiled_grammar_masks_every_row(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
+	auto random = engine::testing::generator(seed);
+	auto const compiled = plain_text();
+	auto jobs = workload(random(), model::slots, 16, 1, sched::UntilContextFull{});
+	for (auto& job : jobs) {
+		job.script = walk(compiled, vocabulary, random, 5 + (random() % 40));
+	}
+	auto bench = std::make_unique<Compiled<roomy>>(fake::Machine{.pending_queries = 1}, jobs, std::nullopt,
+	                                                doubles::CompiledGrammars{.compiled = compiled}, vocabulary);
+	return run_all(*bench, jobs) && bench->failures() == 0 && bench->stop();
+}
+
+/**
+ * A request whose grammar outgrows its bounds says a prefix of its completion, then `overran` with the fault as its
+ * one terminal output, and frees its slot; the requests beside it run as usual.
+ */
+[[nodiscard]] auto an_overrun_grammar_ends_its_request_alone(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
+	auto jobs = workload(seed, 4, 12, 30, sched::UntilContextFull{});
+	jobs[0].script = doubles::script(jobs[0].ask.seed, 80);
+	jobs[0].ask.overrun_at = 6;
+	auto bench = std::make_unique<Scripted<roomy>>(fake::Machine{.pending_queries = 1}, jobs, std::nullopt, scripted(), vocabulary);
+	for (auto const& job : jobs) {
+		bench->submit(job.ask);
+	}
+	auto const answered = bench->pump(
+	    [&] {
+		    return std::ranges::all_of(jobs, [&](Job const& job) {
+			    return bench->answered(job.ask.tag);
+		    });
+	    },
+	    60s);
+	auto const overran = bench->outputs(jobs[0].ask.tag);
+	auto const want = expected(jobs[0]);
+	auto const said = std::span{overran}.first(overran.empty() ? 0 : overran.size() - 1);
+	auto const prefix = said.size() <= 1 + 6 && std::ranges::equal(said, std::span{want}.first(std::min(said.size(), want.size())));
+	auto const others = std::ranges::all_of(std::span{jobs}.subspan(1), [&](Job const& job) {
+		return agrees(bench->outputs(job.ask.tag), expected(job));
+	});
+	return answered && !overran.empty() && overran.back() == Output{doubles::Overran{.fault = {.fault = grammar::MatchFault::LexerTooLarge}}} &&
+	       std::ranges::count_if(overran, terminal) == 1 && prefix && others && bench->failures() == 0 && bench->stop();
+}
+
 }
 
 auto main() -> int {
+	// Built once: every engine of the run takes a copy, as each would build its own.
+	auto const tokenizer = engine::tokenizer::load();
+	if (!tokenizer) {
+		return 1;
+	}
+	auto const vocabulary = grammar::engine_vocabulary(*tokenizer);
 	auto const cases = std::to_array<engine::testing::Case>({
-	    {.name = "eight streams commit their scripts (seed 1)", .holds = eight_streams_commit_their_scripts(1)},
-	    {.name = "eight streams commit their scripts (seed 2)", .holds = eight_streams_commit_their_scripts(2)},
-	    {.name = "limits end at length (seed 3)", .holds = limits_end_at_length(3)},
-	    {.name = "a prompt too long is refused", .holds = a_prompt_too_long_is_refused()},
-	    {.name = "cancellation frees the slot", .holds = cancellation_frees_the_slot()},
-	    {.name = "preemption loses no token (seed 4)", .holds = preemption_loses_no_token(4)},
-	    {.name = "preemption loses no token (seed 5)", .holds = preemption_loses_no_token(5)},
-	    {.name = "outputs are deterministic (seed 6)", .holds = outputs_are_deterministic(6)},
-	    {.name = "every request is answered once (seed 7)", .holds = every_request_is_answered_once(7)},
-	    {.name = "every request is answered once (seed 8)", .holds = every_request_is_answered_once(8)},
-	    {.name = "every request is answered once (seed 9)", .holds = every_request_is_answered_once(9)},
-	    {.name = "every request is answered once (seed 10)", .holds = every_request_is_answered_once(10)},
-	    {.name = "every request is answered once (seed 11)", .holds = every_request_is_answered_once(11)},
-	    {.name = "every request is answered once (seed 12)", .holds = every_request_is_answered_once(12)},
-	    {.name = "a flood is answered once (seed 13)", .holds = a_flood_is_answered_once(13)},
-	    {.name = "a flood is answered once (seed 14)", .holds = a_flood_is_answered_once(14)},
-	    {.name = "a waiting request is cancelled at once", .holds = a_waiting_request_is_cancelled_at_once()},
-	    {.name = "a breakdown fails closed (seed 16, server draining)", .holds = a_breakdown_fails_closed(16, Server::Draining)},
-	    {.name = "a breakdown fails closed (seed 17, server draining)", .holds = a_breakdown_fails_closed(17, Server::Draining)},
-	    {.name = "a breakdown fails closed (seed 18, server behind)", .holds = a_breakdown_fails_closed(18, Server::Behind)},
-	    {.name = "a breakdown fails closed (seed 19, server behind)", .holds = a_breakdown_fails_closed(19, Server::Behind)},
+	    {.name = "eight streams commit their scripts (seed 1)", .holds = eight_streams_commit_their_scripts(vocabulary, 1)},
+	    {.name = "eight streams commit their scripts (seed 2)", .holds = eight_streams_commit_their_scripts(vocabulary, 2)},
+	    {.name = "limits end at length (seed 3)", .holds = limits_end_at_length(vocabulary, 3)},
+	    {.name = "a prompt too long is refused", .holds = a_prompt_too_long_is_refused(vocabulary)},
+	    {.name = "cancellation frees the slot", .holds = cancellation_frees_the_slot(vocabulary)},
+	    {.name = "preemption loses no token (seed 4)", .holds = preemption_loses_no_token(vocabulary, 4)},
+	    {.name = "preemption loses no token (seed 5)", .holds = preemption_loses_no_token(vocabulary, 5)},
+	    {.name = "outputs are deterministic (seed 6)", .holds = outputs_are_deterministic(vocabulary, 6)},
+	    {.name = "every request is answered once (seed 7)", .holds = every_request_is_answered_once(vocabulary, 7)},
+	    {.name = "every request is answered once (seed 8)", .holds = every_request_is_answered_once(vocabulary, 8)},
+	    {.name = "every request is answered once (seed 9)", .holds = every_request_is_answered_once(vocabulary, 9)},
+	    {.name = "every request is answered once (seed 10)", .holds = every_request_is_answered_once(vocabulary, 10)},
+	    {.name = "every request is answered once (seed 11)", .holds = every_request_is_answered_once(vocabulary, 11)},
+	    {.name = "every request is answered once (seed 12)", .holds = every_request_is_answered_once(vocabulary, 12)},
+	    {.name = "a flood is answered once (seed 13)", .holds = a_flood_is_answered_once(vocabulary, 13)},
+	    {.name = "a flood is answered once (seed 14)", .holds = a_flood_is_answered_once(vocabulary, 14)},
+	    {.name = "a waiting request is cancelled at once", .holds = a_waiting_request_is_cancelled_at_once(vocabulary)},
+	    {.name = "a breakdown fails closed (seed 16, server draining)", .holds = a_breakdown_fails_closed(vocabulary, 16, Server::Draining)},
+	    {.name = "a breakdown fails closed (seed 17, server draining)", .holds = a_breakdown_fails_closed(vocabulary, 17, Server::Draining)},
+	    {.name = "a breakdown fails closed (seed 18, server behind)", .holds = a_breakdown_fails_closed(vocabulary, 18, Server::Behind)},
+	    {.name = "a breakdown fails closed (seed 19, server behind)", .holds = a_breakdown_fails_closed(vocabulary, 19, Server::Behind)},
+	    {.name = "a compiled grammar masks every row (seed 20)", .holds = a_compiled_grammar_masks_every_row(vocabulary, 20)},
+	    {.name = "a compiled grammar masks every row (seed 21)", .holds = a_compiled_grammar_masks_every_row(vocabulary, 21)},
+	    {.name = "an overrun grammar ends its request alone (seed 22)", .holds = an_overrun_grammar_ends_its_request_alone(vocabulary, 22)},
 	});
 	return engine::testing::report(cases);
 }

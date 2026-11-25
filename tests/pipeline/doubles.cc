@@ -6,6 +6,7 @@ import engine.card_scheduler;
 import engine.core;
 import engine.device;
 import engine.exec;
+import engine.grammar;
 import engine.http;
 import engine.kv;
 import engine.kv_fake;
@@ -15,6 +16,7 @@ import engine.pipeline;
 import engine.sampling;
 import engine.sched;
 import engine.tokenizer;
+import engine.vocabulary;
 
 /**
  * Test doubles of the parts the pipeline composes, named as doubles: the cards (decode and prefill), the grammar and
@@ -43,36 +45,48 @@ export inline constexpr Token script_range = 100'000;
 
 inline constexpr Token end_of_turn = tokenizer::id(tokenizer::Added::im_end);
 
-export struct TokenMaskDouble {
-	std::array<std::uint64_t, pipeline::token_words> bits;
+/** Every token the tokenizer has, in both of the engine's mask layouts: what the grammar double starts from. */
+export struct Everything {
+	std::vector<std::uint64_t> tokens;
+	std::vector<std::uint64_t> rows;
 
-	[[nodiscard]] auto words() const -> std::span<std::uint64_t const, pipeline::token_words> {
-		return bits;
+	[[nodiscard]] static auto make() -> Everything {
+		auto all = Everything{
+		    .tokens = std::vector<std::uint64_t>(model::divide_up(grammar::engine_layout.tokens, 64), 0),
+		    .rows = std::vector<std::uint64_t>(model::divide_up(grammar::engine_layout.rows, 64), 0),
+		};
+		for (auto token = Token{0}; token < model::sampled_vocabulary; ++token) {
+			all.flip(token);
+		}
+		return all;
+	}
+
+	/** Flips `token`'s bit in both layouts. */
+	auto flip(Token token) -> void {
+		auto const place = vocabulary::place(token);
+		auto const row = (std::size_t{std::to_underlying(place.card)} * model::vocab_per_card) + place.row;
+		tokens[token / 64] ^= std::uint64_t{1} << (token % 64);
+		rows[row / 64] ^= std::uint64_t{1} << (row % 64);
 	}
 };
 
 /**
- * A test double of a grammar's parser state: after k tokens it allows every token but `forbidden(k)`, so each
- * position's mask differs from its neighbours' and a mask computed for the wrong prefix is caught.
+ * A test double of a grammar's matcher, for the scripted refusals and faults a real grammar does not produce on
+ * demand: after k tokens it allows every token but `forbidden(k)`, so each position's mask differs from its
+ * neighbours' and a mask computed for the wrong prefix is caught; with `overrun_at`, its mask after that many tokens
+ * fails as a grammar that outgrew its bounds.
  */
 export class GrammarDouble {
 public:
-	[[nodiscard]] auto mask() const -> TokenMaskDouble {
-		auto mask = TokenMaskDouble{};
-		mask.bits.fill(~std::uint64_t{0});
-		auto const tail = model::sampled_vocabulary % 64;
-		mask.bits.back() = tail == 0 ? ~std::uint64_t{0} : (std::uint64_t{1} << tail) - 1;
-		auto const banned = forbidden(taken_);
-		mask.bits[banned / 64] &= ~(std::uint64_t{1} << (banned % 64));
-		return mask;
-	}
+	GrammarDouble(Everything everything, std::optional<std::size_t> overrun_at)
+	    : current_{everything}, everything_{std::move(everything)}, overrun_at_{overrun_at} {}
 
-	[[nodiscard]] auto advance(Token token) -> pipeline::Step {
+	[[nodiscard]] auto advance(grammar::Vocabulary const& /*vocabulary*/, Token token) -> core::Result<void, grammar::MatchError> {
 		if (token == forbidden(taken_)) {
-			return pipeline::Step::Refused;
+			return std::unexpected(grammar::MatchError{.fault = grammar::MatchFault::Refused});
 		}
 		taken_ += 1;
-		return pipeline::Step::Taken;
+		return {};
 	}
 
 	auto rollback(std::size_t count) -> void {
@@ -80,18 +94,50 @@ public:
 		taken_ -= count;
 	}
 
+	[[nodiscard]] auto mask(grammar::Vocabulary const& /*vocabulary*/) -> core::Result<grammar::MaskView, grammar::MatchError> {
+		if (overrun_at_ == taken_) {
+			return std::unexpected(grammar::MatchError{.fault = grammar::MatchFault::LexerTooLarge});
+		}
+		current_ = everything_;
+		current_.flip(forbidden(taken_));
+		return grammar::MaskView{.tokens = current_.tokens, .rows = current_.rows};
+	}
+
 private:
+	Everything current_;
+	Everything everything_;
+	std::optional<std::size_t> overrun_at_;
 	std::size_t taken_ = 0;
 };
 
 static_assert(pipeline::GrammarState<GrammarDouble>);
 
-/** What a test asks of the engine: a prompt, the script its completion follows (by seed), and its budget. */
+/** What a test asks of the engine: a prompt, the script its completion follows (by seed), its budget, and a fault. */
 export struct Ask {
 	std::uint64_t tag;
 	std::vector<Token> prompt;
 	std::uint64_t seed;
 	sched::Limit limit;
+	/** With the scripted grammar: how many tokens in its grammar outgrows its bounds, if it does. */
+	std::optional<std::size_t> overrun_at;
+};
+
+/** The scripted grammar double for every request. */
+export struct ScriptedGrammars {
+	Everything everything;
+
+	[[nodiscard]] auto start(Ask const& ask) const -> GrammarDouble {
+		return GrammarDouble{everything, ask.overrun_at};
+	}
+};
+
+/** A real compiled grammar for every request, matched by the real matcher. */
+export struct CompiledGrammars {
+	grammar::Grammar compiled;
+
+	[[nodiscard]] auto start(Ask const& /*ask*/) const -> grammar::Matcher {
+		return grammar::Matcher::make(compiled, grammar::engine_layout);
+	}
 };
 
 export struct Accepted {
@@ -120,7 +166,13 @@ export struct Cancelled {
 	[[nodiscard]] constexpr auto operator==(Cancelled const&) const -> bool = default;
 };
 
-export using Output = std::variant<Accepted, Refused, Committed, Ended, Cancelled>;
+export struct Overran {
+	grammar::MatchError fault;
+
+	[[nodiscard]] constexpr auto operator==(Overran const&) const -> bool = default;
+};
+
+export using Output = std::variant<Accepted, Refused, Committed, Ended, Cancelled, Overran>;
 
 export using Batch = std::vector<pipeline::Addressed<Output>>;
 
@@ -144,13 +196,16 @@ export struct ReplyDouble {
 };
 
 /** A test double of the api in front of the engine: submissions are token prompts, outputs are tokens. */
-export struct FrontDouble {
+export template<class Gs>
+struct FrontDouble {
 	using Submission = Ask;
 	using Output = pipeline_doubles::Output;
 	using Update = pipeline_doubles::Update;
 	using Tag = std::uint64_t;
-	using Grammar = GrammarDouble;
+	using Grammar = decltype(std::declval<Gs const&>().start(std::declval<Ask const&>()));
 	using Reply = ReplyDouble;
+
+	Gs grammars;
 
 	[[nodiscard]] auto prepare(tokenizer::Tokenizer const& /*tokenizer*/, Ask ask) -> pipeline::Prepared<Tag, Grammar, Reply> {
 		// Sampled, with the ask's seed as the fresh one, so the seed reaches the cards and names the script.
@@ -158,10 +213,11 @@ export struct FrontDouble {
 		request.temperature = 1.0;
 		auto const params = sampling::parse(request, sampling::thinking_defaults, ask.seed);
 		core::invariant(params.has_value());
+		auto started = grammars.start(ask);
 		return {
 		    .tag = ask.tag,
 		    .request = {.prompt = std::move(ask.prompt), .marks = {}, .sampling = *params, .limit = ask.limit},
-		    .grammar = GrammarDouble{},
+		    .grammar = std::move(started),
 		    .reply = ReplyDouble{},
 		};
 	}
@@ -178,6 +234,10 @@ export struct FrontDouble {
 		return Cancelled{};
 	}
 
+	[[nodiscard]] auto overran(grammar::MatchError fault) const -> Output {
+		return Overran{.fault = fault};
+	}
+
 	[[nodiscard]] auto batch(Batch outputs) const -> Update {
 		return outputs;
 	}
@@ -191,7 +251,8 @@ export struct FrontDouble {
 	}
 };
 
-static_assert(pipeline::Front<FrontDouble, device::DeviceError>);
+static_assert(pipeline::Front<FrontDouble<ScriptedGrammars>, device::DeviceError>);
+static_assert(pipeline::Front<FrontDouble<CompiledGrammars>, device::DeviceError>);
 
 /** The completion a seed scripts: `length` tokens below script_range, then the end of the turn. */
 export [[nodiscard]] auto script(std::uint64_t seed, std::size_t length) -> std::vector<Token> {
@@ -254,16 +315,26 @@ struct Decided {
 	return value ^ (value >> 31U);
 }
 
+/** Which grammar the requests decode under: the scripted double, or a real compiled grammar. */
+export enum class Rules : std::uint8_t {
+	Scripted,
+	Compiled,
+};
+
 /**
  * A test double of the cards: it decodes nothing, and commits for each request the script its seed names. Each row
- * accepts a pseudo-random number of drafts; the draft after them is wrong, and half the time it is the very token the
- * grammar forbids there, so the pipeline's handling of refused drafts runs. Every step completes on both fake cards'
- * events through the card scheduler, so the engine's waits poll a driver.
+ * accepts a pseudo-random number of drafts; the draft after them is wrong, and under the scripted grammar half the
+ * time it is the very token the grammar forbids there, so the pipeline's handling of refused drafts runs. Every
+ * step completes on both fake cards' events through the card scheduler, so the engine's waits poll a driver.
  *
  * The cards learn a request's prompt length from its first sampling chunk, and index its script by position from
  * there, so a paused and resumed request continues its script. Given a breakdown, the double fails at that verify.
+ *
+ * Under a compiled grammar it checks only that each committed token is allowed by its mask; under the scripted
+ * double, also that the mask forbids the token the double forbids there. A mask that allows only the end of the turn
+ * (a request whose grammar overran) commits the end of the turn, as sampling under it must.
  */
-export template<kv::Geometry G>
+export template<kv::Geometry G, Rules R>
 class CardsDouble {
 public:
 	using Error = device::DeviceError;
@@ -303,9 +374,9 @@ public:
 				drafted.tokens[draft] = truth(row.rule.seed, at + draft);
 			}
 			if (accepts < held) {
-				auto const banned = forbidden(at + accepts);
 				auto const right = truth(row.rule.seed, at + accepts);
-				drafted.tokens[accepts] = mix(row.position) % 2 == 0 ? banned : (right == 1 ? 2 : 1);
+				auto const wrong = right == 1 ? Token{2} : Token{1};
+				drafted.tokens[accepts] = R == Rules::Scripted && mix(row.position) % 2 == 0 ? forbidden(at + accepts) : wrong;
 			}
 			drafts.rows.push_back(drafted);
 			accepted_.push_back(accepts);
@@ -328,9 +399,7 @@ public:
 			auto accepted = sched::Accepted{.tokens = {}, .count = 0};
 			for (auto step = std::size_t{0}; step <= accepts && step < row.most; ++step) {
 				auto const& mask = masks.rows[(core::narrow<std::size_t>(index) * (1 + depth)) + step];
-				auto const token = truth(row.rule.seed, at + step);
-				// Each committed token is sampled under its own verify row's mask: the grammar after the tokens before it.
-				core::invariant(mask.allows(token) && !mask.allows(forbidden(at + step)));
+				auto const token = sampled(mask, truth(row.rule.seed, at + step), at + step);
 				accepted.tokens[step] = token;
 				accepted.count = step + 1;
 				if (sched::ends_turn(token)) {
@@ -355,8 +424,7 @@ public:
 				    auto const seed = chunk.rule.seed;
 				    prompts_.try_emplace(seed, end);
 				    auto const at = index_of(seed, end);
-				    auto const token = truth(seed, at);
-				    core::invariant(chosen.mask.allows(token) && !chosen.mask.allows(forbidden(at)));
+				    auto const token = sampled(chosen.mask, truth(seed, at), at);
 				    return sched::ChunkDone{.sampled = token, .took = std::chrono::microseconds{core::narrow<std::int64_t>(chunk.tokens.size())}};
 			    } else {
 				    return sched::ChunkDone{.sampled = std::nullopt, .took = std::chrono::microseconds{core::narrow<std::int64_t>(chosen.chunk.tokens.size())}};
@@ -369,6 +437,22 @@ public:
 	}
 
 private:
+	/**
+	 * What sampling under `mask` commits where the script says `scripted`, at completion index `at`: the end of the turn
+	 * under a mask that allows nothing else, else the scripted token, which its mask must allow (the grammar after the
+	 * tokens before it).
+	 */
+	[[nodiscard]] static auto sampled(pipeline::RowMask const& mask, Token scripted, std::size_t at) -> Token {
+		if (mask == pipeline::RowMask::ending()) {
+			return end_of_turn;
+		}
+		core::invariant(mask.allows(scripted));
+		if constexpr (R == Rules::Scripted) {
+			core::invariant(!mask.allows(forbidden(at)));
+		}
+		return scripted;
+	}
+
 	/** A verify's outcome: its batch's, unless it is the verify the double breaks down at. */
 	[[nodiscard]] auto decide(pipeline::Verified verified) -> Decided<pipeline::Verified> {
 		auto const verify = verifies_;

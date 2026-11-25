@@ -5,6 +5,7 @@ import std;
 import engine.card_scheduler;
 import engine.core;
 import engine.exec;
+import engine.grammar;
 import engine.http;
 import engine.kv;
 import engine.model;
@@ -52,20 +53,29 @@ struct Waiting {
 	sched::Submission request;
 };
 
-/** Whether a scheduled request's client is still there to hear from it. */
-enum class Client : std::uint8_t {
-	Present,
-	/**
-	 * It left: the request ends at the next cycle boundary and is then answered `cancelled`. The cycle in flight may
-	 * still report its tokens, and may end the request anyway; none of that is posted.
-	 */
-	Gone,
+/** The client is there, and the request goes on as its grammar allows. */
+struct Listening {};
+
+/**
+ * The client left: the request ends at the next cycle boundary and is then answered `cancelled`. The cycle in flight
+ * may still report its tokens, and may end the request anyway; none of that is posted.
+ */
+struct Left {};
+
+/**
+ * The request's grammar outgrew its bounds: it is sampled under an end-of-turn mask, ends at the next cycle boundary,
+ * and is then answered `overran` with the fault. Nothing more of it is posted before that.
+ */
+struct Overran {
+	grammar::MatchError fault;
 };
+
+using Fate = std::variant<Listening, Left, Overran>;
 
 /** In the scheduler: queued, running or paused. */
 struct Scheduled {
 	sched::RequestHandle request;
-	Client client;
+	Fate fate;
 };
 
 /** A request the engine holds, from its submission until the scheduler reports it finished. */
@@ -111,12 +121,12 @@ class Loop {
 	using Failure = EngineError<typename C::Error>;
 
 public:
-	Loop(http::Poster<typename F::Update> poster, tokenizer::Tokenizer tokenizer, C cards, F front)
+	Loop(http::Poster<typename F::Update> poster, tokenizer::Tokenizer tokenizer, grammar::Vocabulary vocabulary, C cards, F front)
 	    : scheduler_{std::make_unique<Scheduler>()},
 	      tokenizer_{std::move(tokenizer)},
 	      cards_{std::move(cards)},
 	      front_{std::move(front)},
-	      rows_{std::make_unique<Rows>()},
+	      vocabulary_{std::make_unique<grammar::Vocabulary>(std::move(vocabulary))},
 	      outbox_{poster} {
 		masks_.rows.reserve(model::rows(B));
 		lives_.reserve(http::max_connections + sched::max_requests);
@@ -195,7 +205,7 @@ private:
 	/** Whether the request's client still waits for its terminal output. */
 	[[nodiscard]] static auto owed(Request const& live) -> bool {
 		auto const held = core::alternative<Scheduled>(live.place);
-		return !held || held->client == Client::Present;
+		return !held || !std::holds_alternative<Left>(held->fate);
 	}
 
 	[[nodiscard]] static auto holds(Request const& live, sched::RequestHandle request) -> bool {
@@ -266,7 +276,7 @@ private:
 			}
 			auto submitted = scheduler_->submit(tokenizer_, std::move(held->request));
 			if (submitted) {
-				live.place = Scheduled{.request = submitted->request, .client = Client::Present};
+				live.place = Scheduled{.request = submitted->request, .fate = Listening{}};
 				round_.push_back({.exchange = live.exchange, .output = front_.accepted()});
 				free -= 1;
 				index += 1;
@@ -295,7 +305,7 @@ private:
 		}
 		if (auto held = core::alternative<Scheduled>(found->place)) {
 			scheduler_->cancel(held->request);
-			held->client = Client::Gone;
+			held->fate = Left{};
 			return;
 		}
 		round_.push_back({.exchange = exchange, .output = front_.cancelled()});
@@ -330,26 +340,42 @@ private:
 
 	/** The request's committed tokens, in order: its grammar advances by each, and its reply turns each into outputs. */
 	auto produce(Request& live, std::span<Token const> tokens) -> void {
-		if (std::get<Scheduled>(live.place).client == Client::Gone) {
+		if (!std::holds_alternative<Listening>(std::get<Scheduled>(live.place).fate)) {
 			return;
 		}
 		for (auto const token : tokens) {
-			auto const step = live.grammar.advance(token);
-			// The cards sample under the request's masks, so every committed token is one its grammar allows.
-			core::invariant(step == Step::Taken);
+			if (auto const taken = live.grammar.advance(*vocabulary_, token); !taken) {
+				// The cards sample under the request's masks, so a committed token can only fail the grammar's bounds.
+				core::invariant(outgrown(taken.error()));
+				overrun(live, taken.error());
+				return;
+			}
 			say(live, live.reply.feed(tokenizer_, token));
 		}
 	}
 
+	/** The request's grammar outgrew its bounds: it ends at the next cycle boundary, answered `overran`. */
+	auto overrun(Request& live, grammar::MatchError fault) -> void {
+		auto& held = std::get<Scheduled>(live.place);
+		scheduler_->cancel(held.request);
+		held.fate = Overran{.fault = fault};
+	}
+
 	auto end(Request& live, sched::Finished finished) -> void {
-		// The cycle in flight when the client left may have ended the request anyway: it is cancelled all the same.
-		if (std::get<Scheduled>(live.place).client == Client::Gone) {
+		auto const& fate = std::get<Scheduled>(live.place).fate;
+		// The cycle in flight when the client left, or when the grammar overran, may have ended the request anyway: its
+		// answer is the one its fate decided.
+		if (std::holds_alternative<Left>(fate)) {
 			round_.push_back({.exchange = live.exchange, .output = front_.cancelled()});
+			return;
+		}
+		if (auto const overran = core::alternative<Overran>(fate)) {
+			round_.push_back({.exchange = live.exchange, .output = front_.overran(overran->fault)});
 			return;
 		}
 		std::visit(Overloaded{
 		               [](sched::Cancelled& /*cancelled*/) {
-			               // Only the engine cancels a request, and only when its client has left.
+			               // Only the engine cancels a request, and only when its client left or its grammar overran.
 			               core::invariant(false);
 		               },
 		               [&]<class E>(E& ended) {
@@ -396,7 +422,8 @@ private:
 	 * Each verify row's mask: the request's grammar after its committed tokens, then after each draft in turn. A draft
 	 * the grammar refuses is excluded by the mask before it, so the cards reject it and no row after it commits; those
 	 * rows repeat the last mask, as do the rows past a row's drafts, which read nothing. The grammar is rolled back to
-	 * the committed tokens afterwards.
+	 * the committed tokens afterwards. A request whose grammar outgrows its bounds on the way has all its rows masked
+	 * to the end of the turn.
 	 */
 	auto fill(sched::Batch const& batch, Drafts const& drafts) -> void {
 		auto const depth = model::drafts(batch.depth);
@@ -404,24 +431,68 @@ private:
 		masks_.rows.resize(batch.rows.size() * (1 + depth));
 		for (auto const [signed_index, row] : std::views::enumerate(batch.rows)) {
 			auto const index = core::narrow<std::size_t>(signed_index);
-			auto& grammar = live_of(row.request).grammar;
-			auto const base = index * (1 + depth);
-			masks_.rows[base] = rows_->rows(grammar.mask());
 			auto const held = drafts.rows[index].view();
 			// The cards hold at most the batch's depth of drafts for a row.
 			core::invariant(held.size() <= depth);
-			auto taken = std::size_t{0};
-			for (auto draft = std::size_t{0}; draft < depth; ++draft) {
-				auto const at = base + 1 + draft;
-				if (draft < held.size() && taken == draft && grammar.advance(held[draft]) == Step::Taken) {
-					taken += 1;
-					masks_.rows[at] = rows_->rows(grammar.mask());
-				} else {
-					masks_.rows[at] = masks_.rows[at - 1];
-				}
+			auto const masks = std::span{masks_.rows}.subspan(index * (1 + depth), 1 + depth);
+			auto& live = live_of(row.request);
+			if (std::holds_alternative<Overran>(std::get<Scheduled>(live.place).fate)) {
+				std::ranges::fill(masks, RowMask::ending());
+			} else if (auto const fault = fill_row(live.grammar, held, masks)) {
+				overrun(live, *fault);
+				std::ranges::fill(masks, RowMask::ending());
 			}
-			grammar.rollback(taken);
 		}
+	}
+
+	/** One row's masks, the grammar rolled back after; the fault when the grammar outgrew its bounds on the way. */
+	[[nodiscard]] auto fill_row(F::Grammar& state, std::span<Token const> held, std::span<RowMask> masks)
+	    -> std::optional<grammar::MatchError> {
+		auto taken = std::size_t{0};
+		auto fault = std::optional<grammar::MatchError>{};
+		for (auto const [signed_at, mask] : std::views::enumerate(masks)) {
+			auto const at = core::narrow<std::size_t>(signed_at);
+			// A row past the first reads its draft, if the cards hold one and every draft before it was taken.
+			if (at > 0) {
+				auto const step = at - 1 < held.size() && taken == at - 1
+				                      ? std::optional{state.advance(*vocabulary_, held[at - 1])}
+				                      : std::nullopt;
+				if (!step || !*step) {
+					if (step && outgrown(step->error())) {
+						fault = step->error();
+						break;
+					}
+					mask = masks[at - 1];
+					continue;
+				}
+				taken += 1;
+			}
+			auto const view = state.mask(*vocabulary_);
+			if (!view) {
+				// A mask fails only when its grammar outgrows its bounds.
+				core::invariant(outgrown(view.error()));
+				fault = view.error();
+				break;
+			}
+			mask = RowMask::of(*view);
+		}
+		state.rollback(taken);
+		return fault;
+	}
+
+	/** The mask a chunk that reaches the end of its sequence samples under: its grammar's, or the end of the turn's. */
+	[[nodiscard]] auto first_mask(Request& live) -> RowMask {
+		if (std::holds_alternative<Overran>(std::get<Scheduled>(live.place).fate)) {
+			return RowMask::ending();
+		}
+		auto const view = live.grammar.mask(*vocabulary_);
+		if (view) {
+			return RowMask::of(*view);
+		}
+		// A mask fails only when its grammar outgrows its bounds.
+		core::invariant(outgrown(view.error()));
+		overrun(live, view.error());
+		return RowMask::ending();
 	}
 
 	[[nodiscard]] auto run_batch(sched::Batch const& batch, Inbox<typename F::Submission>& inbox) -> core::Result<sched::BatchDone, Failure> {
@@ -441,10 +512,9 @@ private:
 	}
 
 	[[nodiscard]] auto run_chunk(sched::Chunk const& chunk, Inbox<typename F::Submission>& inbox) -> core::Result<sched::ChunkDone, Failure> {
-		// A chunk that reaches the end of its sequence samples the request's first token, under its grammar's mask.
+		// A chunk that reaches the end of its sequence samples the request's next token, under its grammar's mask.
 		if (chunk.read == sched::Read::Last) {
-			auto const& mask = rows_->rows(live_of(chunk.request).grammar.mask());
-			return await(cards_.prefill(Prefill{Sampling{.chunk = chunk, .mask = mask}}), inbox);
+			return await(cards_.prefill(Prefill{Sampling{.chunk = chunk, .mask = first_mask(live_of(chunk.request))}}), inbox);
 		}
 		return await(cards_.prefill(Prefill{Reading{.chunk = chunk}}), inbox);
 	}
@@ -519,7 +589,8 @@ private:
 	tokenizer::Tokenizer tokenizer_;
 	C cards_;
 	F front_;
-	std::unique_ptr<Rows> rows_;
+	// Too large to hold per request: every matcher borrows this one.
+	std::unique_ptr<grammar::Vocabulary> vocabulary_;
 	Masks masks_;
 	Outbox<typename F::Update> outbox_;
 	/** Every request the engine holds, in arrival order: waiting ones go to the scheduler oldest first. */

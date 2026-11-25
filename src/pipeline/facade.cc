@@ -4,6 +4,7 @@ export module engine.pipeline:facade;
 import std;
 import engine.card_scheduler;
 import engine.core;
+import engine.grammar;
 import engine.http;
 import engine.kv;
 import engine.model;
@@ -30,9 +31,13 @@ class BasicPipeline {
 	using Worker = card_scheduler::Worker<Intake<typename F::Submission>, intake_capacity, core::Result<void, EngineError<typename C::Error>>>;
 
 public:
-	[[nodiscard]] static auto start(http::Poster<typename F::Update> poster, tokenizer::Tokenizer tokenizer, C cards, F front)
+	/**
+	 * Starts the engine thread. `vocabulary` is the engine's, `grammar::engine_vocabulary(tokenizer)` (about 80 ms to
+	 * build, so its owner builds it once at start); every request's matcher borrows it.
+	 */
+	[[nodiscard]] static auto start(http::Poster<typename F::Update> poster, tokenizer::Tokenizer tokenizer, grammar::Vocabulary vocabulary, C cards, F front)
 	    -> core::Result<BasicPipeline, net::NetError> {
-		auto worker = Worker::start([loop = Loop<G, B, T, C, F>{poster, std::move(tokenizer), std::move(cards), std::move(front)}](
+		auto worker = Worker::start([loop = Loop<G, B, T, C, F>{poster, std::move(tokenizer), std::move(vocabulary), std::move(cards), std::move(front)}](
 		                                Inbox<typename F::Submission>& inbox) mutable {
 			return loop.run(inbox);
 		});

@@ -4,6 +4,7 @@ export module engine.pipeline:seams;
 import std;
 import engine.core;
 import engine.exec;
+import engine.grammar;
 import engine.http;
 import engine.kv;
 import engine.model;
@@ -86,23 +87,36 @@ concept Cards = std::movable<C> && kv::Device<C, G> && core::Classified<typename
 	{ cards.prefill(std::move(prefill)) } -> ex::sender;
 };
 
-/** Whether a grammar's parser took a token. */
-export enum class Step : std::uint8_t {
-	Taken,
-	/** The grammar forbids the token here; the state is unchanged. */
-	Refused,
-};
-
 /**
- * One request's parser state over its compiled grammar: the mask of the next position, advancing by a token, and
- * taking back the last tokens taken (a draft's prefix, tried for its mask). It owns what it reads.
+ * One request's parser state over its compiled grammar, as `grammar::Matcher` is: advancing by a token, taking back
+ * the last tokens taken (a draft's prefix, tried for its mask), and the mask at the committed position, a borrow of
+ * the state valid until its next non-const call. Each reads the engine's one vocabulary, borrowed for the call. On a
+ * failed advance nothing changes: `Refused`, `Ended` and `UnknownToken` say the token cannot come there,
+ * `LexerTooLarge` and `RowTooLarge` that the grammar outgrew its bounds.
  */
 export template<class S>
-concept GrammarState = std::movable<S> && requires(S& state, S const& held, Token token, std::size_t count) {
-	{ held.mask() } -> TokenOrderMask;
-	{ state.advance(token) } -> std::same_as<Step>;
-	{ state.rollback(count) } -> std::same_as<void>;
-};
+concept GrammarState = std::move_constructible<S> &&
+                       requires(S& state, grammar::Vocabulary const& vocabulary, Token token, std::size_t count) {
+	                       { state.advance(vocabulary, token) } -> std::same_as<core::Result<void, grammar::MatchError>>;
+	                       { state.rollback(count) } -> std::same_as<void>;
+	                       { state.mask(vocabulary) } -> std::same_as<core::Result<grammar::MaskView, grammar::MatchError>>;
+                       };
+
+static_assert(GrammarState<grammar::Matcher>);
+
+/** Whether a matcher's fault is its grammar outgrowing its bounds, rather than a token that cannot come there. */
+export [[nodiscard]] constexpr auto outgrown(grammar::MatchError error) -> bool {
+	switch (error.fault) {
+	case grammar::MatchFault::LexerTooLarge:
+	case grammar::MatchFault::RowTooLarge:
+		return true;
+	case grammar::MatchFault::Refused:
+	case grammar::MatchFault::Ended:
+	case grammar::MatchFault::UnknownToken:
+		return false;
+	}
+	std::unreachable();
+}
 
 /**
  * Why generation ended, with the exact sequence the request leaves (the prompt as it ran, then every generated token),
@@ -216,7 +230,9 @@ struct [[nodiscard]] EngineError {
  * left and the engine let go of it (at once while it waited for the scheduler, else at the next cycle boundary), after
  * whatever was said before the cancel arrived (nothing, or `accepted` and some of its reply's outputs). So the
  * requests without a terminal output are exactly those the engine holds. A cancel that arrives after the request's
- * terminal output is answered by nothing.
+ * terminal output is answered by nothing. A request whose grammar outgrew its bounds is sampled under an end-of-turn
+ * mask from then on and answered `overran` with the matcher's fault, after what its reply said before, once the
+ * scheduler lets it go.
  *
  * An engine that fails posts what it said before the failure, then `failed` as its last update, retried until the
  * server's mailbox takes it or the engine is stopped: no request it has not answered will be. An engine that is
@@ -228,12 +244,13 @@ concept Front = std::movable<F> && std::movable<typename F::Submission> && std::
                 Reply<typename F::Reply, typename F::Output> &&
                 requires(F& front, tokenizer::Tokenizer const& tokenizer, F::Submission submission,
                          sched::PromptTooLong refused, std::vector<Addressed<typename F::Output>> outputs,
-                         Snapshot<typename F::Tag> snapshot, EngineError<CardError> const& error) {
+                         Snapshot<typename F::Tag> snapshot, EngineError<CardError> const& error, grammar::MatchError fault) {
 	                { front.prepare(tokenizer, std::move(submission)) }
 	                    -> std::same_as<Prepared<typename F::Tag, typename F::Grammar, typename F::Reply>>;
 	                { front.accepted() } -> std::same_as<typename F::Output>;
 	                { front.refused(refused) } -> std::same_as<typename F::Output>;
 	                { front.cancelled() } -> std::same_as<typename F::Output>;
+	                { front.overran(fault) } -> std::same_as<typename F::Output>;
 	                { front.batch(std::move(outputs)) } -> std::same_as<typename F::Update>;
 	                { front.status(std::move(snapshot)) } -> std::same_as<typename F::Update>;
 	                { front.failed(error) } -> std::same_as<typename F::Update>;

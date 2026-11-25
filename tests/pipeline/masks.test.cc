@@ -1,130 +1,86 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import std;
+import engine.core;
+import engine.grammar;
 import engine.model;
 import engine.pipeline;
 import engine.testing;
+import engine.tokenizer;
 import engine.vocabulary;
 
 namespace {
 
+namespace grammar = engine::grammar;
 namespace pipeline = engine::pipeline;
 namespace model = engine::model;
+namespace tokenizer = engine::tokenizer;
 namespace vocabulary = engine::vocabulary;
 
-struct Mask {
-	std::array<std::uint64_t, pipeline::token_words> bits;
-
-	[[nodiscard]] auto words() const -> std::span<std::uint64_t const, pipeline::token_words> {
-		return bits;
-	}
-
-	[[nodiscard]] auto allows(pipeline::Token token) const -> bool {
-		return ((bits[token / 64] >> (token % 64)) & 1U) != 0;
-	}
-};
-
-static_assert(pipeline::TokenOrderMask<Mask>);
-
-/** A mask allowing each token with probability `density` / 64, never a bit past the vocabulary. */
-[[nodiscard]] auto random_mask(std::mt19937_64& random, std::uint64_t density) -> Mask {
-	auto mask = Mask{};
-	for (auto& word : mask.bits) {
-		word = 0;
-		for (auto bit = 0U; bit < 64; ++bit) {
-			word |= (random() % 64 < density ? std::uint64_t{1} : 0) << bit;
-		}
-	}
-	auto const tail = model::sampled_vocabulary % 64;
-	if (tail != 0) {
-		mask.bits.back() &= (std::uint64_t{1} << tail) - 1;
-	}
-	return mask;
-}
-
-/** Bits the row mask sets on both cards together. */
-[[nodiscard]] auto population(pipeline::RowMask const& rows) -> std::size_t {
-	auto total = std::size_t{0};
-	for (auto const& half : rows.cards) {
-		for (auto const word : half) {
-			total += static_cast<std::size_t>(std::popcount(word));
-		}
-	}
-	return total;
-}
-
 /**
- * The row-order mask allows exactly the tokens the token-order mask allows, read through the vocabulary's own map,
- * and sets no other row: checked over every token, for masks from empty to full.
+ * A row mask copied from a matcher allows exactly the tokens the matcher's mask allows, read through the vocabulary's
+ * own map, and each card's half is that card's rows in its lm_head order with the padding rows clear: checked over
+ * every token and every row, at positions along a walk of a small grammar.
  */
-[[nodiscard]] auto rows_allow_exactly_the_masked_tokens(std::uint64_t seed) -> bool {
+[[nodiscard]] auto row_masks_carry_the_matchers_mask(grammar::Vocabulary const& vocabulary, std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
-	auto rows = std::make_unique<pipeline::Rows>();
-	for (auto const density : std::array<std::uint64_t, 4>{0, 1, 32, 64}) {
-		auto const mask = random_mask(random, density);
-		auto const& translated = rows->rows(mask);
-		auto allowed = std::size_t{0};
+	auto matcher = grammar::Matcher::make(grammar::compile_regex("(ab|cd|[a-z ]{1,3}x)+").value(), grammar::engine_layout);
+	for (auto step = 0; step < 6; ++step) {
+		auto const view = matcher.mask(vocabulary).value();
+		auto const rows = pipeline::RowMask::of(view);
+		auto allowed = std::vector<pipeline::Token>{};
 		for (auto token = pipeline::Token{0}; token < model::sampled_vocabulary; ++token) {
-			if (translated.allows(token) != mask.allows(token)) {
+			if (rows.allows(token) != view.allows(token)) {
 				return false;
 			}
-			allowed += mask.allows(token) ? 1 : 0;
+			if (view.allows(token) && token < tokenizer::bpe_vocabulary) {
+				allowed.push_back(token);
+			}
 		}
-		if (population(translated) != allowed) {
+		for (auto const card : {model::Card::Zero, model::Card::One}) {
+			auto const half = rows.card(card);
+			for (auto row = std::size_t{0}; row < model::vocab_per_card; ++row) {
+				auto const token = vocabulary::token(card, row);
+				auto const set = ((half[row / 64] >> (row % 64)) & 1U) != 0;
+				if (set != (token < model::sampled_vocabulary && view.allows(token))) {
+					return false;
+				}
+			}
+		}
+		if (allowed.empty() || !matcher.advance(vocabulary, allowed[random() % allowed.size()])) {
 			return false;
 		}
 	}
 	return true;
 }
 
-/** Row r of card c is set exactly when the token the vocabulary puts there is allowed. */
-[[nodiscard]] auto rows_follow_each_cards_order(std::uint64_t seed) -> bool {
-	auto random = engine::testing::generator(seed);
-	auto rows = std::make_unique<pipeline::Rows>();
-	auto const mask = random_mask(random, 20);
-	auto const& translated = rows->rows(mask);
-	for (auto const card : {model::Card::Zero, model::Card::One}) {
-		auto const& half = translated.cards[std::to_underlying(card)];
-		for (auto probe = 0; probe < 20'000; ++probe) {
-			auto const row = random() % model::vocab_per_card;
-			auto const token = vocabulary::token(card, row);
-			auto const set = ((half[row / 64] >> (row % 64)) & 1U) != 0;
-			if (set != (token < model::sampled_vocabulary && mask.allows(token))) {
-				return false;
-			}
-		}
-	}
-	return true;
-}
-
-/** Translations kept for reuse answer exactly as fresh ones, across more distinct masks than are kept. */
-[[nodiscard]] auto kept_translations_equal_fresh_ones(std::uint64_t seed) -> bool {
-	auto random = engine::testing::generator(seed);
-	auto masks = std::vector<Mask>{};
-	for (auto index = 0; index < 12; ++index) {
-		masks.push_back(random_mask(random, 1 + (random() % 63)));
-	}
-	auto expected = std::vector<pipeline::RowMask>{};
-	for (auto const& mask : masks) {
-		auto fresh = std::make_unique<pipeline::Rows>();
-		expected.push_back(fresh->rows(mask));
-	}
-	auto reused = std::make_unique<pipeline::Rows>();
-	for (auto step = 0; step < 200; ++step) {
-		auto const index = random() % masks.size();
-		if (reused->rows(masks[index]) != expected[index]) {
+/** The mask of a request whose grammar overran allows exactly the two tokens that end a turn. */
+[[nodiscard]] auto the_ending_mask_allows_only_the_end_of_the_turn() -> bool {
+	auto const ending = pipeline::RowMask::ending();
+	auto const ends = std::array{tokenizer::id(tokenizer::Added::im_end), tokenizer::id(tokenizer::Added::endoftext)};
+	for (auto token = pipeline::Token{0}; token < model::sampled_vocabulary; ++token) {
+		if (ending.allows(token) != std::ranges::contains(ends, token)) {
 			return false;
 		}
 	}
-	return true;
+	auto set = std::size_t{0};
+	for (auto const word : ending.words) {
+		set += engine::core::narrow<std::size_t>(std::popcount(word));
+	}
+	return set == ends.size();
 }
 
 }
 
 auto main() -> int {
+	auto const loaded = tokenizer::load();
+	if (!loaded) {
+		return 1;
+	}
+	auto const vocabulary = grammar::engine_vocabulary(*loaded);
 	auto const cases = std::to_array<engine::testing::Case>({
-	    {.name = "rows allow exactly the masked tokens (seed 1)", .holds = rows_allow_exactly_the_masked_tokens(1)},
-	    {.name = "rows follow each card's order (seed 2)", .holds = rows_follow_each_cards_order(2)},
-	    {.name = "kept translations equal fresh ones (seed 3)", .holds = kept_translations_equal_fresh_ones(3)},
+	    {.name = "row masks carry the matcher's mask (seed 1)", .holds = row_masks_carry_the_matchers_mask(vocabulary, 1)},
+	    {.name = "row masks carry the matcher's mask (seed 2)", .holds = row_masks_carry_the_matchers_mask(vocabulary, 2)},
+	    {.name = "the ending mask allows only the end of the turn", .holds = the_ending_mask_allows_only_the_end_of_the_turn()},
 	});
 	return engine::testing::report(cases);
 }
