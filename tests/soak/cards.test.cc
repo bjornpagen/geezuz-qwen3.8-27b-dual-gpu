@@ -153,6 +153,7 @@ inline auto const far = std::chrono::steady_clock::time_point::max();
 	    .memory = {.megahertz = card.memory_clock, .state = static_cast<device::PerformanceState>(card.performance_state)},
 	    .sm = {.megahertz = card.sm_clock},
 	    .power = {.draw_milliwatts = card.power_draw_milliwatts, .limit_milliwatts = card.power_limit_milliwatts},
+	    .temperature = {.celsius = card.gpu_celsius},
 	    .reasons = {.bits = card.clocks_event_reasons},
 	    .counters = card.clocks_event_counters,
 	};

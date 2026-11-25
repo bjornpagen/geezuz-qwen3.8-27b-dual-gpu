@@ -17,6 +17,7 @@ export struct Telemetry {
 	device::MemoryClock memory;
 	device::SmClock sm;
 	device::Power power;
+	device::GpuTemperature temperature;
 	device::ClocksEventReasons reasons;
 	device::ClocksEventCounters counters;
 
@@ -38,6 +39,11 @@ export [[nodiscard]] auto read(device::Devices const& devices, model::Card card)
 	                          .and_then([&] {
 		                          return devices.power(card).transform([&](device::Power const& power) {
 			                          telemetry.power = power;
+		                          });
+	                          })
+	                          .and_then([&] {
+		                          return devices.gpu_temperature(card).transform([&](device::GpuTemperature const& temperature) {
+			                          telemetry.temperature = temperature;
 		                          });
 	                          })
 	                          .and_then([&] {

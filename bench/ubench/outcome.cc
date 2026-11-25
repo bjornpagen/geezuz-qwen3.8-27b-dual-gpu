@@ -25,6 +25,7 @@ export enum class Unit : std::uint8_t {
 	Teraflops,
 	Mebibytes,
 	Watts,
+	Celsius,
 	Ratio,
 	Count,
 };
@@ -55,6 +56,8 @@ export enum class Unit : std::uint8_t {
 		return "MiB";
 	case Unit::Watts:
 		return "W";
+	case Unit::Celsius:
+		return "°C";
 	case Unit::Ratio:
 		return "x";
 	case Unit::Count:

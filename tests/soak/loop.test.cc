@@ -101,6 +101,7 @@ inline auto const idle_reading = Telemetry{
     .memory = {.megahertz = 405, .state = device::PerformanceState::P8},
     .sm = {.megahertz = 210},
     .power = {.draw_milliwatts = 30'000, .limit_milliwatts = 400'000},
+    .temperature = {.celsius = 31},
     .reasons = {.bits = 0x1},
     .counters = counters(std::chrono::nanoseconds{1'000'000}),
 };
@@ -110,6 +111,7 @@ inline auto const working_reading = Telemetry{
     .memory = {.megahertz = 10'001, .state = device::PerformanceState::P2},
     .sm = {.megahertz = 1'875},
     .power = {.draw_milliwatts = 351'000, .limit_milliwatts = 400'000},
+    .temperature = {.celsius = 58},
     .reasons = {.bits = 0},
     .counters = counters(std::chrono::nanoseconds{1'000'000}),
 };
@@ -508,6 +510,7 @@ template<class T>
 			    .reading = Telemetry{.memory = {.megahertz = 9'751, .state = device::PerformanceState::P0},
 			                         .sm = working_reading.sm,
 			                         .power = working_reading.power,
+			                         .temperature = working_reading.temperature,
 			                         .reasons = working_reading.reasons,
 			                         .counters = working_reading.counters},
 			};

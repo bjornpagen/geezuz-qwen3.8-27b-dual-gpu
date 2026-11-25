@@ -2,7 +2,7 @@
 //
 // The operator's account of what the soak and the clock check found: every finding with its wall time (to set beside
 // the junction temperature the gddr6 tool logs, which nothing here can read), the time into the soak, and both cards'
-// clocks, power and slowdown counters right after it.
+// clocks, power, GPU die temperature and slowdown counters right after it.
 export module engine.platform:report;
 
 import std;
@@ -61,10 +61,11 @@ namespace engine::platform {
 /** One card's readings on one line. */
 export [[nodiscard]] auto render(model::Card card, Telemetry const& telemetry) -> std::string {
 	auto const& counters = telemetry.counters;
-	return std::format("{}: memory {}, SM {} MHz, {:.1f} W of a {:.1f} W limit, clock-event reasons {:#x}, slowdown counters sw_power_cap {}, "
-	                   "sw_thermal {}, hw_thermal {}, hw_power_brake {}",
+	return std::format("{}: memory {}, SM {} MHz, {:.1f} W of a {:.1f} W limit, GPU die {} °C, clock-event reasons {:#x}, slowdown counters "
+	                   "sw_power_cap {}, sw_thermal {}, hw_thermal {}, hw_power_brake {}",
 	                   card_name(card), clock_name(telemetry.memory), telemetry.sm.megahertz, telemetry.power.draw_milliwatts / 1000.0,
-	                   telemetry.power.limit_milliwatts / 1000.0, telemetry.reasons.bits, milliseconds(counters.sw_power_cap),
+	                   telemetry.power.limit_milliwatts / 1000.0, telemetry.temperature.celsius, telemetry.reasons.bits,
+	                   milliseconds(counters.sw_power_cap),
 	                   milliseconds(counters.sw_thermal_slowdown), milliseconds(counters.hw_thermal_slowdown),
 	                   milliseconds(counters.hw_power_brake_slowdown));
 }

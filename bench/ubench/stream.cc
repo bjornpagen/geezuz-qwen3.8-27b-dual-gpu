@@ -472,6 +472,8 @@ export struct SoakTelemetry {
 	std::vector<double> draw_watts;
 	/** The power limit the driver enforces, in watts. */
 	double limit_watts;
+	/** The GPU die temperature sampled through the soak, in degrees C (the memory junction is not readable here). */
+	std::vector<double> gpu_celsius;
 	/** How long the software power cap held the clocks down during the soak; absent where NVML does not count it. */
 	std::optional<std::chrono::nanoseconds> power_capped;
 	/** Whether the software power cap was holding the clocks down when the soak ended. */
@@ -485,7 +487,7 @@ export [[nodiscard]] auto evaluate_sustained_clock(std::span<std::vector<double>
 	for (auto const card : device::card_pair) {
 		auto const& series = megahertz[std::to_underlying(card)];
 		auto const& seen = telemetry[std::to_underlying(card)];
-		core::invariant(!series.empty() && !seen.sm_megahertz.empty() && !seen.draw_watts.empty());
+		core::invariant(!series.empty() && !seen.sm_megahertz.empty() && !seen.draw_watts.empty() && !seen.gpu_celsius.empty());
 		auto const settled = std::vector<double>(series.begin() + static_cast<std::ptrdiff_t>(series.size() / 2), series.end());
 		outcome.readings.push_back({.label = std::format("{}, first launch", on(card)), .value = series.front(), .unit = Unit::Megahertz});
 		outcome.readings.push_back({.label = std::format("{}, lowest launch", on(card)), .value = std::ranges::min(series), .unit = Unit::Megahertz});
@@ -493,6 +495,7 @@ export [[nodiscard]] auto evaluate_sustained_clock(std::span<std::vector<double>
 		outcome.readings.push_back({.label = std::format("{}, NVML's SM clock, median sample", on(card)), .value = median(seen.sm_megahertz), .unit = Unit::Megahertz});
 		outcome.readings.push_back({.label = std::format("{}, highest power draw sampled", on(card)), .value = std::ranges::max(seen.draw_watts), .unit = Unit::Watts});
 		outcome.readings.push_back({.label = std::format("{}, enforced power limit", on(card)), .value = seen.limit_watts, .unit = Unit::Watts});
+		outcome.readings.push_back({.label = std::format("{}, hottest GPU die temperature sampled", on(card)), .value = std::ranges::max(seen.gpu_celsius), .unit = Unit::Celsius});
 		if (seen.power_capped) {
 			auto const capped = std::chrono::duration<double, std::milli>{*seen.power_capped}.count();
 			outcome.readings.push_back({.label = std::format("{}, time the software power cap held the clocks during the soak", on(card)), .value = capped, .unit = Unit::Milliseconds});
@@ -525,13 +528,15 @@ using kernels::SustainKernel;
 	});
 }
 
-/** One sample of a card's NVML clock and power draw into its telemetry. */
+/** One sample of a card's NVML clock, power draw and GPU temperature into its telemetry. */
 [[nodiscard]] auto sample(BenchView const& bench, model::Card card, SoakTelemetry& telemetry) -> Result<void> {
 	auto const clock = lift(bench.devices.sm_clock(card));
 	auto const power = lift(bench.devices.power(card));
-	if (auto const failed = first_failure(clock, power)) {
+	auto const temperature = lift(bench.devices.gpu_temperature(card));
+	if (auto const failed = first_failure(clock, power, temperature)) {
 		return std::unexpected(*failed);
 	}
+	telemetry.gpu_celsius.push_back(static_cast<double>(temperature->celsius));
 	telemetry.sm_megahertz.push_back(static_cast<double>(clock->megahertz));
 	telemetry.draw_watts.push_back(static_cast<double>(power->draw_milliwatts) / 1000.0);
 	telemetry.limit_watts = static_cast<double>(power->limit_milliwatts) / 1000.0;
