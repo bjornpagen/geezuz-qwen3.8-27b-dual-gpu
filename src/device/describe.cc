@@ -85,6 +85,8 @@ namespace engine::device {
 		return "NVML_ERROR_DRIVER_NOT_LOADED";
 	case ManagementStatus::GpuIsLost:
 		return "NVML_ERROR_GPU_IS_LOST";
+	case ManagementStatus::ArgumentVersionMismatch:
+		return "NVML_ERROR_ARGUMENT_VERSION_MISMATCH";
 	case ManagementStatus::Unknown:
 		return "NVML_ERROR_UNKNOWN";
 	}

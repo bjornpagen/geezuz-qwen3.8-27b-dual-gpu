@@ -27,7 +27,7 @@ using fake::Machine;
 [[nodiscard]] auto random_card(std::mt19937_64& random) -> CardModel {
 	auto card = CardModel{};
 	card.sm_clock = std::uniform_int_distribution<std::uint32_t>{210, 2100}(random);
-	card.gpu_celsius = std::uniform_int_distribution<std::uint32_t>{15, 95}(random);
+	card.gpu_celsius = std::uniform_int_distribution{-10, 95}(random);
 	card.power_draw_milliwatts = std::uniform_int_distribution<std::uint32_t>{20'000, 450'000}(random);
 	card.power_limit_milliwatts = std::uniform_int_distribution<std::uint32_t>{100'000, 400'000}(random);
 	card.clocks_event_reasons = std::uniform_int_distribution<std::uint64_t>{0, 0x7ff}(random);

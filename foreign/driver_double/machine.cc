@@ -27,7 +27,7 @@ export struct CardModel {
 	std::uint32_t memory_clock = 9501;
 	int performance_state = 2;
 	std::uint32_t sm_clock = 1695;
-	std::uint32_t gpu_celsius = 41;
+	int gpu_celsius = 41;
 	std::uint32_t power_draw_milliwatts = 300'000;
 	std::uint32_t power_limit_milliwatts = 350'000;
 	std::uint64_t clocks_event_reasons = 0x4;

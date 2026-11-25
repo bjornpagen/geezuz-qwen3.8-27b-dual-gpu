@@ -182,15 +182,19 @@ auto fake_nvml_enforced_power_limit(driver::nvmlDevice_t device, unsigned int* m
 	return ManagementStatus::Success;
 }
 
-auto fake_nvml_temperature(driver::nvmlDevice_t device, driver::TemperatureSensor sensor, unsigned int* celsius) -> ManagementStatus {
+auto fake_nvml_temperature(driver::nvmlDevice_t device, driver::Temperature* reading) -> ManagementStatus {
 	if (injected()) {
 		return ManagementStatus::Unknown;
 	}
 	auto const* const model = session_card(device);
-	if (model == nullptr || sensor != driver::TemperatureSensor::Gpu) {
+	if (model == nullptr || reading == nullptr || reading->sensor != driver::TemperatureSensor::Gpu) {
 		return ManagementStatus::InvalidArgument;
 	}
-	*celsius = model->gpu_celsius;
+	// NVML refuses a struct stamped with a version it does not know, as the real library does.
+	if (reading->version != driver::temperature_v1) {
+		return ManagementStatus::ArgumentVersionMismatch;
+	}
+	reading->celsius = model->gpu_celsius;
 	return ManagementStatus::Success;
 }
 

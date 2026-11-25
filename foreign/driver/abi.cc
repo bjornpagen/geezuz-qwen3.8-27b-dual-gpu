@@ -143,6 +143,7 @@ export enum class ManagementStatus : int {
 	NotFound = 6,
 	DriverNotLoaded = 9,
 	GpuIsLost = 15,
+	ArgumentVersionMismatch = 25,
 	Unknown = 999,
 };
 
@@ -160,7 +161,7 @@ export enum class ClockType : int {
 	Video = 3,    // NVML_CLOCK_VIDEO
 };
 
-/** `nvmlTemperatureSensors_t` (nvml.h): which sensor `nvmlDeviceGetTemperature` reads, in degrees C. */
+/** `nvmlTemperatureSensors_t` (nvml.h): which sensor a temperature query reads. */
 export enum class TemperatureSensor : int {
 	Gpu = 0, // NVML_TEMPERATURE_GPU: the GPU die
 };
@@ -222,6 +223,28 @@ export enum class ClocksEventReason : std::uint64_t {
 };
 
 // NOLINTEND(performance-enum-size)
+
+/**
+ * `nvmlTemperature_v1_t`, aliased `nvmlTemperature_t` (NVIDIA's nvml.h, as vendored in NVIDIA/go-nvml
+ * `gen/nvml/nvml.h`: `typedef { unsigned int version; nvmlTemperatureSensors_t sensorType; int temperature; }`), the
+ * struct `nvmlDeviceGetTemperatureV` fills: the caller sets the version and the sensor, NVML the degrees C.
+ */
+export struct Temperature {
+	unsigned int version;
+	TemperatureSensor sensor;
+	int celsius;
+};
+
+static_assert(sizeof(Temperature) == 12 && offsetof(Temperature, sensor) == 4 && offsetof(Temperature, celsius) == 8,
+              "nvmlTemperature_v1_t's layout");
+
+/**
+ * `nvmlTemperature_v1`, the version the caller stamps: nvml.h's `NVML_STRUCT_VERSION(Temperature, 1)`, defined there as
+ * `(unsigned int)(sizeof(nvmlTemperature_v1_t) | (1 << 24U))`.
+ */
+export inline constexpr unsigned int temperature_v1 = static_cast<unsigned int>(sizeof(Temperature)) | (1U << 24U);
+
+static_assert(temperature_v1 == 0x0100'000CU);
 
 /** The field id of link `link`'s speed; links 0 to 5 have consecutive ids. */
 export [[nodiscard]] constexpr auto nvlink_speed_field(std::uint32_t link) -> Field {
@@ -323,7 +346,7 @@ export struct Management {
 	Entry<"nvmlDeviceGetEnforcedPowerLimit", ManagementStatus(nvmlDevice_t, unsigned int*)> enforced_power_limit;
 	Entry<"nvmlDeviceGetCurrentClocksEventReasons", ManagementStatus(nvmlDevice_t, unsigned long long*)> clocks_event_reasons;
 	Entry<"nvmlDeviceGetFieldValues", ManagementStatus(nvmlDevice_t, int, FieldValue*)> field_values;
-	Entry<"nvmlDeviceGetTemperature", ManagementStatus(nvmlDevice_t, TemperatureSensor, unsigned int*)> temperature;
+	Entry<"nvmlDeviceGetTemperatureV", ManagementStatus(nvmlDevice_t, Temperature*)> temperature;
 	Entry<"nvmlDeviceGetNvLinkVersion", ManagementStatus(nvmlDevice_t, unsigned int, unsigned int*)> nvlink_version;
 };
 

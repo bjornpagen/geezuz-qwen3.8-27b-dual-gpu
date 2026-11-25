@@ -79,7 +79,7 @@ export struct Power {
  * memory overclock is limited by, is not readable through NVML on a 3090.
  */
 export struct GpuTemperature {
-	std::uint32_t celsius;
+	std::int32_t celsius;
 
 	[[nodiscard]] constexpr auto operator==(GpuTemperature const&) const -> bool = default;
 };
@@ -257,13 +257,13 @@ public:
 	}
 
 	[[nodiscard]] auto gpu_temperature(PciAddress card) const -> core::Result<GpuTemperature, DeviceError> {
-		auto celsius = 0U;
+		auto reading = Temperature{.version = temperature_v1, .sensor = TemperatureSensor::Gpu, .celsius = 0};
 		return find(card)
 		    .and_then([&](nvmlDevice_t device) {
-			    return call(api_.temperature, device, TemperatureSensor::Gpu, &celsius);
+			    return call(api_.temperature, device, &reading);
 		    })
 		    .transform([&] {
-			    return GpuTemperature{.celsius = celsius};
+			    return GpuTemperature{.celsius = reading.celsius};
 		    });
 	}
 
