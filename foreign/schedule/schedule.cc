@@ -12,6 +12,7 @@ export module engine.schedule;
 namespace engine::schedule {
 
 namespace device = engine::device::schedule;
+namespace model = engine::model;
 
 export using device::Blocks;
 export using device::CardImage;
@@ -85,6 +86,14 @@ export using device::unit_bytes;
 export using device::units_per_output;
 export using device::warps;
 export using device::workspace;
+
+/** The bytes of the workspace's attention records at `budget`, as attention defines them. */
+export [[nodiscard]] constexpr auto attention_record_bytes(model::RowBudget budget) -> model::Count {
+	return engine::device::attn::record_bytes(budget);
+}
+
+/** The bytes of one slot's deltanet replay ring in the workspace, as the deltanet defines them. */
+export inline constexpr model::Count replay_ring_bytes_per_slot = engine::device::deltanet::ring_bytes_per_slot;
 export using device::cycle;
 export using device::cycle_bytes;
 export using device::exchange;
