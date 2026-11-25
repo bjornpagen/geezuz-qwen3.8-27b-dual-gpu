@@ -2,5 +2,7 @@
 
 # The CUDA driver and NVML test double. Only tests link it: the product's one source of driver tables is the loader.
 add_library(engine_driver_double)
-target_sources(engine_driver_double PUBLIC FILE_SET CXX_MODULES FILES driver_double.cc machine.cc fake.cc ring.cc)
+target_sources(engine_driver_double PUBLIC FILE_SET CXX_MODULES FILES
+	driver_double.cc machine.cc ledger.cc cuda_device.cc cuda_memory.cc cuda_work.cc nvml.cc fake.cc ring.cc
+)
 target_link_libraries(engine_driver_double PUBLIC engine_language_profile engine_core engine_driver)
