@@ -22,8 +22,10 @@ inline constexpr Count query_heads = model::query_heads_per_card;
 inline constexpr Count group_heads = model::query_heads / model::kv_heads;
 inline constexpr Count kv_layers = model::kv_layers;
 inline constexpr Count block_positions = model::kv_block_tokens;
-inline constexpr Count chunk_positions = schedule::attention_chunk_positions;
-inline constexpr Count max_chunks = model::max_positions / chunk_positions;
+inline constexpr Count chunk_positions = model::attention::chunk_positions;
+inline constexpr Count max_chunks = model::attention::max_chunks;
+
+static_assert(schedule::attention_chunk_positions == chunk_positions, "the schedule's chunk is the model's");
 
 /** Rows one slot brings into a cycle: its committed token and its deepest drafts. */
 inline constexpr Count max_rows = 1 + model::drafts(model::max_draft_depth);
@@ -93,31 +95,16 @@ static_assert(block_positions % chunk_positions == 0 && block_positions / chunk_
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Groups: the unit attention folds and assigns.
-//
-// A context is cut into 32-position chunks at fixed absolute positions, and the chunks into groups at fixed chunk
-// indices: eight chunks (256 positions) per group up to position 32768, sixty-four (2048 positions) beyond. Within a
-// group the chunks are folded in order by an online softmax; the groups are then merged in order. A group is never
-// split across SMs, so every row's arithmetic is a function of its own query, its kv and its position alone: not of
-// the SM count, the other slots or the rows beside it. Short groups near the start keep many SMs busy on short
-// contexts; long groups far out keep the partial records of a long context few.
+// Groups: the unit attention folds and assigns. The model fixes them (`model::attention`): chunks are folded in order
+// within a group by an online softmax, and a row's groups are then merged in order. A group is never split across
+// SMs, so every row's arithmetic is a function of its own query, its kv and its position alone: not of the SM count,
+// the other slots or the rows beside it.
 
-inline constexpr Count near_group_chunks = 8;
-inline constexpr Count near_chunks = 1024;
-inline constexpr Count far_group_chunks = 64;
-inline constexpr Count near_groups = near_chunks / near_group_chunks;
-
-static_assert(near_chunks % near_group_chunks == 0 && (max_chunks - near_chunks) % far_group_chunks == 0, "groups tile the chunks");
-
-/** The group holding chunk `chunk`. */
-[[nodiscard]] constexpr auto group_of(Count chunk) -> Count {
-	return chunk < near_chunks ? chunk / near_group_chunks : near_groups + (chunk - near_chunks) / far_group_chunks;
-}
-
-/** The first chunk of group `group`. */
-[[nodiscard]] constexpr auto group_begin(Count group) -> Count {
-	return group < near_groups ? group * near_group_chunks : near_chunks + (group - near_groups) * far_group_chunks;
-}
+using model::attention::far_group_chunks;
+using model::attention::group_begin;
+using model::attention::group_of;
+using model::attention::near_chunks;
+using model::attention::near_group_chunks;
 
 /** The groups holding chunks [0, chunks). */
 [[nodiscard]] constexpr auto groups_covering(Count chunks) -> Count {
@@ -363,10 +350,12 @@ struct KvPool {
 	unsigned unused;
 };
 
-/** The layer's q_norm and k_norm weights, bf16 [256] each. */
-struct NormWeights {
+/** What preparing a row reads: the layer's q_norm and k_norm weights (bf16 [256] each) and the rope table. */
+struct Preparation {
 	Address query;
 	Address key;
+	/** `rope_table_bytes`: every (position, pair)'s rotation, filled once by `attn_rope_table`. */
+	Address rotations;
 };
 
 /** The records' storage: fp32 [rows][256] outputs and `Running` [rows]. */
@@ -380,7 +369,7 @@ struct CoreParams {
 	Cycle cycle;
 	KvPool kv;
 	Projections rows;
-	NormWeights norms;
+	Preparation preparation;
 	Records records;
 };
 
@@ -403,7 +392,7 @@ struct PromptParams {
 	unsigned unused;
 	KvPool kv;
 	Projections rows;
-	NormWeights norms;
+	Preparation preparation;
 	Address output;
 };
 

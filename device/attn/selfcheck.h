@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// What attention's self-check kernels compute and how the host reproduces it: the rope digest's partition and terms,
-// the weight split's sweep, and the reduced SM count of the assignment check. Pure constexpr, shared with the host,
-// so a report is read by the very definitions that wrote it.
+// What attention's start-up and self-check kernels compute and how the host reproduces it: the rope table's
+// partition, the weight split's sweep, and the reduced SM count of the assignment check. Pure constexpr, shared with
+// the host, so a report is read by the very definitions that wrote it.
 #pragma once
 
 #include "attn/arithmetic.h"
@@ -15,18 +15,11 @@ namespace engine::device::attn::selfcheck {
 /** The assignment check's block count: far from 82, so nearly every group lands on a different block than at 82. */
 inline constexpr unsigned few_sms = 7;
 
-// The rope digest: one thread per position, its 32 pairs.
-inline constexpr prims::Budget digest_budget = {.threads = 256, .registers_per_thread = 64, .shared_bytes = 0, .blocks_per_sm = 4};
-inline constexpr unsigned digest_blocks = static_cast<unsigned>(model::max_positions) / 256U;
+// The rope table's fill: one thread per position, its 32 pairs.
+inline constexpr prims::Budget rope_budget = {.threads = 256, .registers_per_thread = 64, .shared_bytes = 0, .blocks_per_sm = 4};
+inline constexpr unsigned rope_blocks = static_cast<unsigned>(model::max_positions) / 256U;
 
-static_assert(Count{digest_blocks} * 256U == model::max_positions, "the digest's threads are exactly the positions");
-
-/** One (position, pair)'s contribution to its block's digest: the sine's and the cosine's bits, each mixed with its input. */
-[[nodiscard]] constexpr auto rope_term(unsigned position, int pair) -> unsigned long long {
-	unsigned const input = (position << 5U) | static_cast<unsigned>(pair);
-	SinCos const turn = sincos(angle(position, pair));
-	return prims::selfcheck::digest_term(input, math::bits(turn.sine)) + prims::selfcheck::digest_term(input | 0x80000000U, math::bits(turn.cosine));
-}
+static_assert(Count{rope_blocks} * 256U == model::max_positions, "the fill's threads are exactly the positions");
 
 // The split sweep: every fp32 bit pattern from +0 to 1.0, in contiguous runs, one per thread.
 inline constexpr prims::Budget split_budget = {.threads = 256, .registers_per_thread = 64, .shared_bytes = 0, .blocks_per_sm = 4};
@@ -48,8 +41,8 @@ struct SplitRun {
 
 /** Whether the weight with fp32 bits `bits`, scaled, splits exactly: the last part is what the others leave, all three sum to it. */
 [[nodiscard]] constexpr auto split_exact(unsigned bits) -> bool {
-	float const scaled = math::from_bits(bits) * weight_scale;
-	Parts const parts = split(scaled);
+	float const scaled = math::from_bits(bits) * model::attention::weight_scale;
+	Parts const parts = split(scaled, PvParts::Three);
 	float const after_high = scaled - prims::widen(parts.part[0]);
 	float const rest = after_high - prims::widen(parts.part[1]);
 	float const low_two = prims::widen(parts.part[1]) + prims::widen(parts.part[2]);

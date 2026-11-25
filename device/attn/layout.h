@@ -7,6 +7,7 @@
 
 #include "attn/geometry.h"
 #include "prims/budget.h"
+#include "prims/stage_ring.h"
 
 namespace engine::device::attn {
 
@@ -84,12 +85,6 @@ struct alignas(16) Piece {
 	unsigned word[4];
 };
 
-/** The kv ring's full and empty mbarriers, one each per stage. */
-struct RingStorage {
-	alignas(8) unsigned long long full[ring_stages];
-	alignas(8) unsigned long long empty[ring_stages];
-};
-
 template<class Tile>
 struct CoreShared {
 	alignas(128) Piece stage[ring_stages][tile_bytes / chunk_bytes];
@@ -97,15 +92,14 @@ struct CoreShared {
 	alignas(128) Piece fresh[kinds][max_rows * row_chunks];
 	alignas(128) Piece weights[3][Tile::tile_rows * 4];
 	alignas(16) float scores[Tile::tile_rows][score_stride];
-	RingStorage ring;
+	prims::StageBarriers<ring_stages> ring;
 	float maximum[Tile::tile_rows];
 	float total[Tile::tile_rows];
 	float rescale[Tile::tile_rows];
 	unsigned active[Tile::tile_rows];
 	float final_maximum[Tile::tile_rows];
 	float final_total[Tile::tile_rows];
-	float merge_left[Tile::tile_rows];
-	float merge_right[Tile::tile_rows];
+	model::attention::Merge merge[Tile::tile_rows];
 	Fold fold[Tile::tile_rows];
 	Cycle cycle;
 	Assignment assignment;

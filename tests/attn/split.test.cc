@@ -7,6 +7,7 @@
 // The device check's own criterion agrees with the double one on every value tried.
 import std;
 import engine.attn;
+import engine.model;
 import engine.prims;
 import engine.testing;
 
@@ -17,7 +18,7 @@ namespace prims = engine::device::prims;
 
 /** Whether `scaled` is exactly the sum of its parts, and the device check says so too. */
 [[nodiscard]] auto exact(float scaled) -> bool {
-	auto const parts = attn::split(scaled);
+	auto const parts = attn::split(scaled, attn::PvParts::Three);
 	auto const sum = static_cast<double>(prims::widen(parts.part[0])) + static_cast<double>(prims::widen(parts.part[1])) +
 	                 static_cast<double>(prims::widen(parts.part[2]));
 	return sum == static_cast<double>(scaled);
@@ -34,7 +35,7 @@ struct Sweep {
 	auto result = Sweep{.checked = 0, .inexact = 0, .disagreements = 0};
 	for (auto bits = std::uint64_t{first}; bits < last; bits += stride) {
 		auto const weight = std::bit_cast<float>(static_cast<std::uint32_t>(bits));
-		auto const holds = exact(weight * attn::weight_scale);
+		auto const holds = exact(weight * engine::model::attention::weight_scale);
 		result.inexact += holds ? 0 : 1;
 		result.disagreements += holds == attn::selfcheck::split_exact(static_cast<std::uint32_t>(bits)) ? 0 : 1;
 		++result.checked;
@@ -73,8 +74,8 @@ struct Sweep {
 	auto sound = true;
 	auto checked = std::uint64_t{0};
 	auto const check = [&](float x) {
-		auto const scaled = attn::weight(x, 0.0F);
-		sound = sound && scaled >= 0.0F && scaled <= attn::weight_scale && exact(scaled);
+		auto const scaled = engine::model::attention::weight(x, 0.0F);
+		sound = sound && scaled >= 0.0F && scaled <= engine::model::attention::weight_scale && exact(scaled);
 		++checked;
 	};
 	// |x| in [64, 128): e^x runs from the normal range down through every subnormal to zero.
@@ -93,7 +94,7 @@ struct Sweep {
 	auto random = engine::testing::generator(7);
 	auto rounded = 0;
 	for (auto trial = 0; trial < 1000; ++trial) {
-		auto const weight = std::uniform_real_distribution<float>{0.0F, 1.0F}(random) * attn::weight_scale;
+		auto const weight = std::uniform_real_distribution<float>{0.0F, 1.0F}(random) * engine::model::attention::weight_scale;
 		auto const one = attn::split(weight, attn::PvParts::One);
 		rounded += static_cast<double>(prims::widen(one.part[0])) == static_cast<double>(weight) ? 0 : 1;
 	}

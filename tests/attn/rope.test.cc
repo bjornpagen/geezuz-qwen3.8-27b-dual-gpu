@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The rope and the norms against double precision: the inverse frequencies are theta^(-j/32) to the nearest fp32;
-// the shared sine and cosine are within the stated bound of the exact values at every angle the rope takes (every
-// position, every pair); and a prepared query or key is the exact normalized, rotated row to within its bf16 rounding.
+// The norms and the rope against double precision: a prepared query or key is the exact normalized, rotated row (by
+// the same fp32 angle) to within its bf16 rounding; and the rope table's layout gives every (position, pair) its own
+// eight bytes, a lane's eight pairs one contiguous 64-byte run. The rotations themselves are the model's, held to libm
+// by its own test.
 import std;
 import engine.attn;
 import engine.model;
@@ -13,44 +14,7 @@ namespace {
 
 namespace attn = engine::device::attn;
 namespace prims = engine::device::prims;
-
-/** The absolute error the shared sine and cosine stay within, over every angle the rope takes. */
-inline constexpr double sincos_bound = 0x1p-23;
-
-[[nodiscard]] auto frequencies_are_nearest() -> bool {
-	auto sound = true;
-	for (auto pair = 0; pair < attn::rotary_pairs; ++pair) {
-		auto const exact = std::pow(static_cast<double>(engine::model::rope_theta), -static_cast<double>(pair) / 32.0);
-		auto const got = static_cast<double>(attn::inverse_frequency.value[pair]);
-		auto const ulp = static_cast<double>(std::nextafter(static_cast<float>(got), 2.0F)) - got;
-		sound = sound && std::abs(got - exact) <= 0.5 * ulp * (1.0 + 0x1p-20);
-	}
-	return sound;
-}
-
-struct Errors {
-	double sine;
-	double cosine;
-};
-
-/** The largest errors of the shared sine and cosine over every (position, pair) the model takes. */
-[[nodiscard]] auto every_rope_angle() -> Errors {
-	auto worst = Errors{.sine = 0.0, .cosine = 0.0};
-	for (auto position = 0U; position < engine::model::max_positions; ++position) {
-		for (auto pair = 0; pair < attn::rotary_pairs; ++pair) {
-			auto const angle = attn::angle(position, pair);
-			auto const turn = attn::sincos(angle);
-			worst.sine = std::max(worst.sine, std::abs(static_cast<double>(turn.sine) - std::sin(static_cast<double>(angle))));
-			worst.cosine = std::max(worst.cosine, std::abs(static_cast<double>(turn.cosine) - std::cos(static_cast<double>(angle))));
-		}
-	}
-	return worst;
-}
-
-[[nodiscard]] auto sincos_within_bound() -> bool {
-	auto const worst = every_rope_angle();
-	return worst.sine <= sincos_bound && worst.cosine <= sincos_bound;
-}
+namespace rope = engine::model::rope;
 
 /** A prepared row against the exact norm and rotation in double (by the same fp32 angle), within bf16 rounding. */
 [[nodiscard]] auto prepared_rows_are_exact_to_bf16(std::uint64_t seed) -> bool {
@@ -64,7 +28,8 @@ struct Errors {
 			projection.at(index) = std::normal_distribution<float>{0.0F, scale}(random);
 			weight.at(index) = prims::round_to_bf16(std::normal_distribution<float>{0.0F, 0.3F}(random));
 		}
-		auto const position = std::uniform_int_distribution<std::uint32_t>{0, static_cast<std::uint32_t>(engine::model::max_positions) - 1}(random);
+		auto const position =
+		    std::uniform_int_distribution<std::uint32_t>{0, static_cast<std::uint32_t>(engine::model::max_positions) - 1}(random);
 		auto const row = engine::attn::prepare_rotated(projection, weight, position);
 		auto squares = 0.0;
 		for (auto const value : projection) {
@@ -73,11 +38,12 @@ struct Errors {
 		auto const inverse = 1.0 / std::sqrt(squares / 256.0 + static_cast<double>(engine::model::rms_norm_eps));
 		auto normal = std::array<double, 256>{};
 		for (auto index = std::size_t{0}; index < 256; ++index) {
-			normal.at(index) = static_cast<double>(projection.at(index)) * inverse * (1.0 + static_cast<double>(prims::widen(weight.at(index))));
+			normal.at(index) =
+			    static_cast<double>(projection.at(index)) * inverse * (1.0 + static_cast<double>(prims::widen(weight.at(index))));
 		}
 		auto exact = normal;
 		for (auto pair = std::size_t{0}; pair < 32; ++pair) {
-			auto const angle = static_cast<double>(attn::angle(position, static_cast<int>(pair)));
+			auto const angle = static_cast<double>(rope::angle(position, pair));
 			exact.at(pair) = normal.at(pair) * std::cos(angle) - normal.at(pair + 32) * std::sin(angle);
 			exact.at(pair + 32) = normal.at(pair + 32) * std::cos(angle) + normal.at(pair) * std::sin(angle);
 		}
@@ -95,14 +61,29 @@ struct Errors {
 	return sound;
 }
 
+/** Every table entry is its own eight bytes, in [position][pair] order, filling the table exactly. */
+[[nodiscard]] auto table_entries_tile_the_table() -> bool {
+	auto sound = attn::rope_table_bytes == engine::model::max_positions * rope::pairs * 8;
+	for (auto const position : {std::size_t{0}, std::size_t{1}, std::size_t{4095}, engine::model::max_positions - 1}) {
+		for (auto pair = std::size_t{0}; pair < rope::pairs; ++pair) {
+			sound = sound && attn::rope_offset(position, pair) == (position * rope::pairs + pair) * 8;
+		}
+		// A lane reads pairs 8 r .. 8 r + 7 as four chunks from the first pair's offset, 16-byte aligned.
+		for (auto lane = std::size_t{0}; lane < 4; ++lane) {
+			sound = sound && attn::rope_offset(position, lane * 8) % 16 == 0;
+		}
+	}
+	return sound && attn::rope_offset(engine::model::max_positions - 1, rope::pairs - 1) + 8 == attn::rope_table_bytes;
+}
+
 }
 
 auto main() -> int {
 	auto const cases = std::array{
-	    engine::testing::Case{.name = "the inverse frequencies are the nearest fp32 of theta^(-j/32)", .holds = frequencies_are_nearest()},
-	    engine::testing::Case{.name = "sine and cosine are within 2^-23 at every rope angle", .holds = sincos_within_bound()},
 	    engine::testing::Case{.name = "prepared queries and keys are the exact rows to within bf16 rounding (seed 1)",
-	                          .holds = prepared_rows_are_exact_to_bf16(1)},
+		                      .holds = prepared_rows_are_exact_to_bf16(1)},
+	    engine::testing::Case{.name = "the rope table gives every (position, pair) its own eight bytes",
+		                      .holds = table_entries_tile_the_table()},
 	};
 	return engine::testing::report(cases);
 }

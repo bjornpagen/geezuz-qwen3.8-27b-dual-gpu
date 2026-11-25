@@ -107,14 +107,14 @@ export struct CheckCoreFewSms {
 	using Params = device::CoreParams;
 };
 
-/** The rope's sines and cosines folded per block into u64 digests (zeroed first); `rope_digest` is the host's. */
-export struct DigestRope {
+/** The rope table every row reads, filled once at start by evaluating `model::rope::rotation` on the device. */
+export struct RopeTable {
 	static constexpr ptx::Image image = attn::image;
-	static constexpr std::string_view entry = "attn_digest_rope";
-	static constexpr driver::Dim grid = {.x = device::selfcheck::digest_blocks, .y = 1, .z = 1};
-	static constexpr prims::Budget budget = device::selfcheck::digest_budget;
+	static constexpr std::string_view entry = "attn_rope_table";
+	static constexpr driver::Dim grid = {.x = device::selfcheck::rope_blocks, .y = 1, .z = 1};
+	static constexpr prims::Budget budget = device::selfcheck::rope_budget;
 	static constexpr driver::Residency residency = driver::Residency::Ordinary;
-	/** The address of `digest_blocks` u64 digests. */
+	/** The address of `rope_table_bytes` of device memory. */
 	using Params = device::Address;
 };
 
@@ -133,18 +133,6 @@ static_assert(driver::Kernel<Append> && driver::Kernel<Prefill> && driver::Kerne
 static_assert(driver::Kernel<DecodeCore<1>> && driver::Kernel<DecodeCore<2>> && driver::Kernel<DecodeCore<3>>);
 static_assert(driver::Kernel<DecodeCore<4>> && driver::Kernel<DecodeCore<5>>);
 static_assert(driver::Kernel<U21OnePart<3>> && driver::Kernel<U21OnePart<5>> && driver::Kernel<CheckCoreFewSms>);
-static_assert(driver::Kernel<DigestRope> && driver::Kernel<CheckSplit>);
-
-/** The digest `attn_digest_rope` writes for block `block`, computed on the host. */
-export [[nodiscard]] constexpr auto rope_digest(std::uint32_t block) -> std::uint64_t {
-	auto sum = std::uint64_t{0};
-	for (auto thread = 0U; thread < static_cast<unsigned>(device::selfcheck::digest_budget.threads); ++thread) {
-		auto const position = block * static_cast<unsigned>(device::selfcheck::digest_budget.threads) + thread;
-		for (auto pair = 0; pair < device::rotary_pairs; ++pair) {
-			sum += device::selfcheck::rope_term(position, pair);
-		}
-	}
-	return sum;
-}
+static_assert(driver::Kernel<RopeTable> && driver::Kernel<CheckSplit>);
 
 }

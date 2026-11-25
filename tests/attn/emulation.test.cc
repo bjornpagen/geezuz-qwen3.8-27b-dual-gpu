@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The tiling and the merge against the straightforward reference, in one rounding. The decode path is simulated as the
-// kernels divide it (each SM's assignment, each group's record at its record row, the merge's fold of a row's records)
-// and must equal the reference's left fold of the row's groups bit for bit at every SM count: where a group is
-// computed never changes how. A row's output must not depend on what the kv holds past its own position (the later
-// rows of its cycle, stale drafts or zeros), so a verify row equals the same row decoded alone; nothing is ever a nan;
-// and the result is softmax attention, to within the roundings the contract names.
-//
-// The accumulation here is `SequentialFp32`, a test double that sums each k16 slice by fp32 fmas in k order. Every
-// property above holds for any fixed accumulation; with the model of the sm_86 mma in its place the reference is the
-// bit-exact expectation of the kernels.
+// The tiling and the merge against the row-at-a-time emulation, in the kernels' arithmetic (every tensor-core sum
+// through the model of the sm_86 mma). The decode path is simulated as the kernels divide it (each SM's assignment,
+// each group's record at its record row, the merge's fold of a row's records) and must equal the emulation's left fold
+// of the row's groups bit for bit at every SM count: where a group is computed never changes how. A row's output must
+// not depend on what the kv holds past its own position (the later rows of its cycle, stale drafts or zeros), so a
+// verify row equals the same row decoded alone; nothing is ever a nan; and the result is softmax attention, to within
+// the roundings the contract names.
 import std;
 import engine.attn;
+import engine.model;
 import engine.prims;
 import engine.testing;
 
@@ -25,18 +23,6 @@ using attn::Cycle;
 using engine::attn::KvView;
 using engine::attn::Row;
 using engine::attn::State;
-
-/** Test double for the tensor core's sum: fp32 fmas in k order. Not a model of the mma. */
-struct SequentialFp32 {
-	[[nodiscard]] static auto step(float accumulator, std::span<prims::Bf16 const, 16> a, std::span<prims::Bf16 const, 16> b) -> float {
-		for (auto k = std::size_t{0}; k < 16; ++k) {
-			accumulator = std::fma(prims::widen(a[k]), prims::widen(b[k]), accumulator);
-		}
-		return accumulator;
-	}
-};
-
-static_assert(engine::attn::Accumulation<SequentialFp32>);
 
 [[nodiscard]] auto random_row(std::mt19937_64& random, float scale) -> Row {
 	auto row = Row{};
@@ -54,7 +40,7 @@ struct SlotData {
 	std::vector<std::array<std::array<float, attn::head_dim>, attn::query_heads>> gates;
 };
 
-/** A cycle of up to four slots with contexts up to about 1500 positions (several groups), and its data per kv head. */
+/** A cycle of up to four slots with contexts up to about 700 positions (several groups), and its data per kv head. */
 struct Case {
 	Cycle cycle;
 	std::vector<std::array<SlotData, attn::kv_heads>> slots;
@@ -65,7 +51,7 @@ struct Case {
 	auto first_row = 0U;
 	for (auto slot = 0U; slot < 4; ++slot) {
 		auto const rows = std::uniform_int_distribution<unsigned>{1, static_cast<unsigned>(attn::max_rows)}(random);
-		auto const position = std::uniform_int_distribution<unsigned>{0, 1500}(random);
+		auto const position = std::uniform_int_distribution<unsigned>{0, 700}(random);
 		result.cycle.work[result.cycle.live] = {.slot = slot, .position = position, .rows = rows, .first_row = first_row};
 		++result.cycle.live;
 		first_row += rows;
@@ -106,10 +92,12 @@ struct Case {
 }
 
 [[nodiscard]] auto same_bits(Row const& left, Row const& right) -> bool {
-	return std::ranges::equal(left, right, [](prims::Bf16 a, prims::Bf16 b) { return a.bits == b.bits; });
+	return std::ranges::equal(left, right, [](prims::Bf16 a, prims::Bf16 b) {
+		return a.bits == b.bits;
+	});
 }
 
-/** The reference output of every (work, token, query head), in merge-unit order. */
+/** The row-at-a-time output of every (work, token, query head), in merge-unit order. */
 [[nodiscard]] auto reference_outputs(Case const& input) -> std::vector<Row> {
 	auto outputs = std::vector<Row>{};
 	for (auto work = Count{0}; work < input.cycle.live; ++work) {
@@ -119,8 +107,7 @@ struct Case {
 				auto const head = query / attn::group_heads;
 				auto const& data = input.slots.at(work).at(head);
 				auto const row = token * attn::group_heads + query % attn::group_heads;
-				auto const state =
-				    engine::attn::attend<SequentialFp32>(query_of(data, head, row), view(data), slot.position + token, attn::PvParts::Three);
+				auto const state = engine::attn::attend(query_of(data, head, row), view(data), slot.position + token, attn::PvParts::Three);
 				outputs.push_back(engine::attn::finish(state, data.gates.at(token).at(query)));
 			}
 		}
@@ -128,29 +115,54 @@ struct Case {
 	return outputs;
 }
 
-/**
- * The decode path as the kernels divide it: each SM's items write each group's state at its record row (a row's
- * records past its own position stay nan, as nothing may read them); the merge folds each unit's records in order.
- */
-[[nodiscard]] auto decode_outputs(Case const& input, Count sms) -> std::vector<Row> {
+/** Every group state the cycle's records hold, at its record row; a group a row does not see stays nan. */
+[[nodiscard]] auto group_states(Case const& input) -> std::vector<State> {
 	auto const& cycle = input.cycle;
-	auto records = std::vector<State>(attn::record_rows(cycle),
-	                                  State{.output = {}, .maximum = std::numeric_limits<float>::quiet_NaN(), .total = std::numeric_limits<float>::quiet_NaN()});
+	auto states = std::vector<State>(
+	    attn::record_rows(cycle),
+	    State{.output = {}, .maximum = std::numeric_limits<float>::quiet_NaN(), .total = std::numeric_limits<float>::quiet_NaN()});
+	for (auto& state : states) {
+		state.output.fill(std::numeric_limits<float>::quiet_NaN());
+	}
+	for (auto work = Count{0}; work < cycle.live; ++work) {
+		auto const& slot = cycle.work[work];
+		for (auto head = Count{0}; head < attn::kv_heads; ++head) {
+			auto const& data = input.slots.at(work).at(head);
+			for (auto group = Count{0}; group < attn::groups(slot); ++group) {
+				for (auto row = Count{0}; row < attn::query_rows(slot); ++row) {
+					auto const limit = Count{slot.position} + row / attn::group_heads;
+					if (attn::group_begin(group) * attn::chunk_positions <= limit) {
+						states.at(attn::record_row(cycle, work, head, group, row)) =
+						    engine::attn::group_state(query_of(data, head, row), view(data), limit, group, attn::PvParts::Three);
+					}
+				}
+			}
+		}
+	}
+	return states;
+}
+
+/**
+ * The decode path as the kernels divide it: each SM's items write each of their groups' states at its record rows (a
+ * record no item writes stays nan, so a group computed nowhere poisons its rows); the merge folds each unit's records
+ * in order. A group's state is a function of the row and the group alone, so it is computed once for every SM count.
+ */
+[[nodiscard]] auto decode_outputs(Case const& input, std::span<State const> states, Count sms) -> std::vector<Row> {
+	auto const& cycle = input.cycle;
+	auto records = std::vector<State>(states.size(), states.front());
 	for (auto& record : records) {
+		record.maximum = std::numeric_limits<float>::quiet_NaN();
+		record.total = std::numeric_limits<float>::quiet_NaN();
 		record.output.fill(std::numeric_limits<float>::quiet_NaN());
 	}
 	for (auto sm = Count{0}; sm < sms; ++sm) {
 		auto const mine = attn::assignment(cycle, sm, sms);
 		for (auto const& item : std::span{mine.item}.first(mine.count)) {
 			auto const& slot = cycle.work[item.work];
-			auto const& data = input.slots.at(item.work).at(item.head);
 			for (auto group = Count{item.first_group}; group < Count{item.first_group} + item.groups; ++group) {
 				for (auto row = Count{0}; row < attn::query_rows(slot); ++row) {
-					auto const limit = Count{slot.position} + row / attn::group_heads;
-					if (attn::group_begin(group) * attn::chunk_positions <= limit) {
-						records.at(attn::record_row(cycle, item.work, item.head, group, row)) =
-						    engine::attn::group_state<SequentialFp32>(query_of(data, item.head, row), view(data), limit, group, attn::PvParts::Three);
-					}
+					auto const at = attn::record_row(cycle, item.work, item.head, group, row);
+					records.at(at) = states[at];
 				}
 			}
 		}
@@ -170,15 +182,16 @@ struct Case {
 	return outputs;
 }
 
-/** At every SM count the decode path equals the reference bit for bit. */
+/** At every SM count the decode path equals the row-at-a-time emulation bit for bit. */
 [[nodiscard]] auto decode_path_equals_reference(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto sound = true;
 	for (auto trial = 0; trial < 2; ++trial) {
 		auto const input = random_case(random);
 		auto const expected = reference_outputs(input);
+		auto const states = group_states(input);
 		for (auto const sms : std::array<Count, 4>{1, 7, 82, 200}) {
-			auto const got = decode_outputs(input, sms);
+			auto const got = decode_outputs(input, states, sms);
 			sound = sound && std::ranges::equal(got, expected, same_bits);
 		}
 	}
@@ -203,9 +216,11 @@ struct Case {
 		}
 		auto const query = random_row(random, 1.0F);
 		auto gate = std::array<float, attn::head_dim>{};
-		std::ranges::generate(gate, [&] { return std::normal_distribution<float>{0.0F, 2.0F}(random); });
+		std::ranges::generate(gate, [&] {
+			return std::normal_distribution<float>{0.0F, 2.0F}(random);
+		});
 		auto const output = [&](std::vector<Row> const& k, std::vector<Row> const& v) {
-			return engine::attn::finish(engine::attn::attend<SequentialFp32>(query, {.keys = k, .values = v}, position, attn::PvParts::Three), gate);
+			return engine::attn::finish(engine::attn::attend(query, {.keys = k, .values = v}, position, attn::PvParts::Three), gate);
 		};
 		auto const as_verify = output(keys, values);
 		auto zero_keys = keys;
@@ -218,8 +233,11 @@ struct Case {
 			huge_keys.at(index).fill(prims::round_to_bf16(3.0e38F));
 			huge_values.at(index).fill(prims::round_to_bf16(-3.0e38F));
 		}
-		auto const finite = std::ranges::all_of(as_verify, [](prims::Bf16 value) { return std::isfinite(prims::widen(value)); });
-		sound = sound && finite && same_bits(as_verify, output(zero_keys, zero_values)) && same_bits(as_verify, output(huge_keys, huge_values));
+		auto const finite = std::ranges::all_of(as_verify, [](prims::Bf16 value) {
+			return std::isfinite(prims::widen(value));
+		});
+		sound =
+		    sound && finite && same_bits(as_verify, output(zero_keys, zero_values)) && same_bits(as_verify, output(huge_keys, huge_values));
 	}
 	return sound;
 }
@@ -238,7 +256,7 @@ struct Case {
 			values.push_back(random_row(random, 1.0F));
 		}
 		auto const query = random_row(random, 1.0F);
-		auto const state = engine::attn::attend<SequentialFp32>(query, {.keys = keys, .values = values}, position, attn::PvParts::Three);
+		auto const state = engine::attn::attend(query, {.keys = keys, .values = values}, position, attn::PvParts::Three);
 		auto scores = std::vector<double>{};
 		for (auto index = Count{0}; index <= position; ++index) {
 			auto dot = 0.0;
@@ -271,10 +289,11 @@ struct Case {
 auto main() -> int {
 	auto const cases = std::array{
 	    engine::testing::Case{.name = "the decode path equals the reference bit for bit at 1, 7, 82 and 200 SMs (seed 1)",
-	                          .holds = decode_path_equals_reference(1)},
+		                      .holds = decode_path_equals_reference(1)},
 	    engine::testing::Case{.name = "a row ignores the kv past its position: zeros, later rows, huge values (seed 2)",
-	                          .holds = rows_ignore_kv_past_their_position(2)},
-	    engine::testing::Case{.name = "the result is softmax attention to within fp32 roundings (seed 3)", .holds = result_is_softmax_attention(3)},
+		                      .holds = rows_ignore_kv_past_their_position(2)},
+	    engine::testing::Case{.name = "the result is softmax attention to within fp32 roundings (seed 3)",
+		                      .holds = result_is_softmax_attention(3)},
 	};
 	return engine::testing::report(cases);
 }

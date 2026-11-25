@@ -52,12 +52,10 @@ inline constexpr Kind kinds_in_order[kinds] = {Kind::Key, Kind::Value};
 using KvRing = prims::StageRing<ring_stages, 32, consumer_warps>;
 using Cursor = KvRing::Cursor;
 
-static_assert(sizeof(KvRing::Storage) == sizeof(RingStorage) && alignof(KvRing::Storage) == alignof(RingStorage));
-
 /** The ring over the barriers a core layout holds. */
 template<class Tile>
 [[nodiscard]] __attribute__((device, always_inline)) inline auto kv_ring(CoreShared<Tile>& shared) -> KvRing {
-	return {.full_base = prims::shared_address(shared.ring.full), .empty_base = prims::shared_address(shared.ring.empty)};
+	return KvRing::at(shared.ring);
 }
 
 /** The query tile: query row j at row j of a swizzled tile, like a kv tile's positions. */
@@ -104,8 +102,12 @@ __attribute__((device, always_inline)) inline void load_floats(float const* row,
 // ---------------------------------------------------------------------------------------------------------------------
 // The preparation of a row, one warp per row, lane L holding features [8L, 8L + 8).
 
-/** q_norm or k_norm, then the rope at `position`: the lane's chunk of the rotated row, still fp32. */
-__attribute__((device, always_inline)) inline void normalize_and_rotate(float (&values)[lane_features], prims::Chunk weight, unsigned position) {
+/**
+ * q_norm or k_norm, then the rope at `position` with the rotations of the table at `rotations`: the lane's chunk of
+ * the rotated row, still fp32. The norm's sum is `model::attention_head`'s: the lane's fold, then the warp's butterfly.
+ */
+__attribute__((device, always_inline)) inline void normalize_and_rotate(float (&values)[lane_features], prims::Chunk weight, unsigned position,
+                                                                        Address rotations) {
 	float const inverse = inverse_rms(prims::warp_sum(lane_squares(values)));
 #pragma unroll
 	for (unsigned index = 0; index < lane_features; ++index) {
@@ -119,13 +121,21 @@ __attribute__((device, always_inline)) inline void normalize_and_rotate(float (&
 	for (unsigned index = 0; index < lane_features; ++index) {
 		partner[index] = __builtin_bit_cast(float, prims::exchange(__builtin_bit_cast(unsigned, values[index]), 4));
 	}
-	// Lanes 0-3 hold features 0-31, the first of each pair; lanes 4-7 hold 32-63, the second.
+	// Lanes 0-3 hold features 0-31, the first of each pair; lanes 4-7 hold 32-63, the second. A lane's eight pairs are
+	// 64 contiguous bytes of the table: four chunks of two rotations.
 	if (lane < 8) {
+		auto const reused = prims::policy<prims::Eviction::Last>();
+		auto const* table = at<prims::Chunk const>(rotations + rope_offset(position, Count{lane % 4U} * features_per_chunk));
 #pragma unroll
-		for (unsigned index = 0; index < lane_features; ++index) {
-			int const pair = static_cast<int>((lane % 4U) * lane_features + index);
-			SinCos const turn = sincos(angle(position, pair));
-			values[index] = lane < 4 ? rotate_first(values[index], partner[index], turn) : rotate_second(partner[index], values[index], turn);
+		for (unsigned chunk = 0; chunk < lane_features / 2; ++chunk) {
+			prims::Chunk const turns = prims::load(table + chunk, reused);
+#pragma unroll
+			for (unsigned half = 0; half < 2; ++half) {
+				unsigned const index = 2 * chunk + half;
+				Count const word = Count{2} * half;
+				Rotation const turn = {.cosine = __builtin_bit_cast(float, turns.word[word]), .sine = __builtin_bit_cast(float, turns.word[word + 1])};
+				values[index] = lane < 4 ? model::rope::first(values[index], partner[index], turn) : model::rope::second(partner[index], values[index], turn);
+			}
 		}
 	}
 }
@@ -171,13 +181,13 @@ struct Core {
 
 	/** The queries of every job and, in decode, the kv its rows append. */
 	template<Fresh fresh, class Jobs>
-	__attribute__((device, always_inline)) static void prepare(Shared& shared, Jobs const& jobs, KvPool kv, Projections rows, NormWeights norms) {
+	__attribute__((device, always_inline)) static void prepare(Shared& shared, Jobs const& jobs, KvPool kv, Projections rows, Preparation preparation) {
 		unsigned const warp = Preparers::rank(prims::warp_in_block());
 		unsigned const lane = prims::lane();
 		auto const reused = prims::policy<prims::Eviction::Last>();
 		auto const appended = prims::policy<prims::Eviction::Normal>();
-		prims::Chunk const query_weight = prims::load_constant(at<prims::Chunk const>(norms.query) + lane, reused);
-		prims::Chunk const key_weight = prims::load_constant(at<prims::Chunk const>(norms.key) + lane, reused);
+		prims::Chunk const query_weight = prims::load_constant(at<prims::Chunk const>(preparation.query) + lane, reused);
+		prims::Chunk const key_weight = prims::load_constant(at<prims::Chunk const>(preparation.key) + lane, reused);
 		prims::SharedAddress const query_tile = prims::shared_address(shared.query);
 		for (unsigned index = 0; index < jobs.count(); ++index) {
 			if (index > 0) {
@@ -193,7 +203,7 @@ struct Core {
 					float values[lane_features] = {};
 					float const* source = at<float const>(rows.query) + (Count{job.work.first_row} + token) * query_row_floats + head * head_dim;
 					load_floats(source, lane, reused, values);
-					normalize_and_rotate(values, query_weight, job.work.position + token);
+					normalize_and_rotate(values, query_weight, job.work.position + token, preparation.rotations);
 					chunk = pack_chunk(values);
 				}
 				prims::store_shared(query_tile.plus(static_cast<unsigned>(Queries::offset(static_cast<int>(row), static_cast<int>(lane)))), chunk);
@@ -209,7 +219,7 @@ struct Core {
 					float values[lane_features] = {};
 					if (kind == Kind::Key) {
 						load_floats(at<float const>(rows.key) + row * kv_row_floats + job.head * head_dim, lane, reused, values);
-						normalize_and_rotate(values, key_weight, static_cast<unsigned>(position));
+						normalize_and_rotate(values, key_weight, static_cast<unsigned>(position), preparation.rotations);
 					} else {
 						load_floats(at<float const>(rows.value) + row * kv_row_floats + job.head * head_dim, lane, reused, values);
 					}
@@ -273,7 +283,7 @@ struct Core {
 			prims::fragment::Coordinate const at_element = prims::fragment::c(static_cast<int>(lane), static_cast<int>(reg));
 			unsigned const position = 16U * half + static_cast<unsigned>(at_element.row);
 			unsigned const row = 8U * n_tile + static_cast<unsigned>(at_element.column);
-			shared.scores[row][position] = score(sum.reg[reg]);
+			shared.scores[row][position] = model::attention::score(sum.reg[reg]);
 		}
 	}
 
@@ -299,13 +309,13 @@ struct Core {
 				float const value = shared.scores[row][lane];
 				float const chunk_maximum = prims::warp_max(visible ? value : -math::infinity);
 				float const running = first_of_group ? -math::infinity : shared.maximum[row];
-				Advance const step = advance(running, chunk_maximum);
-				weight_value = visible ? weight(value, step.maximum) : 0.0F;
+				model::attention::Advance const step = model::attention::advance(running, chunk_maximum);
+				weight_value = visible ? model::attention::weight(value, step.maximum) : 0.0F;
 				float const sum = prims::warp_sum(weight_value);
 				float const kept_total = first_of_group ? 0.0F : shared.total[row];
 				if (lane == 0) {
 					shared.maximum[row] = step.maximum;
-					shared.total[row] = running_total(kept_total, step.rescale, sum);
+					shared.total[row] = model::attention::running_total(kept_total, step.rescale, sum);
 					shared.rescale[row] = step.rescale;
 					shared.active[row] = 1;
 				}
@@ -330,7 +340,10 @@ struct Core {
 		prims::Accumulator tile[2][Tile::n_tiles];
 	};
 
-	/** O^T = O^T rescale + V^T P^T for the warp's 32 features; rows that saw nothing of the chunk keep their values. */
+	/**
+	 * O^T = O^T rescale + V^T P^T for the warp's 32 features, in `model::Sum::ChunkValues`' order: each part (hi, mid, lo)
+	 * over both k16 steps of positions before the next part. Rows that saw nothing of the chunk keep their values.
+	 */
 	template<PvParts parts>
 	__attribute__((device, always_inline)) static void accumulate(Shared& shared, Cursor cursor, unsigned warp, Outputs& outputs) {
 		unsigned const lane = prims::lane();
@@ -360,7 +373,7 @@ struct Core {
 			for (unsigned half = 0; half < 2; ++half) {
 #pragma unroll
 				for (unsigned reg = 0; reg < 4; ++reg) {
-					outputs.tile[half][n_tile].reg[reg] = outputs.tile[half][n_tile].reg[reg] * rescale[reg % 2];
+					outputs.tile[half][n_tile].reg[reg] = model::attention::rescaled(outputs.tile[half][n_tile].reg[reg], rescale[reg % 2]);
 				}
 			}
 #pragma unroll
@@ -441,12 +454,11 @@ struct Core {
 				shared.final_maximum[row] = shared.maximum[row];
 				shared.final_total[row] = shared.total[row];
 			} else {
-				Factors const weights = factors(shared.final_maximum[row], shared.maximum[row]);
+				model::attention::Merge const how = model::attention::merge(shared.final_maximum[row], shared.maximum[row]);
 				shared.fold[row] = Fold::Combine;
-				shared.merge_left[row] = weights.left;
-				shared.merge_right[row] = weights.right;
-				shared.final_total[row] = combine(shared.final_total[row], shared.total[row], weights);
-				shared.final_maximum[row] = weights.maximum;
+				shared.merge[row] = how;
+				shared.final_total[row] = model::attention::merged(shared.final_total[row], shared.total[row], how);
+				shared.final_maximum[row] = how.maximum;
 			}
 		}
 	}
@@ -462,9 +474,8 @@ struct Core {
 					unsigned const row = element(warp, half, n_tile, reg).row;
 					float const now = result.tile[half][n_tile].reg[reg];
 					float const added = group.tile[half][n_tile].reg[reg];
-					Factors const weights = {.maximum = 0.0F, .left = shared.merge_left[row], .right = shared.merge_right[row]};
 					Fold const how = shared.fold[row];
-					result.tile[half][n_tile].reg[reg] = how == Fold::Copy ? added : how == Fold::Combine ? combine(now, added, weights) : now;
+					result.tile[half][n_tile].reg[reg] = how == Fold::Copy ? added : how == Fold::Combine ? model::attention::merged(now, added, shared.merge[row]) : now;
 				}
 			}
 		}

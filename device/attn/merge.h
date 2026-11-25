@@ -51,13 +51,13 @@ __attribute__((device, always_inline)) inline void merge(Records records, Addres
 				value[index] = group_value[index];
 			}
 		} else {
-			Factors const weights = factors(maximum, group_maximum);
+			model::attention::Merge const how = model::attention::merge(maximum, group_maximum);
 #pragma unroll
 			for (unsigned index = 0; index < lane_features; ++index) {
-				value[index] = combine(value[index], group_value[index], weights);
+				value[index] = model::attention::merged(value[index], group_value[index], how);
 			}
-			total = combine(total, group_total, weights);
-			maximum = weights.maximum;
+			total = model::attention::merged(total, group_total, how);
+			maximum = how.maximum;
 		}
 	}
 	Count const token_row = Count{work.first_row} + unit.token;

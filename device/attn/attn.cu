@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // Attention's kernels: the prompt append and the prefill attention, the decode core for each row count a slot can
-// bring and the decode merge, the measurement variants U21 compares, and the self-checks that hold the device to the
-// host's arithmetic. The decode loop runs the same building blocks inside its persistent kernel; these entries run
-// them alone, for prefill, for the bring-up checks and for the microbenchmarks.
+// bring and the decode merge, the rope table's fill at start, the measurement variants U21 compares, and the self-checks
+// that hold the device to the host's arithmetic. The decode loop runs the same building blocks inside its persistent
+// kernel; these entries run them alone, for prefill, for the bring-up checks and for the microbenchmarks.
 #include "attn/arithmetic.h"
 #include "attn/core.h"
 #include "attn/geometry.h"
@@ -85,7 +85,7 @@ __attribute__((device, always_inline)) inline void decode_core(CoreParams params
 	} else if (Consumers::holds(warp)) {
 		[[maybe_unused]] Cursor const consumed = Core<Tile>::template consume<Sink::Records, Fresh::Appended, parts>(shared, jobs, ring, Cursor::start(), params.records, params.rows, 0);
 	} else {
-		Core<Tile>::template prepare<Fresh::Appended>(shared, jobs, params.kv, params.rows, params.norms);
+		Core<Tile>::template prepare<Fresh::Appended>(shared, jobs, params.kv, params.rows, params.preparation);
 	}
 }
 
@@ -117,7 +117,7 @@ extern "C" __attribute__((global, launch_bounds(attn::append_budget.threads, att
 	auto const appended = prims::policy<prims::Eviction::Normal>();
 	unsigned const lane = prims::lane();
 	unsigned const warps = static_cast<unsigned>(append_budget.threads / 32);
-	prims::Chunk const key_weight = prims::load_constant(at<prims::Chunk const>(params.norms.key) + lane, reused);
+	prims::Chunk const key_weight = prims::load_constant(at<prims::Chunk const>(params.preparation.key) + lane, reused);
 	unsigned const tasks = params.count * static_cast<unsigned>(kv_heads * kinds);
 	for (unsigned task = prims::block() * warps + prims::warp_in_block(); task < tasks; task += append_blocks * warps) {
 		unsigned const row = task / static_cast<unsigned>(kv_heads * kinds);
@@ -127,7 +127,7 @@ extern "C" __attribute__((global, launch_bounds(attn::append_budget.threads, att
 		float values[lane_features] = {};
 		if (kind == Kind::Key) {
 			load_floats(at<float const>(params.rows.key) + Count{row} * kv_row_floats + Count{head} * head_dim, lane, reused, values);
-			normalize_and_rotate(values, key_weight, static_cast<unsigned>(position));
+			normalize_and_rotate(values, key_weight, static_cast<unsigned>(position), params.preparation.rotations);
 		} else {
 			load_floats(at<float const>(params.rows.value) + Count{row} * kv_row_floats + Count{head} * head_dim, lane, reused, values);
 		}
@@ -164,7 +164,7 @@ extern "C" __attribute__((global, launch_bounds(prompt_budget.threads, prompt_bu
 		Records const none = {.output = 0, .running = 0};
 		[[maybe_unused]] Cursor const consumed = Core<Tile>::template consume<Sink::Output, Fresh::Cached, PvParts::Three>(shared, jobs, ring, Cursor::start(), none, params.rows, params.output);
 	} else {
-		Core<Tile>::template prepare<Fresh::Cached>(shared, jobs, params.kv, params.rows, params.norms);
+		Core<Tile>::template prepare<Fresh::Cached>(shared, jobs, params.kv, params.rows, params.preparation);
 	}
 }
 
@@ -259,22 +259,26 @@ extern "C" __attribute__((global, launch_bounds(core_rows5_budget.threads, core_
 	attn::decode_core<5, PvParts::Three, attn::selfcheck::few_sms>(params);
 }
 
-static_assert(prims::check(attn::selfcheck::digest_budget) == prims::Fit::Fits);
+static_assert(prims::check(attn::selfcheck::rope_budget) == prims::Fit::Fits);
 
 /**
- * The rope on the device: sine and cosine of every (position, pair) angle the model takes, folded per block into
- * `digests[block]` (zeroed by the host). The host folds its own evaluation over the same partition; equal digests mean
- * the device rotates by the host's bits.
+ * The rope table, filled once at start: `model::rope::rotation` of every (position, pair), evaluated here in ieee
+ * double, so every rotation the kernels read is the model's bits. `table` holds `attn::rope_table_bytes`. The bring-up
+ * check reads it back and compares it with the host's evaluation of the same function.
  */
-extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_attn_digest_rope = attn::selfcheck::digest_budget;
+extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_attn_rope_table = attn::selfcheck::rope_budget;
 
-extern "C" __attribute__((global, launch_bounds(attn::selfcheck::digest_budget.threads, attn::selfcheck::digest_budget.blocks_per_sm))) void attn_digest_rope(unsigned long long* digests) {
-	unsigned const position = prims::block() * static_cast<unsigned>(attn::selfcheck::digest_budget.threads) + prims::thread_in_block();
-	unsigned long long sum = 0;
-	for (int pair = 0; pair < attn::rotary_pairs; ++pair) {
-		sum += attn::selfcheck::rope_term(position, pair);
+extern "C" __attribute__((global, launch_bounds(attn::selfcheck::rope_budget.threads, attn::selfcheck::rope_budget.blocks_per_sm))) void attn_rope_table(attn::Address table) {
+	unsigned const position = prims::block() * static_cast<unsigned>(attn::selfcheck::rope_budget.threads) + prims::thread_in_block();
+	auto const written = prims::policy<prims::Eviction::Normal>();
+	auto* chunks = attn::at<prims::Chunk>(table + attn::rope_offset(position, 0));
+	for (unsigned pair = 0; pair < static_cast<unsigned>(attn::rotary_pairs); pair += 2) {
+		engine::model::rope::Rotation const first = engine::model::rope::rotation(position, pair);
+		engine::model::rope::Rotation const second = engine::model::rope::rotation(position, pair + 1);
+		prims::Chunk const both = {.word = {__builtin_bit_cast(unsigned, first.cosine), __builtin_bit_cast(unsigned, first.sine),
+		                                    __builtin_bit_cast(unsigned, second.cosine), __builtin_bit_cast(unsigned, second.sine)}};
+		prims::store(chunks + pair / 2, both, written);
 	}
-	prims::accumulate(&digests[prims::block()], sum);
 }
 
 static_assert(prims::check(attn::selfcheck::split_budget) == prims::Fit::Fits);

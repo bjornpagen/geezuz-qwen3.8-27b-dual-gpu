@@ -3,4 +3,4 @@ export module engine.attn;
 
 export import :spec;
 export import :image;
-export import :reference;
+export import :emulation;
