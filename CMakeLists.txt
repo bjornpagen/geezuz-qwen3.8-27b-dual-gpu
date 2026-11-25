@@ -108,6 +108,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_MODULE_STD ON)
 set(CMAKE_LINKER_TYPE LLD)
 
+# The production host is one known cpu, an epyc 7v13 (zen 3), so host code targets exactly it and vector paths compile
+# in without runtime dispatch. Every arm64 cpu has the neon the development mac's vector paths need.
+if(ENGINE_PLATFORM STREQUAL "linux")
+	string(APPEND CMAKE_CXX_FLAGS " -march=znver3")
+endif()
+
 # Module-ABI flags are global: CMake's synthesized std module sees only CMAKE_CXX_FLAGS, and its BMI must match
 # every importer. That includes the sanitizer and optimization choice of each personality.
 string(APPEND CMAKE_CXX_FLAGS
