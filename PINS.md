@@ -22,6 +22,7 @@ fixed, and update the facts below in the same commit as the bump.
 | senders | NVIDIA stdexec v0.11.0 (latest tag, 2026-11-11), commit `fc5937a544db908edbde37c9aa67b8d308e6a788` | top-level `CMakeLists.txt` (`FetchContent_Declare`) |
 | json | simdjson v5.3.0 (latest release, 2026-11-22), commit `34f8a72e512a4b3e1c88797d4152b474b6a26dc2`, archive SHA-256 `bdf285924b9607a1543db90d9e9b9c56ae8fe02d6a8b68ad99e8bf550fdaaf2d`; on-demand api, exceptions off, exactly one kernel per platform (arm64 neon on darwin, haswell avx2 on linux), no runtime dispatch | `foreign/simdjson/CMakeLists.txt` (`FetchContent_Declare`) |
 | host cpu target | linux: `-march=znver3` (the production epyc 7v13); darwin: the arm64 baseline | top-level `CMakeLists.txt` |
+| api reference | openai-python v3.59.0 (tag v3.59.0, commit `d296ec3be3a98b225d391ef81717b20320f9b598`; sdist `openai-3.59.0.tar.gz` SHA-256 `e4e57d5c28bed6efe6483c9f61ba59be13fa16edde4b771cdaf5c7ca70bc9ff1`): the responses api reference | `docs/API.md` |
 
 The presets search `/opt/local/libexec/llvm-23/bin` (`CMAKE_PROGRAM_PATH`) before `PATH` for `clang++`, so the
 development mac finds MacPorts clang without a shell change; the production box finds its system clang on `PATH`.
