@@ -9,3 +9,5 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/empty" "")
 file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/unreadable")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/unreadable" "x")
 file(CHMOD "${CMAKE_CURRENT_BINARY_DIR}/unreadable" PERMISSIONS OWNER_WRITE)
+
+engine_test(file.describe SOURCES describe.test.cc LINK engine_file)

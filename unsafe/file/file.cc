@@ -54,6 +54,27 @@ export struct [[nodiscard]] FileError {
 	[[nodiscard]] constexpr auto operator==(FileError const&) const -> bool = default;
 };
 
+/** One clause for an operator: why the file could not be mapped. Each failure reads differently. */
+export [[nodiscard]] auto describe(FileError const& error) -> std::string {
+	switch (error.failure) {
+	case Failure::NotFound:
+		return "no file exists at its path, or a component of the path is not a directory";
+	case Failure::Permission:
+		return "the process may not read the file";
+	case Failure::NotRegular:
+		return "the path names a directory, device, fifo or socket, not a regular file";
+	case Failure::Empty:
+		return "the file is empty";
+	case Failure::Exhausted:
+		return "the process ran out of descriptors or address space mapping the file (retrying later may succeed)";
+	case Failure::MapFailed:
+		return "the kernel refused to map the file";
+	case Failure::Unreadable:
+		return "the file cannot be opened or inspected (an i/o error, a symlink loop or an overlong name)";
+	}
+	std::unreachable();
+}
+
 [[nodiscard]] auto open_failure(int error) -> Failure {
 	switch (error) {
 	case ENOENT:
