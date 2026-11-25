@@ -14,17 +14,29 @@ namespace json = engine::json;
 namespace tok = engine::tokenizer;
 using engine_test_chat::RenderCase;
 using engine_test_chat::Spellings;
+using engine_test_chat::TemplateInput;
 
-/** A fixture case with its request decoded as the endpoint decodes it, and rendered. */
+/** A fixture case with its request read as the template takes it, made a conversation, and rendered. */
 struct Rendered {
 	RenderCase const& fixture;
-	std::optional<json::ChatRequest> request;
+	std::optional<TemplateInput> input;
 	std::optional<chat::Prompt> prompt;
-	std::optional<chat::RenderError> error;
+	/** The template's refusal, or the renderer's, by name. */
+	std::optional<std::string_view> error;
 };
 
 [[nodiscard]] auto decoded(tok::Tokenizer const& tokenizer, std::span<tok::Id const> ids) -> std::string {
 	return tokenizer.decode(ids).value_or("\xff");
+}
+
+[[nodiscard]] auto fault_name(chat::ShapeError const& error) -> std::string_view {
+	switch (error.fault) {
+	case chat::ShapeFault::NoUserQuery:
+		return "NoUserQuery";
+	case chat::ShapeFault::MisplacedSystem:
+		return "MisplacedSystem";
+	}
+	std::unreachable();
 }
 
 [[nodiscard]] auto fault_name(chat::RenderError const& error) -> std::string_view {
@@ -32,10 +44,6 @@ struct Rendered {
 		return "ReadError";
 	}
 	switch (std::get<chat::RenderFault>(error.cause)) {
-	case chat::RenderFault::NoUserQuery:
-		return "NoUserQuery";
-	case chat::RenderFault::MisplacedSystem:
-		return "MisplacedSystem";
 	case chat::RenderFault::NotUtf8:
 		return "NotUtf8";
 	}
@@ -59,11 +67,10 @@ template<class Applies, class Holds>
 	return checked > 0;
 }
 
-[[nodiscard]] auto marks_hold(tok::Tokenizer const& tokenizer, chat::Prompt const& prompt, json::ChatRequest const& request,
-                              std::string_view text) -> bool {
+[[nodiscard]] auto marks_hold(tok::Tokenizer const& tokenizer, chat::Prompt const& prompt, chat::Options options, std::string_view text) -> bool {
 	auto const im_start = tok::id(tok::Added::im_start);
 	auto const ids = std::span{prompt.ids};
-	auto const thinking = request.template_options.thinking != json::Thinking::Disabled;
+	auto const thinking = options.thinking == chat::Thinking::Enabled;
 	auto const generation = decoded(tokenizer, ids.subspan(prompt.generation));
 	auto const system_blocks = text.starts_with("<|im_start|>system") ? 1 : 0;
 	return ids[prompt.first_turn] == im_start && ids[prompt.last_query] == im_start &&
@@ -128,58 +135,62 @@ enum class Client : std::uint8_t {
 	Defused,
 };
 
-[[nodiscard]] auto random_request(std::mt19937_64& rng, json::Reader<json::fragment_bounds>& reader, Client client_text)
-    -> json::ChatRequest {
+/** A random chat the template renders; `past` says whether it may drop past reasoning. */
+[[nodiscard]] auto random_conversation(std::mt19937_64& rng, json::Reader<json::fragment_bounds>& reader, Client client_text, chat::PastThinking past)
+    -> chat::Conversation {
 	auto const client = [&](std::string written) {
 		return client_text == Client::Defused ? defused(std::move(written)) : written;
 	};
 	auto const roll = [&rng](int sides) {
 		return std::uniform_int_distribution<int>{0, sides - 1}(rng);
 	};
-	auto request = json::ChatRequest{};
-	request.template_options.thinking = roll(2) == 0 ? json::Thinking::Enabled : json::Thinking::Disabled;
-	auto constexpr efforts = std::array{json::ReasoningEffort::Low, json::ReasoningEffort::Medium, json::ReasoningEffort::XHigh};
-	request.template_options.reasoning_effort = efforts.at(static_cast<std::size_t>(roll(3)));
-	request.template_options.past_thinking = json::PastThinking::Preserved;
+	auto constexpr efforts = std::array{chat::Effort::Low, chat::Effort::Medium, chat::Effort::XHigh};
+	auto const options = chat::Options{
+	    .thinking = roll(2) == 0 ? chat::Thinking::Enabled : chat::Thinking::Disabled,
+	    .effort = efforts.at(static_cast<std::size_t>(roll(3))),
+	    .past_thinking = past,
+	};
+	auto tools = std::vector<std::string>{};
 	for (auto tool = roll(3); tool > 0; --tool) {
-		auto const name = client(text(rng));
-		auto const definition =
-		    std::format(R"({{"type":"function","function":{{"name":"{}","description":"{}"}}}})", name, client(text(rng)));
-		request.tools.push_back(json::Tool{.name = name, .input = json::FunctionTool{.parameters = std::nullopt}, .definition = json_text(reader, definition)});
+		tools.push_back(std::format(R"({{"type":"function","function":{{"name":"{}","description":"{}"}}}})", client(text(rng)), client(text(rng))));
 	}
+	auto turns = std::vector<chat::Turn>{};
 	if (roll(2) == 0) {
-		request.messages.emplace_back(json::SystemMessage{.content = client(text(rng))});
+		turns.emplace_back(chat::SystemTurn{.text = client(text(rng))});
 	}
-	request.messages.emplace_back(json::UserMessage{.content = "a question"});
+	turns.emplace_back(chat::UserTurn{.text = "a question"});
 	for (auto turn = roll(6); turn > 0; --turn) {
 		switch (roll(3)) {
 		case 0:
-			request.messages.emplace_back(json::UserMessage{.content = client(text(rng))});
+			turns.emplace_back(chat::UserTurn{.text = client(text(rng))});
 			break;
 		case 1: {
-			auto assistant = json::AssistantMessage{.content = client(text(rng)), .reasoning_content = client(text(rng)), .tool_calls = {}};
+			auto assistant = chat::AssistantTurn{.reasoning = client(text(rng)), .content = client(text(rng)), .calls = {}};
 			for (auto call = roll(3); call > 0; --call) {
-				auto tool_call = json::ToolCall{.id = "c", .name = client(text(rng)), .arguments = {}};
-				for (auto argument = roll(3); argument > 0; --argument) {
-					auto const name = client(text(rng));
-					if (roll(2) == 0) {
-						tool_call.arguments.push_back(json::Argument{.name = name, .value = client(text(rng))});
-					} else {
-						auto const value = std::format(R"({{"k": ["{}", 1]}})", client(text(rng)));
-						tool_call.arguments.push_back(json::Argument{.name = name, .value = json_text(reader, value)});
-					}
+				if (roll(4) == 0) {
+					assistant.calls.push_back(chat::Call{.name = client(text(rng)), .arguments = chat::CustomInput{.text = client(text(rng))}});
+					continue;
 				}
-				assistant.tool_calls.push_back(std::move(tool_call));
+				auto object = std::string{"{"};
+				for (auto argument = roll(3); argument > 0; --argument) {
+					object += object.size() > 1 ? "," : "";
+					auto const name = std::format(R"("{}{}")", client(text(rng)), argument);
+					object += roll(2) == 0 ? std::format(R"({}:"{}")", name, client(text(rng))) : std::format(R"({}:{{"k": ["{}", 1]}})", name, client(text(rng)));
+				}
+				object += '}';
+				assistant.calls.push_back(chat::Call{.name = client(text(rng)), .arguments = json_text(reader, object)});
 			}
-			request.messages.emplace_back(std::move(assistant));
+			turns.emplace_back(std::move(assistant));
 			break;
 		}
 		default:
-			request.messages.emplace_back(json::ToolMessage{.tool_call_id = "c", .content = client(text(rng))});
+			turns.emplace_back(chat::ToolTurn{.content = client(text(rng))});
 			break;
 		}
 	}
-	return request;
+	auto made = chat::Conversation::make(std::move(turns), std::move(tools), options);
+	engine::core::invariant(made.has_value());
+	return *std::move(made);
 }
 
 [[nodiscard]] auto added_tokens(std::span<tok::Id const> ids) -> std::vector<tok::Id> {
@@ -197,9 +208,10 @@ enum class Client : std::uint8_t {
 	}
 	for (auto round = 0; round < 300; ++round) {
 		auto rng = engine::testing::generator(seed + static_cast<std::uint64_t>(round));
-		auto const spelled = random_request(rng, *reader, Client::Spelled);
+		auto const past = round % 2 == 0 ? chat::PastThinking::Preserved : chat::PastThinking::Dropped;
+		auto const spelled = random_conversation(rng, *reader, Client::Spelled, past);
 		rng = engine::testing::generator(seed + static_cast<std::uint64_t>(round));
-		auto const plain = random_request(rng, *reader, Client::Defused);
+		auto const plain = random_conversation(rng, *reader, Client::Defused, past);
 		auto const with = renderer.render(tokenizer, spelled);
 		auto const without = renderer.render(tokenizer, plain);
 		if (!with || !without || added_tokens(with->ids) != added_tokens(without->ids)) {
@@ -210,29 +222,85 @@ enum class Client : std::uint8_t {
 	return true;
 }
 
+/**
+ * The continuation property: for random chats and every assistant turn in them, the whole chat's ids are the ids of
+ * the chat cut after that turn, up to and including its `<|im_end|>`, followed by the continuation of the rest.
+ */
+[[nodiscard]] auto continuations_extend_exactly(tok::Tokenizer const& tokenizer, chat::Renderer& renderer, std::uint64_t seed) -> bool {
+	auto reader = json::Reader<json::fragment_bounds>::make();
+	if (!reader) {
+		return false;
+	}
+	auto checked = 0;
+	for (auto round = 0; round < 300; ++round) {
+		auto rng = engine::testing::generator(seed + static_cast<std::uint64_t>(round));
+		auto const past = round % 2 == 0 ? chat::PastThinking::Preserved : chat::PastThinking::Dropped;
+		auto const whole = random_conversation(rng, *reader, Client::Spelled, past);
+		auto const rendered = renderer.render(tokenizer, whole);
+		if (!rendered) {
+			return false;
+		}
+		auto const turns = whole.turns();
+		for (auto cut = std::size_t{1}; cut < turns.size(); ++cut) {
+			// A stored response ends with an assistant turn; dropping past reasoning would make the earlier part depend
+			// on where the last query falls, so those chats continue only when they preserve it.
+			auto const before = std::vector<chat::Turn>{turns.begin(), turns.begin() + static_cast<std::ptrdiff_t>(cut)};
+			if (!std::holds_alternative<chat::AssistantTurn>(turns[cut - 1]) || past == chat::PastThinking::Dropped) {
+				continue;
+			}
+			auto const head = chat::Conversation::make(before, std::vector<std::string>{whole.tools().begin(), whole.tools().end()}, whole.options());
+			if (!head) {
+				continue;
+			}
+			auto const prefix = renderer.render(tokenizer, *head);
+			auto const rest = renderer.continuation(tokenizer, turns.subspan(cut), whole.options());
+			if (!prefix || !rest) {
+				return false;
+			}
+			// The stored tokens end with the assistant turn's `<|im_end|>`, which the generation prompt follows.
+			auto stored = prefix->generation;
+			while (stored > 0 && prefix->ids[stored - 1] != tok::id(tok::Added::im_end)) {
+				--stored;
+			}
+			auto const end = std::span{prefix->ids}.first(stored);
+			auto joined = std::vector<tok::Id>{end.begin(), end.end()};
+			joined.insert(joined.end(), rest->ids.begin(), rest->ids.end());
+			auto const generation_at = rest->ids.at(rest->generation) == tok::id(tok::Added::im_start) &&
+			                           joined.size() - rest->ids.size() + rest->generation == rendered->generation;
+			if (end.empty() || joined != rendered->ids || !generation_at) {
+				std::println("  failing round {} of seed {}, cut {}", round, seed, cut);
+				return false;
+			}
+			++checked;
+		}
+	}
+	return checked > 0;
+}
+
 }
 
 auto main() -> int {
 	auto const fixture = engine_test_chat::render_fixture();
 	auto const tokenizer = tok::load();
-	auto decoder = json::RequestDecoder::make();
 	auto renderer = chat::Renderer::make();
-	if (!fixture || !tokenizer || !decoder || !renderer) {
-		std::println("FAIL: the fixtures read, the tokenizer loads, and a decoder and a renderer are made");
+	if (!fixture || !tokenizer || !renderer) {
+		std::println("FAIL: the fixtures read, the tokenizer loads, and a renderer is made");
 		return 1;
 	}
 	auto cases = std::vector<Rendered>{};
 	for (auto const& fixture_case : fixture->cases) {
-		auto rendered = Rendered{.fixture = fixture_case, .request = std::nullopt, .prompt = std::nullopt, .error = std::nullopt};
-		if (auto request = decoder->decode_copy(fixture_case.request)) {
-			rendered.request = std::move(*request);
-			if (auto prompt = renderer->render(*tokenizer, *rendered.request)) {
+		auto rendered = Rendered{.fixture = fixture_case, .input = engine_test_chat::template_input(fixture_case.request), .prompt = std::nullopt, .error = std::nullopt};
+		if (rendered.input) {
+			auto const conversation = chat::Conversation::make(rendered.input->turns, rendered.input->tools, rendered.input->options);
+			if (!conversation) {
+				rendered.error = fault_name(conversation.error());
+			} else if (auto prompt = renderer->render(*tokenizer, *conversation)) {
 				rendered.prompt = std::move(*prompt);
 			} else {
-				rendered.error = prompt.error();
+				rendered.error = fault_name(prompt.error());
 			}
 		} else {
-			std::println("  {} does not decode: {}", fixture_case.name, json::describe(request.error()));
+			std::println("  {} does not read as the template's input", fixture_case.name);
 		}
 		cases.push_back(std::move(rendered));
 	}
@@ -243,10 +311,10 @@ auto main() -> int {
 		return !rendered.fixture.error;
 	};
 	auto const checks = std::array{
-	    engine::testing::Case{.name = "every fixture request decodes as the endpoint decodes it",
+	    engine::testing::Case{.name = "every fixture request reads as the template's input",
 		                      .holds = every(cases, all,
 		                                     [](Rendered const& rendered) {
-		                                         return rendered.request.has_value();
+		                                         return rendered.input.has_value();
 	                                         })},
 	    engine::testing::Case{.name = "every chat the template renders renders to the engine's pieces, id for id",
 		                      .holds = every(cases, accepted,
@@ -279,25 +347,29 @@ auto main() -> int {
 		                                         return rendered.prompt && decoded(*tokenizer, rendered.prompt->ids) ==
 												                               decoded(*tokenizer, rendered.fixture.reference_ids);
 	                                         })},
-	    engine::testing::Case{.name = "every chat the template refuses is refused, with the template's reason",
+	    engine::testing::Case{.name = "every chat the template refuses is refused when made a conversation, with the template's reason",
 		                      .holds = every(
 	                              cases,
 	                              [](Rendered const& rendered) {
 		                              return rendered.fixture.error.has_value();
 	                              },
 	                              [](Rendered const& rendered) {
-		                              return rendered.error && fault_name(*rendered.error) == *rendered.fixture.error;
+		                              return rendered.error && *rendered.error == *rendered.fixture.error;
 	                              })},
 	    engine::testing::Case{.name = "the marks are the <|im_start|> of the first turn, the last user query and the generation prompt",
 		                      .holds = every(cases, accepted,
 		                                     [&](Rendered const& rendered) {
-		                                         return rendered.prompt && rendered.request &&
-												        marks_hold(*tokenizer, *rendered.prompt, *rendered.request, rendered.fixture.text);
+		                                         return rendered.prompt && rendered.input &&
+												        marks_hold(*tokenizer, *rendered.prompt, rendered.input->options, rendered.fixture.text);
 	                                         })},
 	    engine::testing::Case{.name = "client text never places a control token (seed 1)",
 		                      .holds = spellings_never_place_tokens(*tokenizer, *renderer, 1)},
 	    engine::testing::Case{.name = "client text never places a control token (seed 2)",
 		                      .holds = spellings_never_place_tokens(*tokenizer, *renderer, 1000)},
+	    engine::testing::Case{.name = "a continuation appends exactly what the whole chat renders after the stored turn (seed 1)",
+		                      .holds = continuations_extend_exactly(*tokenizer, *renderer, 1)},
+	    engine::testing::Case{.name = "a continuation appends exactly what the whole chat renders after the stored turn (seed 2)",
+		                      .holds = continuations_extend_exactly(*tokenizer, *renderer, 5000)},
 	};
 	return engine::testing::report(checks);
 }

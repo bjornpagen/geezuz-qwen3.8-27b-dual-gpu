@@ -9,6 +9,7 @@ import :text;
 import :value;
 import :containers;
 import :reader;
+import :decode_error;
 import :request;
 import :decode_support;
 import :decode_neutral;
@@ -16,77 +17,51 @@ import :decode_format;
 
 namespace engine::json {
 
-/** A function tool's `function` member. */
-[[nodiscard]] auto function_tool(Fragment& value, std::optional<std::string>& name) -> Decoded<FunctionTool> {
-	auto tool = FunctionTool{.parameters = std::nullopt};
-	auto const visited = each_member(value, [&](std::string_view field, Fragment& member) -> Decoded<void> {
-		if (field == "name") {
-			return text(member).transform([&name](std::string read) { name = std::move(read); });
-		}
-		if (field == "description") {
-			return nullable<std::string>(member, [](Fragment& description) { return text(description); }).transform([](auto const&) {});
-		}
-		if (field == "parameters") {
-			return schema_of(member).transform([&tool](std::optional<JsonText> schema) { tool.parameters = std::move(schema); });
-		}
-		if (field == "strict") {
-			return any_boolean(member);
-		}
-		return refuse(Violation::UnknownField);
-	});
-	if (!visited) {
-		return std::unexpected(visited.error());
-	}
-	return tool;
-}
+/** Every member a tool has, read once, before its type says which of them belong. */
+struct ToolDraft {
+	std::optional<std::string> type;
+	std::optional<std::string> name;
+	std::optional<std::string> description;
+	/** Present (even as `null`) or not: a function tool requires the member. */
+	std::optional<std::optional<JsonText>> parameters;
+	std::optional<std::monostate> strict;
+	std::optional<std::optional<Grammar>> format;
+	std::vector<std::string> seen;
+};
 
-/** A custom tool's `custom` member. */
-[[nodiscard]] auto custom_tool(Fragment& value, std::optional<std::string>& name) -> Decoded<CustomTool> {
-	auto tool = CustomTool{.grammar = std::nullopt};
-	auto const visited = each_member(value, [&](std::string_view field, Fragment& member) -> Decoded<void> {
-		if (field == "name") {
-			return text(member).transform([&name](std::string read) { name = std::move(read); });
-		}
-		if (field == "description") {
-			return nullable<std::string>(member, [](Fragment& description) { return text(description); }).transform([](auto const&) {});
-		}
-		if (field == "format") {
-			return custom_format(member).transform([&tool](std::optional<Grammar> read) { tool.grammar = std::move(read); });
-		}
-		return refuse(Violation::UnknownField);
-	});
-	if (!visited) {
-		return std::unexpected(visited.error());
-	}
-	return tool;
-}
+constexpr auto function_tool_members =
+    std::to_array<std::string_view>({"type", "name", "description", "parameters", "strict", "defer_loading", "allowed_callers", "output_schema"});
+constexpr auto custom_tool_members = std::to_array<std::string_view>({"type", "name", "description", "format", "defer_loading", "allowed_callers"});
 
-/** A tools element: kept whole as written, then read again on its own for what the engine needs from it. */
-[[nodiscard]] auto tool(Body& value, Fragments& fragments) -> Decoded<Tool> {
-	auto definition = lift(value.capture());
-	if (!definition) {
-		return std::unexpected(definition.error());
-	}
-	auto root = lift(fragments.read_copy(definition->text()));
-	if (!root) {
-		return std::unexpected(root.error());
-	}
-	auto type = std::optional<std::string>{};
-	auto function_name = std::optional<std::string>{};
-	auto custom_name = std::optional<std::string>{};
-	auto function = std::optional<FunctionTool>{};
-	auto custom = std::optional<CustomTool>{};
-	auto seen = std::vector<std::string>{};
-	auto const visited = each_member(*root, [&](std::string_view member, Fragment& inner) -> Decoded<void> {
-		seen.emplace_back(member);
-		if (member == "type") {
-			return text(inner).transform([&type](std::string read) { type = std::move(read); });
+[[nodiscard]] auto tool_draft(Body& value) -> Decoded<ToolDraft> {
+	auto read = ToolDraft{};
+	auto const visited = each_member(value, [&read](std::string_view name, Body& member) -> Decoded<void> {
+		read.seen.emplace_back(name);
+		if (name == "type") {
+			return text(member).transform([&read](std::string decoded) { read.type = std::move(decoded); });
 		}
-		if (member == "function") {
-			return function_tool(inner, function_name).transform([&function](FunctionTool read) { function = std::move(read); });
+		if (name == "name") {
+			return text(member).transform([&read](std::string decoded) { read.name = std::move(decoded); });
 		}
-		if (member == "custom") {
-			return custom_tool(inner, custom_name).transform([&custom](CustomTool read) { custom = std::move(read); });
+		if (name == "description") {
+			return nullable<std::string>(member, [](Body& inner) { return text(inner); }).transform([&read](std::optional<std::string> decoded) {
+				read.description = std::move(decoded);
+			});
+		}
+		if (name == "parameters") {
+			return schema_of(member).transform([&read](std::optional<JsonText> schema) { read.parameters = std::move(schema); });
+		}
+		if (name == "strict") {
+			return any_boolean(member).transform([&read] { read.strict = std::monostate{}; });
+		}
+		if (name == "format") {
+			return custom_format(member).transform([&read](std::optional<Grammar> grammar) { read.format = std::move(grammar); });
+		}
+		if (name == "output_schema") {
+			return neutral(member, Neutral::Null);
+		}
+		if (auto const wanted = tolerated(tool_tolerated, name)) {
+			return neutral(member, *wanted);
 		}
 		// Which members belong depends on the type, which may come later: decided after the loop.
 		return {};
@@ -94,47 +69,55 @@ namespace engine::json {
 	if (!visited) {
 		return std::unexpected(visited.error());
 	}
-	if (auto const finished = lift(fragments.finish()); !finished) {
-		return std::unexpected(finished.error());
+	return read;
+}
+
+/** A `tools` element: a function tool or a custom tool. */
+[[nodiscard]] auto tool(Body& value) -> Decoded<Tool> {
+	auto read = tool_draft(value);
+	if (!read) {
+		return std::unexpected(read.error());
 	}
-	if (!type) {
+	if (!read->type) {
 		return refuse_at("type", Violation::MissingField);
 	}
-	if (*type != "function" && *type != "custom") {
-		return refuse_type(unsupported_tool_types, *type);
+	auto const function = *read->type == "function";
+	if (!function && *read->type != "custom") {
+		return refuse_type(unsupported_tool_types, *read->type);
 	}
-	auto const& payload = *type;
-	for (auto const& name : seen) {
-		if (name != "type" && name != payload) {
+	auto const allowed = function ? std::span<std::string_view const>{function_tool_members} : std::span<std::string_view const>{custom_tool_members};
+	for (auto const& name : read->seen) {
+		if (std::ranges::find(allowed, name) == allowed.end()) {
 			return refuse_at(name, Violation::UnknownField);
 		}
 	}
-	auto const missing_name = [&payload] { return std::unexpected(DecodeError{.fault = Violation::MissingField, .path = {"name", payload}}); };
-	if (payload == "function") {
-		if (!function) {
-			return refuse_at("function", Violation::MissingField);
+	if (!read->name) {
+		return refuse_at("name", Violation::MissingField);
+	}
+	if (function) {
+		if (!read->parameters) {
+			return refuse_at("parameters", Violation::MissingField);
 		}
-		if (!function_name) {
-			return missing_name();
+		if (!read->strict) {
+			return refuse_at("strict", Violation::MissingField);
 		}
-		return Tool{.name = std::move(*function_name), .input = std::move(*function), .definition = std::move(*definition)};
+		return Tool{.name = std::move(*read->name), .description = std::move(read->description), .input = FunctionTool{.parameters = std::move(*read->parameters)}};
 	}
-	if (!custom) {
-		return refuse_at("custom", Violation::MissingField);
-	}
-	if (!custom_name) {
-		return missing_name();
-	}
-	return Tool{.name = std::move(*custom_name), .input = std::move(*custom), .definition = std::move(*definition)};
+	return Tool{
+	    .name = std::move(*read->name),
+	    .description = std::move(read->description),
+	    .input = CustomTool{.grammar = read->format ? std::move(*read->format) : std::nullopt},
+	};
 }
 
+/** `tool_choice`: a mode, or an object naming one tool. */
 [[nodiscard]] auto tool_choice(Body& value) -> Decoded<ToolChoice> {
 	auto const kind = kind_of(value);
 	if (!kind) {
 		return std::unexpected(kind.error());
 	}
 	if (*kind == Kind::String) {
-		auto const mode = lift(value.as_string());
+		auto const mode = text(value);
 		if (!mode) {
 			return std::unexpected(mode.error());
 		}
@@ -153,23 +136,18 @@ namespace engine::json {
 		return refuse(WrongShape{.expected = Expected::ToolChoice, .found = *kind});
 	}
 	auto type = std::optional<std::string>{};
-	auto function = std::optional<Named>{};
-	auto other = std::optional<std::string>{};
+	auto name = std::optional<std::string>{};
+	auto seen = std::vector<std::string>{};
 	auto const visited = each_member(value, [&](std::string_view member, Body& inner) -> Decoded<void> {
+		seen.emplace_back(member);
 		if (member == "type") {
 			return text(inner).transform([&type](std::string read) { type = std::move(read); });
 		}
-		if (member != "function") {
-			other = other.value_or(std::string{member});
-			return {};
+		if (member == "name") {
+			return text(inner).transform([&name](std::string read) { name = std::move(read); });
 		}
-		function.emplace();
-		return each_member(inner, [&function](std::string_view field, Body& field_value) -> Decoded<void> {
-			if (field == "name") {
-				return text(field_value).transform([&named = *function](std::string read) { named.name = std::move(read); });
-			}
-			return refuse(Violation::UnknownField);
-		});
+		// Which members belong depends on the type, which may come later: decided after the loop.
+		return {};
 	});
 	if (!visited) {
 		return std::unexpected(visited.error());
@@ -177,19 +155,21 @@ namespace engine::json {
 	if (!type) {
 		return refuse_at("type", Violation::MissingField);
 	}
-	if (*type != "function") {
-		return refuse_type(unsupported_tool_types, *type);
+	if (*type != "function" && *type != "custom") {
+		return refuse_type(unsupported_choice_types, *type);
 	}
-	if (other) {
-		return refuse_at(*other, Violation::UnknownField);
+	for (auto const& member : seen) {
+		if (member != "type" && member != "name") {
+			return refuse_at(member, Violation::UnknownField);
+		}
 	}
-	if (!function) {
-		return refuse_at("function", Violation::MissingField);
+	if (!name) {
+		return refuse_at("name", Violation::MissingField);
 	}
-	if (!function->name) {
-		return std::unexpected(DecodeError{.fault = Violation::MissingField, .path = {"name", "function"}});
+	if (*type == "function") {
+		return ForcedFunction{.name = std::move(*name)};
 	}
-	return ForcedFunction{.name = std::move(*function->name)};
+	return ForcedCustom{.name = std::move(*name)};
 }
 
 }

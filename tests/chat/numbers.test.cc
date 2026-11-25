@@ -25,19 +25,29 @@ using engine_test_chat::NumberCase;
 	if (!reader || !renderer || !tokenizer) {
 		return std::nullopt;
 	}
-	auto call = json::ToolCall{.id = "c", .name = "f", .arguments = {}};
+	auto object = std::string{"{"};
 	for (auto const [index, number] : std::views::enumerate(cases)) {
-		auto text = json::JsonText::from(*reader, number.literal);
-		if (!text) {
+		if (!json::JsonText::from(*reader, number.literal)) {
 			std::println("  {} does not read", number.literal);
 			return std::nullopt;
 		}
-		call.arguments.push_back(json::Argument{.name = std::format("x{}", index), .value = std::move(*text)});
+		object += std::format(R"({}"x{}": {})", index > 0 ? ", " : "", index, number.literal);
 	}
-	auto request = json::ChatRequest{};
-	request.messages.emplace_back(json::UserMessage{.content = "q"});
-	request.messages.emplace_back(json::AssistantMessage{.content = {}, .reasoning_content = {}, .tool_calls = {std::move(call)}});
-	auto const prompt = renderer->render(*tokenizer, request);
+	object += '}';
+	auto arguments = json::JsonText::from(*reader, object);
+	if (!arguments) {
+		return std::nullopt;
+	}
+	auto turns = std::vector<chat::Turn>{
+	    chat::UserTurn{.text = "q"},
+	    chat::AssistantTurn{.reasoning = {}, .content = {}, .calls = {chat::Call{.name = "f", .arguments = std::move(*arguments)}}},
+	};
+	auto const conversation = chat::Conversation::make(
+	    std::move(turns), {}, chat::Options{.thinking = chat::Thinking::Enabled, .effort = chat::Effort::XHigh, .past_thinking = chat::PastThinking::Preserved});
+	if (!conversation) {
+		return std::nullopt;
+	}
+	auto const prompt = renderer->render(*tokenizer, *conversation);
 	if (!prompt) {
 		return std::nullopt;
 	}

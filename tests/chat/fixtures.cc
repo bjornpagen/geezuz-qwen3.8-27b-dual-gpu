@@ -186,7 +186,7 @@ export struct RenderCase {
 /** A model's reply to a request with `tools`, and the reference's parse of it. */
 export struct ParseCase {
 	std::string name;
-	json::Thinking thinking;
+	engine::chat::Thinking thinking;
 	std::vector<std::string> tools;
 	std::string output;
 	engine::chat::Reply expected;
@@ -265,13 +265,13 @@ export [[nodiscard]] auto parse_fixture() -> std::optional<Fixture<ParseCase>> {
 		for (auto const& tool : items_at(node, "tools")) {
 			tools.push_back(tool.text());
 		}
-		auto calls = std::vector<engine::chat::Call>{};
+		auto calls = std::vector<engine::chat::ParsedCall>{};
 		for (auto const& call : items_at(node, "calls")) {
-			calls.push_back(engine::chat::Call{.name = text_at(call, "name"), .arguments = text_at(call, "arguments")});
+			calls.push_back(engine::chat::ParsedCall{.name = text_at(call, "name"), .arguments = text_at(call, "arguments")});
 		}
 		return ParseCase{
 		    .name = text_at(node, "name"),
-		    .thinking = flag_at(node, "thinking") ? json::Thinking::Enabled : json::Thinking::Disabled,
+		    .thinking = flag_at(node, "thinking") ? engine::chat::Thinking::Enabled : engine::chat::Thinking::Disabled,
 		    .tools = std::move(tools),
 		    .output = text_at(node, "output"),
 		    .expected = engine::chat::Reply{.reasoning = text_at(node, "reasoning"),
@@ -288,17 +288,375 @@ export [[nodiscard]] auto number_fixture() -> std::optional<Fixture<NumberCase>>
 	});
 }
 
+namespace chat = engine::chat;
+
 /**
- * The request a parse case's reply answers: one user message, the case's tools as written, and its thinking mode.
- * The tools are JSON texts, so the request is their concatenation.
+ * A chat-format request body as the chat template takes it, read here from the template's own input format: its
+ * turns, its tools as written (the template's `tools`), its options from `chat_template_kwargs`, and the tools a
+ * reply parser casts by.
  */
-export [[nodiscard]] auto parse_request(ParseCase const& parse) -> std::string {
-	auto tools = std::string{};
-	for (auto const& tool : parse.tools) {
-		tools += tools.empty() ? tool : "," + tool;
+export struct TemplateInput {
+	std::vector<chat::Turn> turns;
+	std::vector<std::string> tools;
+	chat::Options options;
+	std::vector<json::Tool> parser_tools;
+};
+
+using Fragments = json::Reader<json::fragment_bounds>;
+
+/** Message content: a string, `null`, or text parts read as their concatenation. */
+[[nodiscard]] auto content_of(Value value) -> std::optional<std::string> {
+	auto const kind = value.kind();
+	if (!kind) {
+		return std::nullopt;
 	}
-	return std::format(R"({{"messages":[{{"role":"user","content":"q"}}],"tools":[{}],"chat_template_kwargs":{{"enable_thinking":{}}}}})",
-	                   tools, parse.thinking == json::Thinking::Enabled ? "true" : "false");
+	if (*kind == json::Kind::Null) {
+		return value.as_null() ? std::optional{std::string{}} : std::nullopt;
+	}
+	if (*kind == json::Kind::String) {
+		auto const read = value.as_string();
+		return read ? std::optional{std::string{*read}} : std::nullopt;
+	}
+	auto parts = value.as_array();
+	auto joined = std::string{};
+	while (parts) {
+		auto part = parts->next();
+		if (!part) {
+			return std::nullopt;
+		}
+		if (!*part) {
+			return joined;
+		}
+		auto object = (*part)->as_object();
+		auto text = object.and_then([](auto& fields) { return fields.member("text"); });
+		auto const read = text.and_then([](auto& field) { return field.as_string(); });
+		if (!read) {
+			return std::nullopt;
+		}
+		joined += *read;
+	}
+	return std::nullopt;
+}
+
+/** A past call's arguments: an object as written, or a string holding one (empty for none). */
+[[nodiscard]] auto arguments_of(Value value, Fragments& fragments) -> std::optional<json::JsonText> {
+	auto const kind = value.kind();
+	if (!kind) {
+		return std::nullopt;
+	}
+	if (*kind == json::Kind::Object) {
+		auto held = value.capture();
+		return held ? std::optional{std::move(*held)} : std::nullopt;
+	}
+	auto const text = value.as_string();
+	if (!text) {
+		return std::nullopt;
+	}
+	auto held = json::JsonText::from(fragments, text->empty() ? std::string_view{"{}"} : *text);
+	return held ? std::optional{std::move(*held)} : std::nullopt;
+}
+
+[[nodiscard]] auto calls_of(Value value, Fragments& fragments) -> std::optional<std::vector<chat::Call>> {
+	auto const kind = value.kind();
+	if (kind && *kind == json::Kind::Null) {
+		return std::vector<chat::Call>{};
+	}
+	auto list = value.as_array();
+	auto calls = std::vector<chat::Call>{};
+	while (list) {
+		auto element = list->next();
+		if (!element) {
+			return std::nullopt;
+		}
+		if (!*element) {
+			return calls;
+		}
+		auto call = (*element)->as_object();
+		auto function = call.and_then([](auto& members) { return members.member("function"); });
+		auto fields = function.and_then([](auto& inner) { return inner.as_object(); });
+		if (!fields) {
+			return std::nullopt;
+		}
+		auto name = std::optional<std::string>{};
+		auto arguments = std::optional<json::JsonText>{};
+		while (true) {
+			auto member = fields->next();
+			if (!member) {
+				return std::nullopt;
+			}
+			if (!*member) {
+				break;
+			}
+			if ((*member)->name == "name") {
+				auto const read = (*member)->value.as_string();
+				if (!read) {
+					return std::nullopt;
+				}
+				name = std::string{*read};
+			} else if ((*member)->name == "arguments") {
+				arguments = arguments_of(std::move((*member)->value), fragments);
+				if (!arguments) {
+					return std::nullopt;
+				}
+			}
+		}
+		if (!name) {
+			return std::nullopt;
+		}
+		if (!arguments) {
+			arguments = json::JsonText::from(fragments, "{}").value();
+		}
+		calls.push_back(chat::Call{.name = std::move(*name), .arguments = std::move(*arguments)});
+	}
+	return std::nullopt;
+}
+
+[[nodiscard]] auto turn_of(Value value, Fragments& fragments) -> std::optional<chat::Turn> {
+	auto message = value.as_object();
+	if (!message) {
+		return std::nullopt;
+	}
+	auto role = std::string{};
+	auto content = std::string{};
+	auto reasoning = std::string{};
+	auto calls = std::vector<chat::Call>{};
+	while (true) {
+		auto member = message->next();
+		if (!member) {
+			return std::nullopt;
+		}
+		if (!*member) {
+			break;
+		}
+		auto const name = (*member)->name;
+		auto& field = (*member)->value;
+		if (name == "role") {
+			auto const read = field.as_string();
+			if (!read) {
+				return std::nullopt;
+			}
+			role = std::string{*read};
+		} else if (name == "content") {
+			auto read = content_of(std::move(field));
+			if (!read) {
+				return std::nullopt;
+			}
+			content = std::move(*read);
+		} else if (name == "reasoning_content") {
+			auto read = content_of(std::move(field));
+			if (!read) {
+				return std::nullopt;
+			}
+			reasoning = std::move(*read);
+		} else if (name == "tool_calls") {
+			auto read = calls_of(std::move(field), fragments);
+			if (!read) {
+				return std::nullopt;
+			}
+			calls = std::move(*read);
+		}
+	}
+	if (role == "system" || role == "developer") {
+		return chat::SystemTurn{.text = std::move(content)};
+	}
+	if (role == "user") {
+		return chat::UserTurn{.text = std::move(content)};
+	}
+	if (role == "assistant") {
+		return chat::AssistantTurn{.reasoning = std::move(reasoning), .content = std::move(content), .calls = std::move(calls)};
+	}
+	if (role == "tool") {
+		return chat::ToolTurn{.content = std::move(content)};
+	}
+	return std::nullopt;
+}
+
+/** The tool a reply parser casts by: a chat-format tool's name and parameter schema. */
+export [[nodiscard]] auto parser_tool(std::string_view definition, Fragments& fragments) -> std::optional<json::Tool> {
+	auto root = fragments.read_copy(definition);
+	auto tool = root.and_then([](auto& inner) { return inner.as_object(); });
+	auto function = tool.and_then([](auto& members) { return members.member("function"); });
+	auto fields = function.and_then([](auto& inner) { return inner.as_object(); });
+	if (!fields) {
+		return std::nullopt;
+	}
+	auto name = std::optional<std::string>{};
+	auto parameters = std::optional<json::JsonText>{};
+	while (true) {
+		auto member = fields->next();
+		if (!member) {
+			return std::nullopt;
+		}
+		if (!*member) {
+			break;
+		}
+		if ((*member)->name == "name") {
+			auto const read = (*member)->value.as_string();
+			if (!read) {
+				return std::nullopt;
+			}
+			name = std::string{*read};
+		} else if ((*member)->name == "parameters") {
+			auto const kind = (*member)->value.kind();
+			if (kind && *kind == json::Kind::Object) {
+				auto held = (*member)->value.capture();
+				if (!held) {
+					return std::nullopt;
+				}
+				parameters = std::move(*held);
+			}
+		}
+	}
+	if (!name) {
+		return std::nullopt;
+	}
+	return json::Tool{.name = std::move(*name), .description = std::nullopt, .input = json::FunctionTool{.parameters = std::move(parameters)}};
+}
+
+[[nodiscard]] auto options_of(Value value) -> std::optional<chat::Options> {
+	auto options = chat::Options{.thinking = chat::Thinking::Enabled, .effort = chat::Effort::XHigh, .past_thinking = chat::PastThinking::Preserved};
+	auto kwargs = value.as_object();
+	while (kwargs) {
+		auto member = kwargs->next();
+		if (!member) {
+			return std::nullopt;
+		}
+		if (!*member) {
+			return options;
+		}
+		auto const name = (*member)->name;
+		auto& field = (*member)->value;
+		if (name == "enable_thinking" || name == "preserve_thinking") {
+			auto const flag = field.as_boolean();
+			if (!flag) {
+				return std::nullopt;
+			}
+			if (name == "enable_thinking" && !*flag) {
+				options.thinking = chat::Thinking::Disabled;
+			}
+			if (name == "preserve_thinking" && !*flag) {
+				options.past_thinking = chat::PastThinking::Dropped;
+			}
+		} else if (name == "reasoning_effort") {
+			auto const effort = field.as_string();
+			if (!effort) {
+				return std::nullopt;
+			}
+			if (*effort == "low") {
+				options.effort = chat::Effort::Low;
+			} else if (*effort == "medium") {
+				options.effort = chat::Effort::Medium;
+			} else if (*effort == "xhigh") {
+				options.effort = chat::Effort::XHigh;
+			} else {
+				return std::nullopt;
+			}
+		}
+	}
+	return std::nullopt;
+}
+
+export [[nodiscard]] auto template_input(std::string_view body) -> std::optional<TemplateInput> {
+	auto reader = json::Reader<fixture_bounds>::make();
+	auto fragments = Fragments::make();
+	if (!reader || !fragments) {
+		return std::nullopt;
+	}
+	auto root = reader->read_copy(body);
+	auto request = root.and_then([](auto& inner) { return inner.as_object(); });
+	if (!request) {
+		return std::nullopt;
+	}
+	auto input = TemplateInput{
+	    .turns = {},
+	    .tools = {},
+	    .options = {.thinking = chat::Thinking::Enabled, .effort = chat::Effort::XHigh, .past_thinking = chat::PastThinking::Preserved},
+	    .parser_tools = {},
+	};
+	while (true) {
+		auto member = request->next();
+		if (!member) {
+			return std::nullopt;
+		}
+		if (!*member) {
+			break;
+		}
+		auto const name = (*member)->name;
+		auto& field = (*member)->value;
+		if (name == "messages") {
+			auto messages = field.as_array();
+			while (messages) {
+				auto message = messages->next();
+				if (!message) {
+					return std::nullopt;
+				}
+				if (!*message) {
+					break;
+				}
+				auto turn = turn_of(std::move(**message), *fragments);
+				if (!turn) {
+					return std::nullopt;
+				}
+				input.turns.push_back(std::move(*turn));
+			}
+			if (!messages) {
+				return std::nullopt;
+			}
+		} else if (name == "tools") {
+			auto tools = field.as_array();
+			while (tools) {
+				auto tool = tools->next();
+				if (!tool) {
+					return std::nullopt;
+				}
+				if (!*tool) {
+					break;
+				}
+				auto held = (*tool)->capture();
+				if (!held) {
+					return std::nullopt;
+				}
+				input.tools.emplace_back(held->text());
+			}
+			if (!tools) {
+				return std::nullopt;
+			}
+		} else if (name == "chat_template_kwargs") {
+			auto options = options_of(std::move(field));
+			if (!options) {
+				return std::nullopt;
+			}
+			input.options = *options;
+		}
+	}
+	if (!reader->finish()) {
+		return std::nullopt;
+	}
+	for (auto const& definition : input.tools) {
+		auto tool = parser_tool(definition, *fragments);
+		if (!tool) {
+			return std::nullopt;
+		}
+		input.parser_tools.push_back(std::move(*tool));
+	}
+	return input;
+}
+
+/** The tools a parse case's reply answers, as a reply parser takes them. */
+export [[nodiscard]] auto parser_tools(ParseCase const& parse) -> std::optional<std::vector<json::Tool>> {
+	auto fragments = Fragments::make();
+	if (!fragments) {
+		return std::nullopt;
+	}
+	auto tools = std::vector<json::Tool>{};
+	for (auto const& definition : parse.tools) {
+		auto tool = parser_tool(definition, *fragments);
+		if (!tool) {
+			return std::nullopt;
+		}
+		tools.push_back(std::move(*tool));
+	}
+	return tools;
 }
 
 }

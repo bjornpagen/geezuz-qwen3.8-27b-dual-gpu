@@ -7,7 +7,7 @@ import engine.json;
 import :text;
 import :dumps;
 import :cast;
-import :render;
+import :conversation;
 
 namespace engine::chat {
 
@@ -104,7 +104,7 @@ struct InCall {
 using Region = std::variant<InText, InCall>;
 
 /** Whether more output may follow. */
-enum class Input : std::uint8_t {
+enum class Feed : std::uint8_t {
 	Open,
 	Ended,
 };
@@ -191,9 +191,9 @@ struct OpenMatch {
 };
 
 /** The tool-call opening at the front of `rest`: `<tool_call>\s*<function=(?P<name>[^>\n]+)>`. */
-[[nodiscard]] auto match_open(std::string_view rest, Input input) -> OpenMatch {
+[[nodiscard]] auto match_open(std::string_view rest, Feed input) -> OpenMatch {
 	auto const none = OpenMatch{.prefix = Prefix::None, .end = 0, .name = {}};
-	auto const part = OpenMatch{.prefix = input == Input::Open ? Prefix::Part : Prefix::None, .end = 0, .name = {}};
+	auto const part = OpenMatch{.prefix = input == Feed::Open ? Prefix::Part : Prefix::None, .end = 0, .name = {}};
 	auto constexpr tag = std::string_view{"<tool_call>"};
 	auto constexpr function = std::string_view{"<function="};
 	switch (compare(rest, tag)) {
@@ -209,7 +209,7 @@ struct OpenMatch {
 		auto const c = front(rest.substr(at));
 		if (!c) {
 			// Output that ends inside a character ends with no whitespace there.
-			if (input == Input::Open) {
+			if (input == Feed::Open) {
 				return part;
 			}
 			break;
@@ -296,23 +296,23 @@ struct Written {
 export class Parser {
 public:
 	/**
-	 * A parser for the reply to `request`: it starts where the request's generation prompt leaves the model, inside
-	 * the thinking block or after it, and casts arguments by the request's tools.
+	 * A parser for a reply: it starts where the generation prompt leaves the model, inside the thinking block or
+	 * after it, and casts arguments by the function tools' parameter schemas. A custom tool's `input` is never cast.
 	 */
-	[[nodiscard]] static auto make(json::ChatRequest const& request) -> core::Result<Parser, json::ReadError>;
+	[[nodiscard]] static auto make(std::span<json::Tool const> tools, Thinking thinking) -> core::Result<Parser, json::ReadError>;
 
 	/** Reads more of the reply. */
 	[[nodiscard]] auto push(std::string_view text) -> std::vector<Event> {
-		core::invariant(stream_ == Input::Open);
+		core::invariant(stream_ == Feed::Open);
 		pending_.append(text);
-		return drain(Input::Open);
+		return drain(Feed::Open);
 	}
 
 	/** Ends the reply: what was held for more input is decided, and an open tool call closes. */
 	[[nodiscard]] auto finish() -> std::vector<Event> {
-		core::invariant(stream_ == Input::Open);
-		stream_ = Input::Ended;
-		auto events = drain(Input::Ended);
+		core::invariant(stream_ == Feed::Open);
+		stream_ = Feed::Ended;
+		auto events = drain(Feed::Ended);
 		if (std::holds_alternative<InCall>(region_)) {
 			close_call(events);
 		}
@@ -322,10 +322,10 @@ public:
 private:
 	Parser(Region region, std::optional<Casting> casting) : casting_{std::move(casting)}, region_{std::move(region)} {}
 
-	[[nodiscard]] auto scan(Input input) const -> Scan;
-	[[nodiscard]] auto drain(Input input) -> std::vector<Event>;
+	[[nodiscard]] auto scan(Feed input) const -> Scan;
+	[[nodiscard]] auto drain(Feed input) -> std::vector<Event>;
 	/** Reports the region's text that is final; returns how many bytes of `text` it used. */
-	[[nodiscard]] auto deliver(std::vector<Event>& events, std::string_view text, Input input) -> std::size_t;
+	[[nodiscard]] auto deliver(std::vector<Event>& events, std::string_view text, Feed input) -> std::size_t;
 	auto enter(std::vector<Event>& events, Marker marker, std::string name) -> void;
 	auto close_call(std::vector<Event>& events) -> void;
 	[[nodiscard]] auto arguments(std::string_view name, std::string_view body) -> std::string;
@@ -336,13 +336,22 @@ private:
 	/** Output not yet reported: a possible marker, trailing whitespace, a partial character. */
 	std::string pending_;
 	std::size_t calls_ = 0;
-	Input stream_ = Input::Open;
+	Feed stream_ = Feed::Open;
 };
 
-auto Parser::make(json::ChatRequest const& request) -> core::Result<Parser, json::ReadError> {
-	auto const region =
-	    InText{.field = thinking_on(request.template_options) ? Field::Reasoning : Field::Content, .segment = Segment::Fresh};
-	if (request.tools.empty()) {
+[[nodiscard]] constexpr auto opening_field(Thinking thinking) -> Field {
+	switch (thinking) {
+	case Thinking::Enabled:
+		return Field::Reasoning;
+	case Thinking::Disabled:
+		return Field::Content;
+	}
+	std::unreachable();
+}
+
+auto Parser::make(std::span<json::Tool const> tools, Thinking thinking) -> core::Result<Parser, json::ReadError> {
+	auto const region = InText{.field = opening_field(thinking), .segment = Segment::Fresh};
+	if (tools.empty()) {
 		return Parser{region, std::nullopt};
 	}
 	auto reader = json::Reader<json::fragment_bounds>::make();
@@ -350,7 +359,7 @@ auto Parser::make(json::ChatRequest const& request) -> core::Result<Parser, json
 		return std::unexpected(reader.error());
 	}
 	auto signatures = std::vector<Signature>{};
-	for (auto const& tool : request.tools) {
+	for (auto const& tool : tools) {
 		auto signature = Signature{.name = tool.name, .parameters = {}};
 		auto const function = core::alternative<json::FunctionTool>(tool.input);
 		if (function && function->parameters) {
@@ -375,7 +384,7 @@ auto Parser::make(json::ChatRequest const& request) -> core::Result<Parser, json
 	return Parser{region, Casting{.signatures = std::move(signatures), .reader = std::move(*reader)}};
 }
 
-auto Parser::scan(Input input) const -> Scan {
+auto Parser::scan(Feed input) const -> Scan {
 	auto const markers = [&] -> std::span<LiteralMarker const> {
 		if (std::holds_alternative<InCall>(region_)) {
 			return call_markers;
@@ -409,21 +418,21 @@ auto Parser::scan(Input input) const -> Scan {
 			}
 			held = held || open.prefix == Prefix::Part;
 		}
-		if (held && input == Input::Open) {
+		if (held && input == Feed::Open) {
 			return Held{.begin = at};
 		}
 	}
 	return Clear{};
 }
 
-auto Parser::drain(Input input) -> std::vector<Event> {
+auto Parser::drain(Feed input) -> std::vector<Event> {
 	auto events = std::vector<Event>{};
 	while (true) {
 		auto const found = scan(input);
 		if (std::holds_alternative<Hit>(found)) {
 			auto const& hit = std::get<Hit>(found);
 			// The text before a marker ends its segment.
-			auto const used = deliver(events, std::string_view{pending_}.substr(0, hit.begin), Input::Ended);
+			auto const used = deliver(events, std::string_view{pending_}.substr(0, hit.begin), Feed::Ended);
 			core::invariant(used == hit.begin);
 			auto name = std::string{hit.name};
 			auto const marker = hit.marker;
@@ -433,13 +442,13 @@ auto Parser::drain(Input input) -> std::vector<Event> {
 		}
 		auto const limit = std::holds_alternative<Held>(found) ? std::get<Held>(found).begin : pending_.size();
 		auto const used =
-		    deliver(events, std::string_view{pending_}.substr(0, limit), std::holds_alternative<Held>(found) ? Input::Open : input);
+		    deliver(events, std::string_view{pending_}.substr(0, limit), std::holds_alternative<Held>(found) ? Feed::Open : input);
 		pending_.erase(0, used);
 		return events;
 	}
 }
 
-auto Parser::deliver(std::vector<Event>& events, std::string_view text, Input input) -> std::size_t {
+auto Parser::deliver(std::vector<Event>& events, std::string_view text, Feed input) -> std::size_t {
 	if (std::holds_alternative<InCall>(region_)) {
 		std::get<InCall>(region_).body.append(text);
 		return text.size();
@@ -450,7 +459,7 @@ auto Parser::deliver(std::vector<Event>& events, std::string_view text, Input in
 		while (begin < text.size()) {
 			auto const c = front(text.substr(begin));
 			if (!c) {
-				if (input == Input::Open) {
+				if (input == Feed::Open) {
 					return begin;
 				}
 				break;
@@ -467,7 +476,7 @@ auto Parser::deliver(std::vector<Event>& events, std::string_view text, Input in
 	while (at < text.size()) {
 		auto const c = front(text.substr(at));
 		if (!c) {
-			if (input == Input::Open) {
+			if (input == Feed::Open) {
 				break;
 			}
 			end = text.size();
@@ -487,7 +496,7 @@ auto Parser::deliver(std::vector<Event>& events, std::string_view text, Input in
 		}
 		in.segment = Segment::Started;
 	}
-	return input == Input::Open ? end : text.size();
+	return input == Feed::Open ? end : text.size();
 }
 
 auto Parser::enter(std::vector<Event>& events, Marker marker, std::string name) -> void {
@@ -542,18 +551,18 @@ auto Parser::arguments(std::string_view name, std::string_view body) -> std::str
 }
 
 /** A call in a whole reply: its name and its arguments' JSON. */
-export struct Call {
+export struct ParsedCall {
 	std::string name;
 	std::string arguments;
 
-	[[nodiscard]] auto operator==(Call const&) const -> bool = default;
+	[[nodiscard]] auto operator==(ParsedCall const&) const -> bool = default;
 };
 
 /** A whole reply: the events of a parse, gathered. */
 export struct Reply {
 	std::string reasoning;
 	std::string content;
-	std::vector<Call> calls;
+	std::vector<ParsedCall> calls;
 
 	auto add(Event const& event) -> void {
 		if (std::holds_alternative<ReasoningDelta>(event)) {
@@ -563,7 +572,7 @@ export struct Reply {
 		} else if (std::holds_alternative<ToolCallStart>(event)) {
 			auto const& start = std::get<ToolCallStart>(event);
 			core::invariant(start.index == calls.size());
-			calls.push_back(Call{.name = start.name, .arguments = {}});
+			calls.push_back(ParsedCall{.name = start.name, .arguments = {}});
 		} else {
 			auto const& end = std::get<ToolCallEnd>(event);
 			core::invariant(end.index + 1 == calls.size());
@@ -574,9 +583,9 @@ export struct Reply {
 	[[nodiscard]] auto operator==(Reply const&) const -> bool = default;
 };
 
-/** Parses a whole reply to `request` at once. */
-export [[nodiscard]] auto parse(std::string_view output, json::ChatRequest const& request) -> core::Result<Reply, json::ReadError> {
-	auto parser = Parser::make(request);
+/** Parses a whole reply at once. */
+export [[nodiscard]] auto parse(std::string_view output, std::span<json::Tool const> tools, Thinking thinking) -> core::Result<Reply, json::ReadError> {
+	auto parser = Parser::make(tools, thinking);
 	if (!parser) {
 		return std::unexpected(parser.error());
 	}

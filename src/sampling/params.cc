@@ -14,14 +14,8 @@ export inline constexpr double temperature_maximum = 2.0;
 export enum class ParamErrorKind : std::uint8_t {
 	/** temperature is outside [0, temperature_maximum] (0 is greedy). */
 	TemperatureOutOfRange,
-	/** top_k is 0 or negative: unbounded top-k is not offered, since the device samples from its best candidates. */
-	TopKBelowOne,
-	/** top_k is above top_k_bound, the most candidates the device keeps per row. */
-	TopKAboveBound,
 	/** top_p is outside [0, 1]. */
 	TopPOutOfRange,
-	/** min_p is outside [0, 1]. */
-	MinPOutOfRange,
 };
 
 /** A refused request: the caller answers it with a 400 naming the kind. */
@@ -31,10 +25,7 @@ export struct [[nodiscard]] ParamError {
 	[[nodiscard]] constexpr auto retry() const -> core::Retry {
 		switch (kind) {
 		case ParamErrorKind::TemperatureOutOfRange:
-		case ParamErrorKind::TopKBelowOne:
-		case ParamErrorKind::TopKAboveBound:
 		case ParamErrorKind::TopPOutOfRange:
-		case ParamErrorKind::MinPOutOfRange:
 			return core::Retry::Permanent;
 		}
 		std::unreachable();
@@ -43,16 +34,16 @@ export struct [[nodiscard]] ParamError {
 	[[nodiscard]] constexpr auto operator==(ParamError const&) const -> bool = default;
 };
 
-/** The sampling fields of a request as they arrived; an absent field takes the server's default. */
+/**
+ * The sampling fields of a Responses request as they arrived; an absent field takes the model's default. The api has
+ * no seed, top-k or min-p: every request draws a fresh seed, and top-k and min-p are always the model's.
+ */
 export struct Request {
 	std::optional<double> temperature;
-	std::optional<std::int64_t> top_k;
 	std::optional<double> top_p;
-	std::optional<double> min_p;
-	std::optional<std::int64_t> seed;
 };
 
-/** What an absent request field becomes. */
+/** The model's recommended sampling: what an absent request field becomes, and the top-k and min-p every request uses. */
 export struct Defaults {
 	double temperature;
 	std::int64_t top_k;
@@ -82,8 +73,8 @@ export using Params = std::variant<Greedy, Sample>;
 
 /**
  * Validates a request's sampling at the boundary, once: every field present or defaulted is checked in the order
- * temperature, top_k, top_p, min_p, and the first refused one names the error. A request's seed is its 64-bit two's
- * complement pattern; `fresh_seed` is the caller's entropy for a request that names none.
+ * temperature then top_p, and the first refused one names the error. Top-k and min-p are the defaults'; the seed is
+ * `fresh_seed`, the caller's entropy, since the api names none.
  */
 export [[nodiscard]] constexpr auto parse(Request const& request, Defaults const& defaults, std::uint64_t fresh_seed)
     -> core::Result<Params, ParamError>;
@@ -133,35 +124,21 @@ private:
 }
 
 constexpr auto parse(Request const& request, Defaults const& defaults, std::uint64_t fresh_seed) -> core::Result<Params, ParamError> {
+	// The model's top-k and min-p are the program's constants, not a request's: out of range they are a bug here.
+	core::invariant(defaults.top_k >= 1 && defaults.top_k <= sampling_device::top_k_bound && within(defaults.min_p, 0.0, 1.0));
 	auto const temperature = request.temperature.value_or(defaults.temperature);
-	auto const top_k = request.top_k.value_or(defaults.top_k);
 	auto const top_p = request.top_p.value_or(defaults.top_p);
-	auto const min_p = request.min_p.value_or(defaults.min_p);
 	if (!within(temperature, 0.0, temperature_maximum)) {
 		return std::unexpected(ParamError{.kind = ParamErrorKind::TemperatureOutOfRange});
-	}
-	if (top_k < 1) {
-		return std::unexpected(ParamError{.kind = ParamErrorKind::TopKBelowOne});
-	}
-	if (top_k > sampling_device::top_k_bound) {
-		return std::unexpected(ParamError{.kind = ParamErrorKind::TopKAboveBound});
 	}
 	if (!within(top_p, 0.0, 1.0)) {
 		return std::unexpected(ParamError{.kind = ParamErrorKind::TopPOutOfRange});
 	}
-	if (!within(min_p, 0.0, 1.0)) {
-		return std::unexpected(ParamError{.kind = ParamErrorKind::MinPOutOfRange});
-	}
-	if (temperature == 0.0 || top_k == 1 || top_p == 0.0) {
+	if (temperature == 0.0 || defaults.top_k == 1 || top_p == 0.0) {
 		return Params{Greedy{}};
 	}
-	auto const seed = request.seed
-	                      .transform([](std::int64_t named) {
-		                      return std::bit_cast<std::uint64_t>(named);
-	                      })
-	                      .value_or(fresh_seed);
 	auto const nucleus = top_p == 1.0 ? std::optional<double>{} : std::optional{top_p};
-	return Params{Sample{temperature, core::narrow<int>(top_k), nucleus, min_p, seed}};
+	return Params{Sample{temperature, core::narrow<int>(defaults.top_k), nucleus, defaults.min_p, fresh_seed}};
 }
 
 [[nodiscard]] constexpr auto filter_of(Greedy) -> sampling_device::Filter {

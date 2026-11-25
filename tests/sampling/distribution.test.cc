@@ -8,6 +8,7 @@ namespace {
 using engine::sampling::Greedy;
 using engine::sampling::Outcome;
 using engine::sampling::Params;
+using engine::sampling::Defaults;
 using engine::sampling::Request;
 using engine::sampling::Sample;
 
@@ -112,8 +113,22 @@ struct Filters {
 	return holds;
 }
 
-[[nodiscard]] auto params_of(Request const& request) -> Params {
-	return engine::sampling::parse(request, engine::sampling::thinking_defaults, 11).value();
+/** Every filter at once: a request sets temperature and top_p, the model's defaults top-k and min-p. */
+struct Setting {
+	double temperature;
+	std::int64_t top_k;
+	double top_p;
+	double min_p;
+};
+
+[[nodiscard]] auto params_of(Setting const& setting, std::uint64_t seed) -> Params {
+	return engine::sampling::parse(Request{.temperature = setting.temperature, .top_p = setting.top_p},
+	                               Defaults{.temperature = 1.0, .top_k = setting.top_k, .top_p = 1.0, .min_p = setting.min_p}, seed)
+	    .value();
+}
+
+[[nodiscard]] auto params_of(Setting const& setting) -> Params {
+	return params_of(setting, 11);
 }
 
 // Every logit vector over a four-token vocabulary drawn from a grid with many ties, under every grid of filters.
@@ -128,8 +143,7 @@ struct Filters {
 					for (auto const min_p : {0.0, 0.2, 0.5, 1.0}) {
 						holds = holds &&
 						        matches_oracle(
-						            params_of(Request{
-						                .temperature = temperature, .top_k = top_k, .top_p = top_p, .min_p = min_p, .seed = std::nullopt}),
+						            params_of(Setting{.temperature = temperature, .top_k = top_k, .top_p = top_p, .min_p = min_p}),
 						            logits);
 					}
 				}
@@ -167,20 +181,19 @@ struct Filters {
 	return logits;
 }
 
-[[nodiscard]] auto random_request(std::mt19937_64& generator) -> Request {
+[[nodiscard]] auto random_request(std::mt19937_64& generator) -> Setting {
 	auto unit = std::uniform_real_distribution<double>{0.0, 1.0};
 	auto choice = std::uniform_int_distribution<int>{0, 7};
 	auto top_k = std::uniform_int_distribution<int>{1, 64};
 	auto const temperatures = std::array{0.0, 1e-3, 0.3, 0.7, 1.0, 1.5, 2.0, 2.0 * unit(generator)};
-	auto const top_ks = std::array{1, 2, 5, 20, 40, 63, 64, top_k(generator)};
+	auto const top_ks = std::array<std::int64_t, 8>{1, 2, 5, 20, 40, 63, 64, top_k(generator)};
 	auto const top_ps = std::array{0.0, 0.1, 0.5, 0.8, 0.95, 1.0, 1.0, unit(generator)};
 	auto const min_ps = std::array{0.0, 0.0, 0.01, 0.05, 0.2, 0.9, 1.0, unit(generator)};
-	return Request{
+	return Setting{
 	    .temperature = temperatures[static_cast<std::size_t>(choice(generator))],
 	    .top_k = top_ks[static_cast<std::size_t>(choice(generator))],
 	    .top_p = top_ps[static_cast<std::size_t>(choice(generator))],
 	    .min_p = min_ps[static_cast<std::size_t>(choice(generator))],
-	    .seed = std::nullopt,
 	};
 }
 
@@ -219,13 +232,13 @@ struct Filters {
 [[nodiscard]] auto ties_fall_to_the_lower_id() -> bool {
 	auto const flat = std::vector<float>(100, 1.5F);
 	auto const top3 = engine::sampling::distribution(
-	    params_of(Request{.temperature = 1.0, .top_k = 3, .top_p = 1.0, .min_p = 0.0, .seed = std::nullopt}), flat);
+	    params_of(Setting{.temperature = 1.0, .top_k = 3, .top_p = 1.0, .min_p = 0.0}), flat);
 	auto const nucleus = engine::sampling::distribution(
-	    params_of(Request{.temperature = 1.0, .top_k = 64, .top_p = 0.05, .min_p = 0.0, .seed = std::nullopt}), flat);
+	    params_of(Setting{.temperature = 1.0, .top_k = 64, .top_p = 0.05, .min_p = 0.0}), flat);
 	auto const greedy = engine::sampling::distribution(Params{Greedy{}}, flat);
 	// Four equal weights reach exactly half the mass at the second: the cut keeps the shortest prefix that reaches it.
 	auto const half = engine::sampling::distribution(
-	    params_of(Request{.temperature = 1.0, .top_k = 4, .top_p = 0.5, .min_p = 0.0, .seed = std::nullopt}), flat);
+	    params_of(Setting{.temperature = 1.0, .top_k = 4, .top_p = 0.5, .min_p = 0.0}), flat);
 	return top3 == std::vector<Outcome>{{.token = 0, .probability = 1.0 / 3.0},
 	                                    {.token = 1, .probability = 1.0 / 3.0},
 	                                    {.token = 2, .probability = 1.0 / 3.0}} &&
@@ -270,7 +283,7 @@ struct Filters {
 [[nodiscard]] auto boundaries_belong_to_the_next_survivor() -> bool {
 	auto const flat = std::vector<float>(8, 0.0F);
 	auto const kept = engine::sampling::survivors(
-	    params_of(Request{.temperature = 1.0, .top_k = 4, .top_p = 1.0, .min_p = 0.0, .seed = std::nullopt}), flat);
+	    params_of(Setting{.temperature = 1.0, .top_k = 4, .top_p = 1.0, .min_p = 0.0}), flat);
 	auto holds = kept.count == 4;
 	for (auto index = 0; index < 4; ++index) {
 		holds = holds && engine::sampling::pick(kept, index / 4.0) == index &&
@@ -291,7 +304,7 @@ struct Filters {
 [[nodiscard]] auto drawn_tokens_follow_the_distribution(std::uint64_t seed) -> bool {
 	auto const logits = std::vector<float>{2.0F, 1.5F, 1.5F, 0.0F, -1.0F, 3.0F, 2.5F, -0.5F, 1.0F, 0.25F};
 	auto const params =
-	    params_of(Request{.temperature = 0.8, .top_k = 8, .top_p = 0.97, .min_p = 0.02, .seed = static_cast<std::int64_t>(seed)});
+	    params_of(Setting{.temperature = 0.8, .top_k = 8, .top_p = 0.97, .min_p = 0.02}, seed);
 	auto const rule = engine::sampling::rule(params, 0);
 	auto const reference = engine::sampling::distribution(params, logits);
 	auto constexpr draws = 400'000;

@@ -9,12 +9,13 @@ target_sources(engine_json PUBLIC FILE_SET CXX_MODULES FILES
 	containers.cc
 	reader.cc
 	write.cc
+	decode_error.cc
 	request.cc
 	decode_support.cc
 	decode_neutral.cc
-	decode_messages.cc
 	decode_format.cc
 	decode_tools.cc
+	decode_input.cc
 	decode.cc
 	response.cc
 )

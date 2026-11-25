@@ -8,6 +8,7 @@ namespace {
 using engine::sampling::Candidate;
 using engine::sampling::Greedy;
 using engine::sampling::Params;
+using engine::sampling::Defaults;
 using engine::sampling::Request;
 using engine::sampling::Rule;
 using engine::sampling::Survivors;
@@ -152,13 +153,10 @@ using engine::sampling::Verdict;
 	                       std::ranges::to<std::vector>();
 	auto holds = true;
 	for (auto round = 0; round < 3'000; ++round) {
-		auto const params = engine::sampling::parse(Request{.temperature = 2.0 * unit(generator),
-		                                                    .top_k = top_k(generator),
-		                                                    .top_p = unit(generator),
-		                                                    .min_p = 0.0,
-		                                                    .seed = std::nullopt},
-		                                            engine::sampling::thinking_defaults, 0)
-		                        .value();
+		// The model's top-k is a default, so a test varies it through the defaults.
+		auto const defaults = Defaults{.temperature = 1.0, .top_k = top_k(generator), .top_p = 1.0, .min_p = 0.0};
+		auto const params =
+		    engine::sampling::parse(Request{.temperature = 2.0 * unit(generator), .top_p = unit(generator)}, defaults, 0).value();
 		auto const filter = engine::sampling::rule(params, 0).filter;
 		auto target_logits = std::vector<float>(all_ids.size());
 		std::ranges::generate(target_logits, [&] {
@@ -287,8 +285,8 @@ constexpr auto toy_ids = std::array{0, 1, 2, 3, 4, 5};
 // the exact p(t1) p(t2 | t1), across 200,000 seeds.
 [[nodiscard]] auto speculative_output_is_distributed_as_p(std::uint64_t model_seed) -> bool {
 	auto const model = toy(model_seed);
-	auto const params = engine::sampling::parse(Request{.temperature = 0.9, .top_k = 5, .top_p = 0.95, .min_p = 0.01, .seed = std::nullopt},
-	                                            engine::sampling::thinking_defaults, 0)
+	auto const params = engine::sampling::parse(Request{.temperature = 0.9, .top_p = 0.95},
+	                                            Defaults{.temperature = 1.0, .top_k = 5, .top_p = 1.0, .min_p = 0.01}, 0)
 	                        .value();
 	auto constexpr context = 2;
 	auto constexpr trials = 200'000;

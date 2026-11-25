@@ -79,16 +79,23 @@ using engine_test_chat::ParseCase;
 	return pieces;
 }
 
+/** A parse case with the tools its reply parser casts by. */
 struct Parsed {
 	ParseCase const& fixture;
-	std::optional<json::ChatRequest> request;
+	std::optional<std::vector<json::Tool>> tools;
 };
 
-/** Checks `holds` on every case with its decoded request, naming the first that fails. */
+/** What a reply is parsed under: its tools, and whether it starts inside the thinking block. */
+struct Under {
+	std::span<json::Tool const> tools;
+	chat::Thinking thinking;
+};
+
+/** Checks `holds` on every case with its tools, naming the first that fails. */
 template<class Holds>
 [[nodiscard]] auto every(std::span<Parsed const> cases, Holds const& holds) -> bool {
 	for (auto const& parsed : cases) {
-		if (!parsed.request || !holds(parsed.fixture, *parsed.request)) {
+		if (!parsed.tools || !holds(parsed.fixture, Under{.tools = *parsed.tools, .thinking = parsed.fixture.thinking})) {
 			std::println("  first failing case: {}", parsed.fixture.name);
 			return false;
 		}
@@ -96,57 +103,57 @@ template<class Holds>
 	return !cases.empty();
 }
 
-[[nodiscard]] auto one_shot(json::ChatRequest const& request, std::string_view output) -> std::optional<chat::Reply> {
-	auto reply = chat::parse(output, request);
+[[nodiscard]] auto one_shot(Under under, std::string_view output) -> std::optional<chat::Reply> {
+	auto reply = chat::parse(output, under.tools, under.thinking);
 	return reply ? std::optional{std::move(*reply)} : std::nullopt;
 }
 
-[[nodiscard]] auto pieces_gather(json::ChatRequest const& request, std::span<std::string const> pieces, std::string_view whole) -> bool {
-	auto parser = chat::Parser::make(request);
+[[nodiscard]] auto pieces_gather(Under under, std::span<std::string const> pieces, std::string_view whole) -> bool {
+	auto parser = chat::Parser::make(under.tools, under.thinking);
 	if (!parser) {
 		return false;
 	}
 	auto const streamed = gather(std::move(*parser), pieces);
-	return streamed && streamed == one_shot(request, whole);
+	return streamed && streamed == one_shot(under, whole);
 }
 
 [[nodiscard]] auto random_splits_gather(std::span<Parsed const> cases, std::uint64_t seed, double rate) -> bool {
 	auto rng = engine::testing::generator(seed);
-	return every(cases, [&](ParseCase const& reply, json::ChatRequest const& request) {
+	return every(cases, [&](ParseCase const& reply, Under under) {
 		auto const pieces = split(reply.output, rng, rate);
-		return pieces_gather(request, pieces, reply.output);
+		return pieces_gather(under, pieces, reply.output);
 	});
-}
-
-[[nodiscard]] auto request_of(json::RequestDecoder& decoder, std::string_view body) -> std::optional<json::ChatRequest> {
-	auto request = decoder.decode_copy(body);
-	return request ? std::optional{std::move(*request)} : std::nullopt;
 }
 
 // Where the parser differs from the reference on purpose.
 
-[[nodiscard]] auto parse_with(json::RequestDecoder& decoder, std::string_view body, std::string_view output) -> std::optional<chat::Reply> {
-	auto const request = request_of(decoder, body);
-	if (!request) {
-		return std::nullopt;
-	}
-	auto reply = chat::parse(output, *request);
-	return reply ? std::optional{std::move(*reply)} : std::nullopt;
-}
-
-[[nodiscard]] auto reasoning_regions_join(json::RequestDecoder& decoder) -> bool {
-	auto const reply =
-	    parse_with(decoder, R"({"messages":[{"role":"user","content":"q"}]})", "first\n</think>\n\nanswer <think> second </think> more");
+[[nodiscard]] auto reasoning_regions_join() -> bool {
+	auto const reply = one_shot(Under{.tools = {}, .thinking = chat::Thinking::Enabled}, "first\n</think>\n\nanswer <think> second </think> more");
 	return reply == chat::Reply{.reasoning = "firstsecond", .content = "answermore", .calls = {}};
 }
 
-[[nodiscard]] auto structured_casts_stay_json(json::RequestDecoder& decoder) -> bool {
-	auto const body = std::string{R"({"messages":[{"role":"user","content":"q"}],"tools":[{"type":"function","function":{"name":"f",)"} +
-	                  R"("parameters":{"type":"object","properties":{"o":{"type":"object"},"a":{"type":"array"}}}}}]})";
-	auto const reply = parse_with(decoder, body,
+[[nodiscard]] auto structured_casts_stay_json() -> bool {
+	auto fragments = json::Reader<json::fragment_bounds>::make();
+	auto const tool = fragments ? engine_test_chat::parser_tool(R"({"type":"function","function":{"name":"f",)"
+	                                                            R"("parameters":{"type":"object","properties":{"o":{"type":"object"},"a":{"type":"array"}}}}})",
+	                                                            *fragments)
+	                            : std::nullopt;
+	if (!tool) {
+		return false;
+	}
+	auto const tools = std::array{*tool};
+	auto const reply = one_shot(Under{.tools = tools, .thinking = chat::Thinking::Enabled},
 	                              "</think><tool_call>\n<function=f>\n<parameter=o>\n{\"k\": 1, \"k\": "
 	                              "2}\n</parameter>\n<parameter=a>\n[NaN, 1e999]\n</parameter>\n</function>\n</tool_call>");
 	return reply && reply->calls.size() == 1 && reply->calls.front().arguments == R"({"o": "{\"k\": 1, \"k\": 2}", "a": "[NaN, 1e999]"})";
+}
+
+/** A custom tool's `input` stays the text the model wrote, even where a function's string-free schema would cast. */
+[[nodiscard]] auto custom_input_is_never_cast() -> bool {
+	auto const tools = std::array{json::Tool{.name = "run", .description = std::nullopt, .input = json::CustomTool{.grammar = std::nullopt}}};
+	auto const reply = one_shot(Under{.tools = tools, .thinking = chat::Thinking::Disabled},
+	                            "<tool_call>\n<function=run>\n<parameter=input>\n42\n</parameter>\n</function>\n</tool_call>");
+	return reply && reply->calls.size() == 1 && reply->calls.front().arguments == R"({"input": "42"})";
 }
 
 // The round trip: a reply written in the template's own format parses back to itself.
@@ -202,9 +209,9 @@ struct Written {
 };
 
 /** A random reply, and the model's text for it as the chat template writes an assistant turn after `<think>\n`. */
-[[nodiscard]] auto random_reply(std::mt19937_64& rng, json::Thinking thinking) -> Written {
+[[nodiscard]] auto random_reply(std::mt19937_64& rng, chat::Thinking thinking) -> Written {
 	auto written = Written{};
-	if (thinking == json::Thinking::Enabled) {
+	if (thinking == chat::Thinking::Enabled) {
 		written.reply.reasoning = core_text(rng);
 		written.output = std::string{pick(rng, spaces)} + written.reply.reasoning + std::string{pick(rng, spaces)} + "\n</think>\n\n";
 	}
@@ -213,7 +220,7 @@ struct Written {
 	auto const calls = std::uniform_int_distribution<std::size_t>{0, 3}(rng);
 	for (auto index = std::size_t{0}; index < calls; ++index) {
 		written.output += index > 0 ? "\n" : written.reply.content.empty() ? "" : "\n\n";
-		auto call = chat::Call{.name = std::string{pick(rng, names)}, .arguments = "{"};
+		auto call = chat::ParsedCall{.name = std::string{pick(rng, names)}, .arguments = "{"};
 		written.output.append("<tool_call>\n<function=").append(call.name).append(">\n");
 		auto const parameters = std::uniform_int_distribution<std::size_t>{0, 3}(rng);
 		for (auto parameter = std::size_t{0}; parameter < parameters; ++parameter) {
@@ -229,20 +236,14 @@ struct Written {
 	return written;
 }
 
-[[nodiscard]] auto replies_round_trip(json::RequestDecoder& decoder, std::uint64_t seed) -> bool {
+[[nodiscard]] auto replies_round_trip(std::uint64_t seed) -> bool {
 	auto rng = engine::testing::generator(seed);
-	for (auto const thinking : {json::Thinking::Enabled, json::Thinking::Disabled}) {
-		auto const body = std::format(R"({{"messages":[{{"role":"user","content":"q"}}],"chat_template_kwargs":{{"enable_thinking":{}}}}})",
-		                              thinking == json::Thinking::Enabled ? "true" : "false");
-		auto const request = request_of(decoder, body);
-		if (!request) {
-			return false;
-		}
+	for (auto const thinking : {chat::Thinking::Enabled, chat::Thinking::Disabled}) {
 		for (auto round = 0; round < 500; ++round) {
 			auto const written = random_reply(rng, thinking);
-			auto parser = chat::Parser::make(*request);
+			auto parser = chat::Parser::make({}, thinking);
 			auto const pieces = split(written.output, rng, 0.2);
-			if (!parser || chat::parse(written.output, *request) != written.reply || gather(std::move(*parser), pieces) != written.reply) {
+			if (!parser || chat::parse(written.output, {}, thinking) != written.reply || gather(std::move(*parser), pieces) != written.reply) {
 				std::println("  failing output: {:?}", written.output);
 				return false;
 			}
@@ -256,24 +257,23 @@ struct Written {
 auto main() -> int {
 	auto const fixture = engine_test_chat::parse_fixture();
 	auto const tokenizer = tok::load();
-	auto decoder = json::RequestDecoder::make();
-	if (!fixture || !tokenizer || !decoder) {
-		std::println("FAIL: the fixtures read, the tokenizer loads, and a decoder is made");
+	if (!fixture || !tokenizer) {
+		std::println("FAIL: the fixtures read and the tokenizer loads");
 		return 1;
 	}
 	auto cases = std::vector<Parsed>{};
 	for (auto const& fixture_case : fixture->cases) {
-		auto request = decoder->decode_copy(engine_test_chat::parse_request(fixture_case));
-		if (!request) {
-			std::println("  {} does not decode: {}", fixture_case.name, json::describe(request.error()));
+		auto tools = engine_test_chat::parser_tools(fixture_case);
+		if (!tools) {
+			std::println("  {}: its tools do not read", fixture_case.name);
 		}
-		cases.push_back(Parsed{.fixture = fixture_case, .request = request ? std::optional{std::move(*request)} : std::nullopt});
+		cases.push_back(Parsed{.fixture = fixture_case, .tools = std::move(tools)});
 	}
 	auto const checks = std::array{
 	    engine::testing::Case{.name = "every fixture reply parses as the checkpoint's response template parses it",
 		                      .holds = every(cases,
-		                                     [](ParseCase const& reply, json::ChatRequest const& request) {
-		                                         return one_shot(request, reply.output) == reply.expected;
+		                                     [](ParseCase const& reply, Under under) {
+		                                         return one_shot(under, reply.output) == reply.expected;
 	                                         })},
 	    engine::testing::Case{.name = "cut at random bytes, every fixture reply streams to its whole parse (seed 1, dense cuts)",
 		                      .holds = random_splits_gather(cases, 1, 0.5)},
@@ -283,22 +283,22 @@ auto main() -> int {
 		                      .holds = random_splits_gather(cases, 3, 1.0)},
 	    engine::testing::Case{.name = "decoded token by token, every fixture reply streams to the parse of its decoding",
 		                      .holds = every(cases,
-		                                     [&](ParseCase const& reply, json::ChatRequest const& request) {
+		                                     [&](ParseCase const& reply, Under under) {
 		                                         auto const pieces = token_pieces(*tokenizer, reply.output);
 		                                         auto whole = std::string{};
 		                                         std::ranges::for_each(pieces, [&whole](std::string const& piece) {
 			                                         whole += piece;
 		                                         });
-		                                         return !pieces.empty() && pieces_gather(request, pieces, whole);
+		                                         return !pieces.empty() && pieces_gather(under, pieces, whole);
 	                                         })},
-	    engine::testing::Case{.name = "reasoning regions join, where the reference keeps only the last",
-		                      .holds = reasoning_regions_join(*decoder)},
+	    engine::testing::Case{.name = "reasoning regions join, where the reference keeps only the last", .holds = reasoning_regions_join()},
 	    engine::testing::Case{.name = "object and array casts read strict JSON: repeated keys and NaN stay text",
-		                      .holds = structured_casts_stay_json(*decoder)},
+		                      .holds = structured_casts_stay_json()},
+	    engine::testing::Case{.name = "a custom tool's input is never cast", .holds = custom_input_is_never_cast()},
 	    engine::testing::Case{.name = "replies written as the template writes them parse back to themselves (seed 1)",
-		                      .holds = replies_round_trip(*decoder, 1)},
+		                      .holds = replies_round_trip(1)},
 	    engine::testing::Case{.name = "replies written as the template writes them parse back to themselves (seed 2)",
-		                      .holds = replies_round_trip(*decoder, 2)},
+		                      .holds = replies_round_trip(2)},
 	};
 	return engine::testing::report(checks);
 }

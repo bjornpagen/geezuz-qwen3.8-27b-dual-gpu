@@ -56,442 +56,539 @@ using Scratch = json::Reader<json::request_bounds>;
 	return model::serialize(model::Model{.value = std::move(object)}, model::Style{.spelling = model::Spelling::Raw, .spacing = model::Spacing::Compact}, rng);
 }
 
-[[nodiscard]] auto random_function_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
-	auto const name = "fn_" + std::to_string(rng() % 1000);
-	auto const parameters = coin(rng) ? std::optional<json::JsonText>{json_text(scratch, compact_object(rng, rng() % 4))} : std::nullopt;
-	auto definition = Text{};
-	json::write_object(definition, [&](Members& tool) {
-		tool.string("type", "function");
-		tool.object("function", [&](Members& function) {
-			function.string("name", name);
-			if (coin(rng)) {
-				function.string("description", model::random_text(rng, 10));
-			}
-			if (parameters) {
-				function.json("parameters", *parameters);
-			} else if (coin(rng)) {
-				function.null("parameters");
-			}
-			if (coin(rng)) {
-				function.boolean("strict", coin(rng));
-			}
-		});
-	});
-	return json::Tool{.name = name, .input = json::FunctionTool{.parameters = parameters}, .definition = json_text(scratch, definition.bytes)};
-}
-
-/** A custom tool, its format spelled every way it may be: absent, text, or a grammar nested or flat. */
-[[nodiscard]] auto random_custom_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
-	auto const name = "custom_" + std::to_string(rng() % 1000);
-	auto const grammar = coin(rng) ? std::optional<json::Grammar>{json::Grammar{
-	                                     .syntax = coin(rng) ? json::GrammarSyntax::Lark : json::GrammarSyntax::Regex,
-	                                     .definition = model::random_text(rng, 30),
-	                                 }}
-	                               : std::nullopt;
-	auto definition = Text{};
-	json::write_object(definition, [&](Members& tool) {
-		tool.string("type", "custom");
-		tool.object("custom", [&](Members& custom) {
-			custom.string("name", name);
-			if (coin(rng)) {
-				custom.string("description", model::random_text(rng, 10));
-			}
-			auto const syntax = [&grammar] { return grammar->syntax == json::GrammarSyntax::Lark ? "lark" : "regex"; };
-			if (grammar && coin(rng)) {
-				custom.object("format", [&](Members& format) {
-					format.string("type", "grammar");
-					format.object("grammar", [&](Members& nested) {
-						nested.string("definition", grammar->definition);
-						nested.string("syntax", syntax());
-					});
-				});
-			} else if (grammar) {
-				custom.object("format", [&](Members& format) {
-					format.string("syntax", syntax());
-					format.string("type", "grammar");
-					format.string("definition", grammar->definition);
-				});
-			} else if (coin(rng)) {
-				custom.object("format", [](Members& format) { format.string("type", "text"); });
-			} else if (coin(rng)) {
-				custom.null("format");
-			}
-		});
-	});
-	return json::Tool{.name = name, .input = json::CustomTool{.grammar = grammar}, .definition = json_text(scratch, definition.bytes)};
-}
-
-[[nodiscard]] auto random_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
-	return coin(rng) ? random_function_tool(rng, scratch) : random_custom_tool(rng, scratch);
-}
-
-[[nodiscard]] auto random_format(std::mt19937_64& rng, Scratch& scratch) -> json::ResponseFormat {
-	switch (rng() % 4) {
-	case 0:
-		return json::ResponseFormatMode::Text;
-	case 1:
-		return json::ResponseFormatMode::JsonObject;
-	default:
-		return json::JsonSchemaFormat{
-		    .name = "schema_" + std::to_string(rng() % 100),
-		    .schema = coin(rng) ? std::optional<json::JsonText>{json_text(scratch, compact_object(rng, rng() % 4))} : std::nullopt,
-		};
-	}
-}
-
-[[nodiscard]] auto random_call(std::mt19937_64& rng, Scratch& scratch) -> json::ToolCall {
-	auto call = json::ToolCall{.id = "call_" + std::to_string(rng()), .name = "fn_" + std::to_string(rng() % 1000), .arguments = {}};
-	for (auto count = rng() % 4; count > 0; --count) {
-		auto name = "arg" + std::to_string(count);
-		if (coin(rng)) {
-			call.arguments.push_back(json::Argument{.name = std::move(name), .value = model::random_text(rng, 12)});
-		} else {
-			auto const value = model::generate(rng, model::random_shape(rng));
-			auto text = model::serialize(value, model::Style{.spelling = model::Spelling::Raw, .spacing = model::Spacing::Compact}, rng);
-			// A string argument is the other alternative; generate a non-string here.
-			if (std::holds_alternative<std::string>(value.value)) {
-				text.insert(0, "[").append("]");
-			}
-			call.arguments.push_back(json::Argument{.name = std::move(name), .value = json_text(scratch, text)});
-		}
-	}
-	return call;
-}
-
-[[nodiscard]] auto random_message(std::mt19937_64& rng, Scratch& scratch) -> json::Message {
-	switch (rng() % 4) {
-	case 0:
-		return json::SystemMessage{.content = model::random_text(rng, 20)};
-	case 1:
-		return json::UserMessage{.content = model::random_text(rng, 20)};
-	case 2: {
-		auto message = json::AssistantMessage{.content = coin(rng) ? model::random_text(rng, 20) : "", .reasoning_content = coin(rng) ? model::random_text(rng, 20) : "", .tool_calls = {}};
-		for (auto count = rng() % 3; count > 0; --count) {
-			message.tool_calls.push_back(random_call(rng, scratch));
-		}
-		return message;
-	}
-	default:
-		return json::ToolMessage{.tool_call_id = "call_" + std::to_string(rng()), .content = model::random_text(rng, 20)};
-	}
-}
-
 template<class T>
 [[nodiscard]] auto maybe(std::mt19937_64& rng, T value) -> std::optional<T> {
 	return coin(rng) ? std::optional<T>{std::move(value)} : std::nullopt;
 }
 
-[[nodiscard]] auto random_request(std::mt19937_64& rng, Scratch& scratch) -> json::ChatRequest {
-	auto request = json::ChatRequest{
+[[nodiscard]] auto id(std::mt19937_64& rng, std::string_view prefix) -> std::string {
+	return std::format("{}{}", prefix, rng() % 100000);
+}
+
+[[nodiscard]] auto random_item(std::mt19937_64& rng, Scratch& scratch) -> json::InputItem {
+	switch (rng() % 6) {
+	case 0: {
+		auto constexpr roles = std::array{json::Role::User, json::Role::Assistant, json::Role::System, json::Role::Developer};
+		return json::MessageItem{.role = roles[rng() % roles.size()], .text = model::random_text(rng, 20)};
+	}
+	case 1:
+		return json::FunctionCallItem{.call_id = id(rng, "call_"), .name = id(rng, "fn_"), .arguments = json_text(scratch, compact_object(rng, rng() % 4))};
+	case 2:
+		return json::FunctionOutputItem{.call_id = id(rng, "call_"), .output = model::random_text(rng, 20)};
+	case 3:
+		return json::CustomCallItem{.call_id = id(rng, "call_"), .name = id(rng, "custom_"), .input = model::random_text(rng, 20)};
+	case 4:
+		return json::CustomOutputItem{.call_id = id(rng, "call_"), .output = model::random_text(rng, 20)};
+	default:
+		return json::ReasoningItem{.text = model::random_text(rng, 20)};
+	}
+}
+
+[[nodiscard]] auto random_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
+	if (coin(rng)) {
+		return json::Tool{
+		    .name = id(rng, "fn_"),
+		    .description = maybe(rng, model::random_text(rng, 10)),
+		    .input = json::FunctionTool{.parameters = coin(rng) ? std::optional{json_text(scratch, compact_object(rng, rng() % 4))} : std::nullopt},
+		};
+	}
+	auto grammar = std::optional<json::Grammar>{};
+	if (coin(rng)) {
+		grammar = json::Grammar{.syntax = coin(rng) ? json::GrammarSyntax::Lark : json::GrammarSyntax::Regex, .definition = model::random_text(rng, 30)};
+	}
+	return json::Tool{.name = id(rng, "custom_"), .description = maybe(rng, model::random_text(rng, 10)), .input = json::CustomTool{.grammar = grammar}};
+}
+
+[[nodiscard]] auto random_choice(std::mt19937_64& rng) -> json::ToolChoice {
+	switch (rng() % 5) {
+	case 0:
+		return json::ToolChoiceMode::None;
+	case 1:
+		return json::ToolChoiceMode::Auto;
+	case 2:
+		return json::ToolChoiceMode::Required;
+	case 3:
+		return json::ForcedFunction{.name = id(rng, "fn_")};
+	default:
+		return json::ForcedCustom{.name = id(rng, "custom_")};
+	}
+}
+
+[[nodiscard]] auto random_format(std::mt19937_64& rng, Scratch& scratch) -> json::TextFormat {
+	switch (rng() % 3) {
+	case 0:
+		return json::TextFormatMode::Text;
+	case 1:
+		return json::TextFormatMode::JsonObject;
+	default:
+		return json::JsonSchemaFormat{
+		    .name = id(rng, "schema_"),
+		    .description = maybe(rng, model::random_text(rng, 10)),
+		    .schema = json_text(scratch, compact_object(rng, rng() % 4)),
+		};
+	}
+}
+
+[[nodiscard]] auto random_request(std::mt19937_64& rng, Scratch& scratch) -> json::CreateRequest {
+	auto constexpr efforts = std::array{json::Effort::None, json::Effort::Low, json::Effort::Medium, json::Effort::XHigh};
+	auto request = json::CreateRequest{
 	    .model = maybe(rng, model::random_text(rng, 8)),
-	    .messages = {},
+	    .input = {},
+	    .instructions = maybe(rng, model::random_text(rng, 20)),
 	    .tools = {},
-	    .tool_choice = std::nullopt,
-	    .delivery = std::array{json::Delivery::Whole, json::Delivery::Stream, json::Delivery::StreamWithUsage}[rng() % 3],
-	    .max_tokens = maybe(rng, static_cast<std::int64_t>(rng() % 100000)),
+	    .tool_choice = random_choice(rng),
+	    .format = random_format(rng, scratch),
+	    .effort = efforts[rng() % efforts.size()],
+	    .max_output_tokens = maybe(rng, static_cast<std::int64_t>(rng() % 300000) - 10),
 	    .temperature = maybe(rng, model::random_finite(rng)),
 	    .top_p = maybe(rng, static_cast<double>(rng() % 1000) / 1000.0),
-	    .top_k = maybe(rng, static_cast<std::int64_t>(rng() % 100) - 1),
-	    .min_p = maybe(rng, static_cast<double>(rng() % 1000) / 1000.0),
-	    .seed = maybe(rng, std::bit_cast<std::int64_t>(rng())),
-	    .stop = {},
-	    .template_options = {
-	        .thinking = maybe(rng, coin(rng) ? json::Thinking::Enabled : json::Thinking::Disabled),
-	        .reasoning_effort = maybe(rng, std::array{json::ReasoningEffort::Low, json::ReasoningEffort::Medium, json::ReasoningEffort::XHigh}[rng() % 3]),
-	        .past_thinking = maybe(rng, coin(rng) ? json::PastThinking::Preserved : json::PastThinking::Dropped),
-	    },
-	    .response_format = random_format(rng, scratch),
+	    .delivery = coin(rng) ? json::Delivery::Whole : json::Delivery::Stream,
+	    .storage = coin(rng) ? json::Storage::Stored : json::Storage::Unstored,
+	    .previous_response_id = maybe(rng, id(rng, "resp_")),
+	    .metadata = {},
 	};
-	for (auto count = rng() % 6; count > 0; --count) {
-		request.messages.push_back(random_message(rng, scratch));
+	for (auto count = rng() % 7; count > 0; --count) {
+		request.input.push_back(random_item(rng, scratch));
 	}
 	for (auto count = rng() % 3; count > 0; --count) {
 		request.tools.push_back(random_tool(rng, scratch));
 	}
-	if (coin(rng)) {
-		request.tool_choice = coin(rng) ? json::ToolChoice{std::array{json::ToolChoiceMode::None, json::ToolChoiceMode::Auto, json::ToolChoiceMode::Required}[rng() % 3]}
-		                                : json::ToolChoice{json::ForcedFunction{.name = "fn_" + std::to_string(rng() % 1000)}};
-	}
-	for (auto count = rng() % (json::max_stop_sequences + 1); count > 0; --count) {
-		request.stop.push_back(model::random_text(rng, 4));
+	for (auto count = rng() % (json::max_metadata_pairs + 1); count > 0; --count) {
+		request.metadata.push_back(json::MetadataPair{.key = std::format("k{}", count), .value = model::random_text(rng, 30)});
 	}
 	return request;
 }
 
-/** Writes message content in one of its spellings: a string, text parts, or (when empty) null or nothing. */
-auto write_content(Members& message, std::string_view content, std::mt19937_64& rng) -> void {
-	auto const spelling = rng() % 4;
-	if (content.empty() && spelling == 0) {
+/** Writes text content as a string or as parts split at character boundaries, the parts' type chosen among `types`. */
+auto write_content(Members& item, std::string_view member, std::string_view content, std::span<std::string_view const> types, std::mt19937_64& rng) -> void {
+	if (coin(rng)) {
+		item.string(member, content);
 		return;
 	}
-	if (content.empty() && spelling == 1) {
-		message.null("content");
-		return;
-	}
-	if (spelling == 2) {
-		message.array("content", [&](Elements& parts) {
-			auto at = std::size_t{0};
-			while (at < content.size() || (at == 0 && coin(rng))) {
-				auto end = std::min<std::size_t>(content.size(), at + 1 + rng() % 12);
-				while (end < content.size() && (std::bit_cast<std::uint8_t>(content[end]) & 0xC0U) == 0x80U) {
-					++end;
+	item.array(member, [&](Elements& parts) {
+		auto at = std::size_t{0};
+		while (at < content.size()) {
+			auto end = std::min<std::size_t>(content.size(), at + 1 + rng() % 12);
+			while (end < content.size() && (std::bit_cast<std::uint8_t>(content[end]) & 0xC0U) == 0x80U) {
+				++end;
+			}
+			auto const type = types[rng() % types.size()];
+			parts.object([&](Members& part) {
+				if (coin(rng)) {
+					part.string("type", type);
+					part.string("text", content.substr(at, end - at));
+				} else {
+					part.string("text", content.substr(at, end - at));
+					part.string("type", type);
 				}
-				parts.object([&](Members& part) {
-					if (coin(rng)) {
-						part.string("type", "text");
-						part.string("text", content.substr(at, end - at));
-					} else {
-						part.string("text", content.substr(at, end - at));
-						part.string("type", "text");
-					}
-				});
-				at = end;
-				if (at == 0) {
-					break;
+				if (type == "input_text" && coin(rng)) {
+					part.null("prompt_cache_breakpoint");
 				}
-			}
-		});
-		return;
-	}
-	message.string("content", content);
-}
-
-auto write_arguments(Members& function, std::vector<json::Argument> const& arguments, std::mt19937_64& rng) -> void {
-	auto const object = [&arguments](Members& written) {
-		for (auto const& argument : arguments) {
-			if (std::holds_alternative<std::string>(argument.value)) {
-				written.string(argument.name, std::get<std::string>(argument.value));
-			} else {
-				written.json(argument.name, std::get<json::JsonText>(argument.value));
-			}
-		}
-	};
-	auto const spelling = rng() % 4;
-	if (arguments.empty() && spelling == 0) {
-		return;
-	}
-	if (arguments.empty() && spelling == 1) {
-		function.string("arguments", "");
-		return;
-	}
-	if (spelling == 2) {
-		function.object("arguments", object);
-		return;
-	}
-	auto held = Text{};
-	json::write_object(held, object);
-	function.string("arguments", held.bytes);
-}
-
-auto write_message(Elements& messages, json::Message const& message, std::mt19937_64& rng) -> void {
-	messages.object([&](Members& written) {
-		if (std::holds_alternative<json::SystemMessage>(message)) {
-			written.string("role", coin(rng) ? "system" : "developer");
-			write_content(written, std::get<json::SystemMessage>(message).content, rng);
-		} else if (std::holds_alternative<json::UserMessage>(message)) {
-			write_content(written, std::get<json::UserMessage>(message).content, rng);
-			written.string("role", "user");
-			if (coin(rng)) {
-				written.string("name", "someone");
-			}
-		} else if (std::holds_alternative<json::ToolMessage>(message)) {
-			auto const& tool = std::get<json::ToolMessage>(message);
-			written.string("tool_call_id", tool.tool_call_id);
-			written.string("role", "tool");
-			write_content(written, tool.content, rng);
-		} else {
-			auto const& assistant = std::get<json::AssistantMessage>(message);
-			written.string("role", "assistant");
-			write_content(written, assistant.content, rng);
-			if (!assistant.reasoning_content.empty() || coin(rng)) {
-				written.string("reasoning_content", assistant.reasoning_content);
-			} else if (coin(rng)) {
-				written.null("reasoning_content");
-			}
-			if (coin(rng)) {
-				written.null("refusal");
-			}
-			if (!assistant.tool_calls.empty() || coin(rng)) {
-				written.array("tool_calls", [&](Elements& calls) {
-					auto index = std::int64_t{0};
-					for (auto const& call : assistant.tool_calls) {
-						calls.object([&](Members& written_call) {
-							if (coin(rng)) {
-								written_call.integer("index", index);
-							}
-							written_call.string("id", call.id);
-							if (coin(rng)) {
-								written_call.string("type", "function");
-							}
-							written_call.object("function", [&](Members& function) {
-								function.string("name", call.name);
-								write_arguments(function, call.arguments, rng);
-							});
-						});
-						++index;
-					}
-				});
-			} else if (coin(rng)) {
-				written.null("tool_calls");
-			}
+				if (type == "output_text" && coin(rng)) {
+					part.array("annotations", [](Elements&) {});
+					part.array("logprobs", [](Elements&) {});
+				}
+			});
+			at = end;
 		}
 	});
 }
 
+constexpr auto input_parts = std::to_array<std::string_view>({"input_text"});
+constexpr auto assistant_parts = std::to_array<std::string_view>({"input_text", "output_text"});
+constexpr auto reasoning_parts = std::to_array<std::string_view>({"reasoning_text"});
+
+[[nodiscard]] auto role_text(json::Role role) -> std::string_view {
+	switch (role) {
+	case json::Role::User:
+		return "user";
+	case json::Role::Assistant:
+		return "assistant";
+	case json::Role::System:
+		return "system";
+	case json::Role::Developer:
+		return "developer";
+	}
+	std::unreachable();
+}
+
+/** The members a resent item may carry at their neutral values. */
+auto write_item_extras(Members& item, std::mt19937_64& rng, bool status, bool caller) -> void {
+	if (coin(rng)) {
+		item.string("id", id(rng, "item_"));
+	}
+	if (status && coin(rng)) {
+		item.string("status", "completed");
+	}
+	if (caller && coin(rng)) {
+		item.object("caller", [](Members& written) { written.string("type", "direct"); });
+	}
+}
+
+auto write_item(Elements& items, json::InputItem const& item, std::mt19937_64& rng) -> void {
+	items.object([&](Members& written) {
+		if (auto const message = engine::core::alternative<json::MessageItem>(item)) {
+			if (coin(rng)) {
+				written.string("type", "message");
+			}
+			written.string("role", role_text(message->role));
+			write_content(written, "content", message->text, message->role == json::Role::Assistant ? std::span<std::string_view const>{assistant_parts} : std::span<std::string_view const>{input_parts}, rng);
+			write_item_extras(written, rng, true, false);
+			if (coin(rng)) {
+				written.null("phase");
+			}
+		} else if (auto const call = engine::core::alternative<json::FunctionCallItem>(item)) {
+			written.string("type", "function_call");
+			written.string("call_id", call->call_id);
+			written.string("arguments", call->arguments.text());
+			written.string("name", call->name);
+			write_item_extras(written, rng, true, true);
+			if (coin(rng)) {
+				written.null("namespace");
+			}
+		} else if (auto const output = engine::core::alternative<json::FunctionOutputItem>(item)) {
+			written.string("call_id", output->call_id);
+			written.string("type", "function_call_output");
+			write_content(written, "output", output->output, input_parts, rng);
+			write_item_extras(written, rng, true, true);
+		} else if (auto const custom = engine::core::alternative<json::CustomCallItem>(item)) {
+			written.string("input", custom->input);
+			written.string("type", "custom_tool_call");
+			written.string("name", custom->name);
+			written.string("call_id", custom->call_id);
+			write_item_extras(written, rng, false, true);
+		} else if (auto const custom_output = engine::core::alternative<json::CustomOutputItem>(item)) {
+			written.string("type", "custom_tool_call_output");
+			written.string("call_id", custom_output->call_id);
+			write_content(written, "output", custom_output->output, input_parts, rng);
+			write_item_extras(written, rng, false, true);
+		} else {
+			auto const& reasoning = std::get<json::ReasoningItem>(item);
+			written.string("type", "reasoning");
+			if (coin(rng)) {
+				written.array("summary", [](Elements&) {});
+			}
+			if (!reasoning.text.empty() || coin(rng)) {
+				written.array("content", [&](Elements& parts) {
+					auto const text = std::string_view{reasoning.text};
+					auto at = std::size_t{0};
+					while (at < text.size()) {
+						auto end = std::min<std::size_t>(text.size(), at + 1 + rng() % 12);
+						while (end < text.size() && (std::bit_cast<std::uint8_t>(text[end]) & 0xC0U) == 0x80U) {
+							++end;
+						}
+						parts.object([&](Members& part) {
+							part.string("type", reasoning_parts[0]);
+							part.string("text", text.substr(at, end - at));
+						});
+						at = end;
+					}
+				});
+			}
+			if (coin(rng)) {
+				written.null("encrypted_content");
+			}
+			write_item_extras(written, rng, true, false);
+		}
+	});
+}
+
+auto write_tool(Elements& tools, json::Tool const& tool, std::mt19937_64& rng) -> void {
+	tools.object([&](Members& written) {
+		auto const describe = [&] {
+			if (tool.description) {
+				written.string("description", *tool.description);
+			} else if (coin(rng)) {
+				written.null("description");
+			}
+		};
+		if (auto const function = engine::core::alternative<json::FunctionTool>(tool.input)) {
+			written.string("name", tool.name);
+			written.string("type", "function");
+			if (function->parameters) {
+				written.json("parameters", *function->parameters);
+			} else {
+				written.null("parameters");
+			}
+			describe();
+			auto const strict = rng() % 3;
+			if (strict == 0) {
+				written.null("strict");
+			} else {
+				written.boolean("strict", strict == 1);
+			}
+			if (coin(rng)) {
+				written.boolean("defer_loading", false);
+				written.array("allowed_callers", [](Elements& callers) { callers.string("direct"); });
+				written.null("output_schema");
+			}
+			return;
+		}
+		auto const& custom = std::get<json::CustomTool>(tool.input);
+		written.string("type", "custom");
+		describe();
+		written.string("name", tool.name);
+		if (custom.grammar) {
+			written.object("format", [&](Members& format) {
+				auto const syntax = custom.grammar->syntax == json::GrammarSyntax::Lark ? "lark" : "regex";
+				if (coin(rng)) {
+					format.string("definition", custom.grammar->definition);
+					format.string("type", "grammar");
+					format.string("syntax", syntax);
+				} else {
+					format.string("type", "grammar");
+					format.string("syntax", syntax);
+					format.string("definition", custom.grammar->definition);
+				}
+			});
+		} else if (auto const spelling = rng() % 3; spelling == 0) {
+			written.object("format", [](Members& format) { format.string("type", "text"); });
+		} else if (spelling == 1) {
+			written.null("format");
+		}
+	});
+}
+
+auto write_choice(Members& written, json::ToolChoice const& choice, std::mt19937_64& rng) -> void {
+	if (auto const mode = engine::core::alternative<json::ToolChoiceMode>(choice)) {
+		if (*mode == json::ToolChoiceMode::Auto && coin(rng)) {
+			if (coin(rng)) {
+				written.null("tool_choice");
+			}
+			return;
+		}
+		auto constexpr modes = std::array<std::string_view, 3>{"none", "auto", "required"};
+		written.string("tool_choice", modes[std::to_underlying(*mode)]);
+		return;
+	}
+	written.object("tool_choice", [&](Members& forced) {
+		if (auto const function = engine::core::alternative<json::ForcedFunction>(choice)) {
+			forced.string("name", function->name);
+			forced.string("type", "function");
+		} else {
+			forced.string("type", "custom");
+			forced.string("name", std::get<json::ForcedCustom>(choice).name);
+		}
+	});
+}
+
+auto write_text(Members& written, json::TextFormat const& format, std::mt19937_64& rng) -> void {
+	if (auto const mode = engine::core::alternative<json::TextFormatMode>(format); mode && *mode == json::TextFormatMode::Text) {
+		switch (rng() % 5) {
+		case 0:
+			return;
+		case 1:
+			written.null("text");
+			return;
+		case 2:
+			written.object("text", [](Members&) {});
+			return;
+		case 3:
+			written.object("text", [](Members& text) { text.null("format"); });
+			return;
+		default:
+			written.object("text", [&](Members& text) {
+				text.object("format", [](Members& written_format) { written_format.string("type", "text"); });
+				if (coin(rng)) {
+					text.string("verbosity", "medium");
+				}
+			});
+			return;
+		}
+	}
+	written.object("text", [&](Members& text) {
+		if (coin(rng)) {
+			text.null("verbosity");
+		}
+		text.object("format", [&](Members& written_format) {
+			if (engine::core::alternative<json::TextFormatMode>(format)) {
+				written_format.string("type", "json_object");
+				return;
+			}
+			auto const& schema = std::get<json::JsonSchemaFormat>(format);
+			written_format.json("schema", schema.schema);
+			written_format.string("type", "json_schema");
+			written_format.string("name", schema.name);
+			if (schema.description) {
+				written_format.string("description", *schema.description);
+			} else if (coin(rng)) {
+				written_format.null("description");
+			}
+			if (coin(rng)) {
+				written_format.boolean("strict", coin(rng));
+			}
+		});
+	});
+}
+
+auto write_reasoning(Members& written, json::Effort effort, std::mt19937_64& rng) -> void {
+	auto constexpr efforts = std::array<std::string_view, 4>{"none", "low", "medium", "xhigh"};
+	if (effort == json::Effort::XHigh) {
+		switch (rng() % 4) {
+		case 0:
+			return;
+		case 1:
+			written.null("reasoning");
+			return;
+		case 2:
+			written.object("reasoning", [](Members& reasoning) { reasoning.null("effort"); });
+			return;
+		default:
+			break;
+		}
+	}
+	written.object("reasoning", [&](Members& reasoning) {
+		if (coin(rng)) {
+			reasoning.null("summary");
+			reasoning.string("context", coin(rng) ? "auto" : "all_turns");
+			reasoning.string("mode", "standard");
+		}
+		reasoning.string("effort", efforts[std::to_underlying(effort)]);
+	});
+}
+
 enum class Field : std::uint8_t {
-	Messages,
+	Input,
 	Model,
+	Instructions,
 	Tools,
 	ToolChoice,
-	Delivery,
-	MaxTokens,
+	Text,
+	Reasoning,
+	Budget,
 	Sampling,
-	Stop,
-	Template,
-	Format,
+	Delivery,
+	Storage,
+	Previous,
+	Metadata,
 	Neutral,
 };
 
 /** Writes a request in a random order of members and a random choice of the spellings each member allows. */
-[[nodiscard]] auto encode(json::ChatRequest const& request, std::mt19937_64& rng) -> std::string {
-	auto fields = std::vector<Field>{Field::Messages, Field::Model, Field::Tools, Field::ToolChoice, Field::Delivery, Field::MaxTokens, Field::Sampling, Field::Stop, Field::Template, Field::Format, Field::Neutral};
+[[nodiscard]] auto encode(json::CreateRequest const& request, std::mt19937_64& rng) -> std::string {
+	auto fields = std::vector<Field>{Field::Input,  Field::Model,  Field::Instructions, Field::Tools,    Field::ToolChoice, Field::Text,     Field::Reasoning,
+	                                 Field::Budget, Field::Sampling, Field::Delivery,   Field::Storage, Field::Previous,   Field::Metadata, Field::Neutral};
 	std::ranges::shuffle(fields, rng);
 	auto out = Text{};
 	json::write_object(out, [&](Members& written) {
 		for (auto const field : fields) {
 			switch (field) {
-			case Field::Messages:
-				written.array("messages", [&](Elements& messages) {
-					for (auto const& message : request.messages) {
-						write_message(messages, message, rng);
-					}
-				});
+			case Field::Input: {
+				auto const one_user = request.input.size() == 1 && engine::core::alternative<json::MessageItem>(request.input.front()) &&
+				                      std::get<json::MessageItem>(request.input.front()).role == json::Role::User;
+				if (one_user && coin(rng)) {
+					written.string("input", std::get<json::MessageItem>(request.input.front()).text);
+				} else {
+					written.array("input", [&](Elements& items) {
+						for (auto const& item : request.input) {
+							write_item(items, item, rng);
+						}
+					});
+				}
 				break;
+			}
 			case Field::Model:
 				if (request.model) {
 					written.string("model", *request.model);
+				}
+				break;
+			case Field::Instructions:
+				if (request.instructions) {
+					written.string("instructions", *request.instructions);
+				} else if (coin(rng)) {
+					written.null("instructions");
 				}
 				break;
 			case Field::Tools:
 				if (!request.tools.empty() || coin(rng)) {
 					written.array("tools", [&](Elements& tools) {
 						for (auto const& tool : request.tools) {
-							tools.json(tool.definition);
+							write_tool(tools, tool, rng);
 						}
 					});
 				}
 				break;
 			case Field::ToolChoice:
-				if (request.tool_choice && std::holds_alternative<json::ToolChoiceMode>(*request.tool_choice)) {
-					auto constexpr modes = std::array<std::string_view, 3>{"none", "auto", "required"};
-					written.string("tool_choice", modes[std::to_underlying(std::get<json::ToolChoiceMode>(*request.tool_choice))]);
-				} else if (request.tool_choice) {
-					written.object("tool_choice", [&](Members& choice) {
-						choice.string("type", "function");
-						choice.object("function", [&](Members& function) { function.string("name", std::get<json::ForcedFunction>(*request.tool_choice).name); });
-					});
-				}
+				write_choice(written, request.tool_choice, rng);
 				break;
-			case Field::Delivery:
-				if (request.delivery == json::Delivery::Whole) {
-					if (coin(rng)) {
-						written.boolean("stream", false);
-					}
-				} else {
-					written.boolean("stream", true);
-					if (request.delivery == json::Delivery::StreamWithUsage) {
-						written.object("stream_options", [](Members& options) { options.boolean("include_usage", true); });
-					} else if (coin(rng)) {
-						written.object("stream_options", [&](Members& options) {
-							if (coin(rng)) {
-								options.boolean("include_usage", false);
-							}
-						});
-					}
-				}
+			case Field::Text:
+				write_text(written, request.format, rng);
 				break;
-			case Field::MaxTokens:
-				if (request.max_tokens) {
-					written.integer(coin(rng) ? "max_tokens" : "max_completion_tokens", *request.max_tokens);
+			case Field::Reasoning:
+				write_reasoning(written, request.effort, rng);
+				break;
+			case Field::Budget:
+				if (request.max_output_tokens) {
+					written.integer("max_output_tokens", *request.max_output_tokens);
+				} else if (coin(rng)) {
+					written.null("max_output_tokens");
 				}
 				break;
 			case Field::Sampling:
-				for (auto const& [name, value] : {std::pair{"temperature", request.temperature}, std::pair{"top_p", request.top_p}, std::pair{"min_p", request.min_p}}) {
+				for (auto const& [name, value] : {std::pair{"temperature", request.temperature}, std::pair{"top_p", request.top_p}}) {
 					if (value) {
 						written.real(name, *value);
 					} else if (coin(rng)) {
 						written.null(name);
 					}
 				}
-				for (auto const& [name, value] : {std::pair{"top_k", request.top_k}, std::pair{"seed", request.seed}}) {
-					if (value) {
-						written.integer(name, *value);
-					}
-				}
 				break;
-			case Field::Stop:
-				if (request.stop.size() == 1 && coin(rng)) {
-					written.string("stop", request.stop.front());
-				} else if (!request.stop.empty() || coin(rng)) {
-					written.array("stop", [&](Elements& stops) {
-						for (auto const& stop : request.stop) {
-							stops.string(stop);
-						}
-					});
-				}
-				break;
-			case Field::Template: {
-				auto const& options = request.template_options;
-				if (options.thinking || options.reasoning_effort || options.past_thinking || coin(rng)) {
-					written.object("chat_template_kwargs", [&](Members& kwargs) {
-						if (options.thinking) {
-							kwargs.boolean("enable_thinking", *options.thinking == json::Thinking::Enabled);
-						}
-						if (options.reasoning_effort) {
-							auto constexpr efforts = std::array<std::string_view, 3>{"low", "medium", "xhigh"};
-							kwargs.string("reasoning_effort", efforts[std::to_underlying(*options.reasoning_effort)]);
-						}
-						if (options.past_thinking) {
-							kwargs.boolean("preserve_thinking", *options.past_thinking == json::PastThinking::Preserved);
-						}
-					});
-				}
-				break;
-			}
-			case Field::Format:
-				if (std::holds_alternative<json::JsonSchemaFormat>(request.response_format)) {
-					auto const& format = std::get<json::JsonSchemaFormat>(request.response_format);
-					written.object("response_format", [&](Members& written_format) {
-						written_format.object("json_schema", [&](Members& schema) {
+			case Field::Delivery:
+				if (request.delivery == json::Delivery::Stream) {
+					written.boolean("stream", true);
+					if (coin(rng)) {
+						written.object("stream_options", [&](Members& options) {
 							if (coin(rng)) {
-								schema.boolean("strict", coin(rng));
-							}
-							schema.string("name", format.name);
-							if (format.schema) {
-								schema.json("schema", *format.schema);
+								options.boolean("include_obfuscation", false);
 							}
 						});
-						written_format.string("type", "json_schema");
+					}
+				} else if (auto const spelling = rng() % 3; spelling == 0) {
+					written.boolean("stream", false);
+				} else if (spelling == 1) {
+					written.null("stream");
+				}
+				break;
+			case Field::Storage:
+				if (request.storage == json::Storage::Unstored) {
+					written.boolean("store", false);
+				} else if (auto const spelling = rng() % 3; spelling == 0) {
+					written.boolean("store", true);
+				} else if (spelling == 1) {
+					written.null("store");
+				}
+				break;
+			case Field::Previous:
+				if (request.previous_response_id) {
+					written.string("previous_response_id", *request.previous_response_id);
+				} else if (coin(rng)) {
+					written.null("previous_response_id");
+				}
+				break;
+			case Field::Metadata:
+				if (!request.metadata.empty() || coin(rng)) {
+					written.object("metadata", [&](Members& pairs) {
+						for (auto const& pair : request.metadata) {
+							pairs.string(pair.key, pair.value);
+						}
 					});
-				} else if (std::get<json::ResponseFormatMode>(request.response_format) == json::ResponseFormatMode::JsonObject) {
-					written.object("response_format", [](Members& format) { format.string("type", "json_object"); });
 				} else if (coin(rng)) {
-					written.object("response_format", [](Members& format) { format.string("type", "text"); });
-				} else if (coin(rng)) {
-					written.null("response_format");
+					written.null("metadata");
 				}
 				break;
 			case Field::Neutral:
 				if (coin(rng)) {
-					written.integer("n", 1);
-					written.real("presence_penalty", 0.0);
-					written.integer("frequency_penalty", 0);
-					written.boolean("logprobs", false);
-					written.object("logit_bias", [](Members&) {});
-					written.string("user", "client-42");
-					written.array("modalities", [](Elements& modalities) { modalities.string("text"); });
+					written.boolean("background", false);
 					written.boolean("parallel_tool_calls", true);
-					written.null("metadata");
+					written.string("truncation", "disabled");
+					written.string("service_tier", coin(rng) ? "auto" : "default");
+					written.array("include", [](Elements&) {});
+					written.integer("top_logprobs", 0);
+					written.null("max_tool_calls");
+					written.null("safety_identifier");
+					written.null("user");
+					written.null("prompt_cache_key");
+					written.null("conversation");
 				}
 				break;
 			}
@@ -518,7 +615,7 @@ enum class Field : std::uint8_t {
 }
 
 struct Refusal {
-	std::string_view body;
+	std::string body;
 	json::DecodeError error;
 };
 
@@ -530,98 +627,163 @@ struct Refusal {
 	return json::WrongShape{.expected = expected, .found = found};
 }
 
+/** A valid request with `members` spliced in after its input. */
+[[nodiscard]] auto with(std::string_view members) -> std::string {
+	return std::format(R"({{"input":"hi",{}}})", members);
+}
+
+/** A request whose input is the one item `item`. */
+[[nodiscard]] auto item(std::string_view item) -> std::string {
+	return std::format(R"({{"input":[{}]}})", item);
+}
+
+/** A request whose tools are the one tool `tool`. */
+[[nodiscard]] auto tool(std::string_view tool) -> std::string {
+	return std::format(R"({{"input":"hi","tools":[{}]}})", tool);
+}
+
 /** Requests refused with the documented fault at the documented member, one per rule the decoder states. */
 [[nodiscard]] auto refusals_name_the_member() -> bool {
 	using json::Kind;
 	using json::Expected;
 	using P = json::PathStep;
 	auto const parse = [](json::ParseFault fault) { return json::DecodeFault{json::ParseError{.fault = fault}}; };
+	auto const zero = P{std::size_t{0}};
+	auto many_pairs = std::string{};
+	for (auto index = std::size_t{0}; index <= json::max_metadata_pairs; ++index) {
+		many_pairs += std::format(R"({}"k{}":"v")", index == 0 ? "" : ",", index);
+	}
+	auto const long_key = std::string(json::max_metadata_key_bytes + 1, 'k');
+	auto const long_value = std::string(json::max_metadata_value_bytes + 1, 'v');
 	auto const refusals = std::vector<Refusal>{
 	    {.body = R"([])", .error = at(shape(Expected::Object, Kind::Array), {})},
-	    {.body = R"({"messages":[]} {})", .error = at(parse(json::ParseFault::TrailingContent), {})},
-	    {.body = R"({"messages":[]}x)", .error = at(parse(json::ParseFault::TrailingContent), {})},
-	    {.body = R"({"messages":[{"role":"user","content":"]}"}]} x)", .error = at(parse(json::ParseFault::TrailingContent), {})},
-	    {.body = R"({"messages":[)", .error = at(parse(json::ParseFault::Truncated), {})},
-	    {.body = R"({})", .error = at(Violation::MissingField, {P{"messages"}})},
-	    {.body = R"({"messages":[],"best_of":2})", .error = at(Violation::UnknownField, {P{"best_of"}})},
-	    {.body = R"({"messages":[],"messages":[]})", .error = at(parse(json::ParseFault::DuplicateKey), {})},
-	    {.body = R"({"messages":{}})", .error = at(shape(Expected::Array, Kind::Object), {P{"messages"}})},
-	    {.body = R"({"messages":[{"content":"x"}]})", .error = at(Violation::MissingField, {P{"messages"}, P{std::size_t{0}}, P{"role"}})},
-	    {.body = R"({"messages":[{"role":"robot","content":"x"}]})", .error = at(Violation::UnknownValue, {P{"messages"}, P{std::size_t{0}}, P{"role"}})},
-	    {.body = R"({"messages":[{"role":"function","content":"x","name":"f"}]})", .error = at(Violation::Unsupported, {P{"messages"}, P{std::size_t{0}}, P{"role"}})},
-	    {.body = R"({"messages":[{"role":"user","content":"x","mood":"good"}]})", .error = at(Violation::UnknownField, {P{"messages"}, P{std::size_t{0}}, P{"mood"}})},
-	    {.body = R"({"messages":[{"role":"user","content":"x","tool_call_id":"c"}]})", .error = at(Violation::UnknownField, {P{"messages"}, P{std::size_t{0}}, P{"tool_call_id"}})},
-	    {.body = R"({"messages":[{"role":"tool","content":"x"}]})", .error = at(Violation::MissingField, {P{"messages"}, P{std::size_t{0}}, P{"tool_call_id"}})},
-	    {.body = R"({"messages":[{"role":"user","content":7}]})", .error = at(shape(Expected::Content, Kind::Integer), {P{"messages"}, P{std::size_t{0}}, P{"content"}})},
-	    {.body = R"({"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"u"}}]}]})",
-	     .error = at(Violation::Unsupported, {P{"messages"}, P{std::size_t{0}}, P{"content"}, P{std::size_t{1}}, P{"type"}})},
-	    {.body = R"({"messages":[{"role":"user","content":[{"type":"sticker"}]}]})", .error = at(Violation::UnknownValue, {P{"messages"}, P{std::size_t{0}}, P{"content"}, P{std::size_t{0}}, P{"type"}})},
-	    {.body = R"({"messages":[{"role":"user","content":[{"type":"text","text":"a","cache_control":{}}]}]})",
-	     .error = at(Violation::UnknownField, {P{"messages"}, P{std::size_t{0}}, P{"content"}, P{std::size_t{0}}, P{"cache_control"}})},
-	    {.body = R"({"messages":[{"role":"user","content":[{"text":"a"}]}]})", .error = at(Violation::MissingField, {P{"messages"}, P{std::size_t{0}}, P{"content"}, P{std::size_t{0}}, P{"type"}})},
-	    {.body = R"({"messages":[{"role":"assistant","refusal":"no"}]})", .error = at(Violation::Unsupported, {P{"messages"}, P{std::size_t{0}}, P{"refusal"}})},
-	    {.body = R"({"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"custom","custom":{}}]}]})",
-	     .error = at(Violation::Unsupported, {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"type"}})},
-	    {.body = R"({"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"f"}}]}]})",
-	     .error = at(Violation::MissingField, {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"id"}})},
-	    {.body = R"({"messages":[{"role":"assistant","tool_calls":[{"id":"c","function":{"name":"f","arguments":"{\"a\":"}}]}]})",
-	     .error = at(parse(json::ParseFault::Truncated), {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"function"}, P{"arguments"}})},
-	    {.body = R"({"messages":[{"role":"assistant","tool_calls":[{"id":"c","function":{"name":"f","arguments":"[1]"}}]}]})",
-	     .error = at(shape(Expected::Arguments, Kind::Array), {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"function"}, P{"arguments"}})},
-	    {.body = R"({"messages":[{"role":"assistant","tool_calls":[{"id":"c","function":{"name":"f","arguments":"{\"a\":1,\"a\":2}"}}]}]})",
-	     .error = at(parse(json::ParseFault::DuplicateKey), {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"function"}, P{"arguments"}})},
-	    {.body = R"({"messages":[{"role":"assistant","tool_calls":[{"id":"c","function":{"name":"f","extra":1}}]}]})",
-	     .error = at(Violation::UnknownField, {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"function"}, P{"extra"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"web_search"}]})", .error = at(Violation::Unsupported, {P{"tools"}, P{std::size_t{0}}, P{"type"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f"},"custom":{"name":"f"}}]})", .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{}}]})", .error = at(Violation::MissingField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"name"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"grammar","grammar":{"syntax":"ebnf","definition":"x"}}}}]})",
-	     .error = at(Violation::UnknownValue, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"grammar"}, P{"syntax"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"grammar","syntax":"lark"}}}]})",
-	     .error = at(Violation::MissingField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"definition"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"text","definition":"x"}}}]})",
-	     .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"definition"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"x"},"syntax":"lark"}}}]})",
-	     .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"syntax"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"cfg"}}}]})",
-	     .error = at(Violation::UnknownValue, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"type"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f"},"cache_control":{}}]})", .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"cache_control"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f","strict":"yes"}}]})",
-	     .error = at(shape(Expected::Boolean, Kind::String), {P{"tools"}, P{std::size_t{0}}, P{"function"}, P{"strict"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":[]}}]})",
-	     .error = at(shape(Expected::Object, Kind::Array), {P{"tools"}, P{std::size_t{0}}, P{"function"}, P{"parameters"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{"a":tru}}}]})", .error = at(parse(json::ParseFault::InvalidLiteral), {P{"tools"}, P{std::size_t{0}}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{}}]})", .error = at(Violation::MissingField, {P{"tools"}, P{std::size_t{0}}, P{"function"}, P{"name"}})},
-	    {.body = R"({"messages":[],"tool_choice":"maybe"})", .error = at(Violation::UnknownValue, {P{"tool_choice"}})},
-	    {.body = R"({"messages":[],"tool_choice":{"type":"allowed_tools","allowed_tools":{}}})", .error = at(Violation::Unsupported, {P{"tool_choice"}, P{"type"}})},
-	    {.body = R"({"messages":[],"tool_choice":3})", .error = at(shape(Expected::ToolChoice, Kind::Integer), {P{"tool_choice"}})},
-	    {.body = R"({"messages":[],"max_tokens":5,"max_completion_tokens":5})", .error = at(json::Conflict{.other = "max_tokens"}, {P{"max_completion_tokens"}})},
-	    {.body = R"({"messages":[],"max_tokens":5.5})", .error = at(shape(Expected::Integer, Kind::Real), {P{"max_tokens"}})},
-	    {.body = R"({"messages":[],"stream_options":{"include_usage":true}})", .error = at(json::Conflict{.other = "stream"}, {P{"stream_options"}})},
-	    {.body = R"({"messages":[],"stream":true,"stream_options":{"include_obfuscation":true}})", .error = at(Violation::Unsupported, {P{"stream_options"}, P{"include_obfuscation"}})},
-	    {.body = R"({"messages":[],"stream":"yes"})", .error = at(shape(Expected::Boolean, Kind::String), {P{"stream"}})},
-	    {.body = R"({"messages":[],"temperature":"hot"})", .error = at(shape(Expected::Number, Kind::String), {P{"temperature"}})},
-	    {.body = R"({"messages":[],"stop":["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q"]})", .error = at(json::TooMany{.limit = json::max_stop_sequences}, {P{"stop"}})},
-	    {.body = R"({"messages":[],"stop":{}})", .error = at(shape(Expected::Stop, Kind::Object), {P{"stop"}})},
-	    {.body = R"({"messages":[],"stop":["a",1]})", .error = at(shape(Expected::String, Kind::Integer), {P{"stop"}, P{std::size_t{1}}})},
-	    {.body = R"({"messages":[],"chat_template_kwargs":{"reasoning_effort":"max"}})", .error = at(Violation::UnknownValue, {P{"chat_template_kwargs"}, P{"reasoning_effort"}})},
-	    {.body = R"({"messages":[],"chat_template_kwargs":{"thinking_budget":100}})", .error = at(Violation::UnknownField, {P{"chat_template_kwargs"}, P{"thinking_budget"}})},
-	    {.body = R"({"messages":[],"n":2})", .error = at(Violation::Unsupported, {P{"n"}})},
-	    {.body = R"({"messages":[],"presence_penalty":0.5})", .error = at(Violation::Unsupported, {P{"presence_penalty"}})},
-	    {.body = R"({"messages":[],"logprobs":true})", .error = at(Violation::Unsupported, {P{"logprobs"}})},
-	    {.body = R"({"messages":[],"logit_bias":{"50256":-100}})", .error = at(Violation::Unsupported, {P{"logit_bias"}})},
-	    {.body = R"({"messages":[],"response_format":{"type":"xml"}})", .error = at(Violation::UnknownValue, {P{"response_format"}, P{"type"}})},
-	    {.body = R"({"messages":[],"response_format":{"type":"json_schema"}})", .error = at(Violation::MissingField, {P{"response_format"}, P{"json_schema"}})},
-	    {.body = R"({"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{}}}})",
-	     .error = at(Violation::MissingField, {P{"response_format"}, P{"json_schema"}, P{"name"}})},
-	    {.body = R"({"messages":[],"response_format":{"type":"json_object","json_schema":{"name":"n"}}})", .error = at(Violation::UnknownField, {P{"response_format"}, P{"json_schema"}})},
-	    {.body = R"({"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":[]}}})",
-	     .error = at(shape(Expected::Object, Kind::Array), {P{"response_format"}, P{"json_schema"}, P{"schema"}})},
-	    {.body = R"({"messages":[],"response_format":"json"})", .error = at(shape(Expected::Object, Kind::String), {P{"response_format"}})},
-	    {.body = R"({"messages":[],"parallel_tool_calls":false})", .error = at(Violation::Unsupported, {P{"parallel_tool_calls"}})},
-	    {.body = R"({"messages":[],"reasoning_effort":"high"})", .error = at(Violation::Unsupported, {P{"reasoning_effort"}})},
-	    {.body = R"({"messages":[],"modalities":["text","audio"]})", .error = at(Violation::Unsupported, {P{"modalities"}})},
-	    {.body = R"({"messages":[],"user":5})", .error = at(shape(Expected::String, Kind::Integer), {P{"user"}})},
+	    {.body = R"({"input":"x"} x)", .error = at(parse(json::ParseFault::TrailingContent), {})},
+	    {.body = R"({"input":[)", .error = at(parse(json::ParseFault::Truncated), {})},
+	    {.body = R"({})", .error = at(Violation::MissingField, {P{"input"}})},
+	    {.body = R"({"input":"x","input":"y"})", .error = at(parse(json::ParseFault::DuplicateKey), {})},
+	    {.body = R"({"input":3})", .error = at(shape(Expected::Input, Kind::Integer), {P{"input"}})},
+	    {.body = with(R"("frobnicate":1)"), .error = at(Violation::UnknownField, {P{"frobnicate"}})},
+	    {.body = with(R"("messages":[])"), .error = at(Violation::UnknownField, {P{"messages"}})},
+	    {.body = with(R"("seed":1)"), .error = at(Violation::UnknownField, {P{"seed"}})},
+	    {.body = with(R"("model":null)"), .error = at(shape(Expected::String, Kind::Null), {P{"model"}})},
+	    {.body = with(R"("user":"u")"), .error = at(Violation::Deprecated, {P{"user"}})},
+	    {.body = with(R"("prompt_cache_retention":"24h")"), .error = at(Violation::Deprecated, {P{"prompt_cache_retention"}})},
+	    {.body = with(R"("reasoning":{"generate_summary":"auto"})"), .error = at(Violation::Deprecated, {P{"reasoning"}, P{"generate_summary"}})},
+	    {.body = with(R"("reasoning":{"effort":"high"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"effort"}})},
+	    {.body = with(R"("reasoning":{"effort":"minimal"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"effort"}})},
+	    {.body = with(R"("reasoning":{"effort":"max"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"effort"}})},
+	    {.body = with(R"("reasoning":{"effort":"turbo"})"), .error = at(Violation::UnknownValue, {P{"reasoning"}, P{"effort"}})},
+	    {.body = with(R"("reasoning":{"summary":"auto"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"summary"}})},
+	    {.body = with(R"("reasoning":{"context":"current_turn"})"), .error = at(Violation::Unsupported, {P{"reasoning"}, P{"context"}})},
+	    {.body = with(R"("reasoning":{"budget":5})"), .error = at(Violation::UnknownField, {P{"reasoning"}, P{"budget"}})},
+	    {.body = with(R"("background":true)"), .error = at(Violation::Unsupported, {P{"background"}})},
+	    {.body = with(R"("conversation":"conv_1")"), .error = at(Violation::Unsupported, {P{"conversation"}})},
+	    {.body = with(R"("prompt":{"id":"p"})"), .error = at(Violation::Unsupported, {P{"prompt"}})},
+	    {.body = with(R"("include":["reasoning.encrypted_content"])"), .error = at(Violation::Unsupported, {P{"include"}})},
+	    {.body = with(R"("truncation":"auto")"), .error = at(Violation::Unsupported, {P{"truncation"}})},
+	    {.body = with(R"("service_tier":"flex")"), .error = at(Violation::Unsupported, {P{"service_tier"}})},
+	    {.body = with(R"("parallel_tool_calls":false)"), .error = at(Violation::Unsupported, {P{"parallel_tool_calls"}})},
+	    {.body = with(R"("max_tool_calls":3)"), .error = at(Violation::Unsupported, {P{"max_tool_calls"}})},
+	    {.body = with(R"("prompt_cache_key":"k")"), .error = at(Violation::Unsupported, {P{"prompt_cache_key"}})},
+	    {.body = with(R"("top_logprobs":2)"), .error = at(Violation::Unsupported, {P{"top_logprobs"}})},
+	    {.body = with(R"("max_output_tokens":5.5)"), .error = at(shape(Expected::Integer, Kind::Real), {P{"max_output_tokens"}})},
+	    {.body = with(R"("temperature":"hot")"), .error = at(shape(Expected::Number, Kind::String), {P{"temperature"}})},
+	    {.body = with(R"("stream":"yes")"), .error = at(shape(Expected::Boolean, Kind::String), {P{"stream"}})},
+	    {.body = with(R"("stream_options":{})"), .error = at(json::Conflict{.other = "stream"}, {P{"stream_options"}})},
+	    {.body = with(R"("stream":true,"stream_options":{"include_obfuscation":true})"), .error = at(Violation::Unsupported, {P{"stream_options"}, P{"include_obfuscation"}})},
+	    {.body = with(R"("stream":true,"stream_options":{"include_usage":true})"), .error = at(Violation::UnknownField, {P{"stream_options"}, P{"include_usage"}})},
+	    {.body = with(std::format(R"("metadata":{{{}}})", many_pairs)), .error = at(json::TooMany{.limit = json::max_metadata_pairs}, {P{"metadata"}})},
+	    {.body = with(std::format(R"("metadata":{{"{}":"v"}})", long_key)), .error = at(json::TooLong{.limit = json::max_metadata_key_bytes}, {P{"metadata"}, P{long_key}})},
+	    {.body = with(std::format(R"("metadata":{{"k":"{}"}})", long_value)), .error = at(json::TooLong{.limit = json::max_metadata_value_bytes}, {P{"metadata"}, P{"k"}})},
+	    {.body = with(R"("metadata":{"k":1})"), .error = at(shape(Expected::String, Kind::Integer), {P{"metadata"}, P{"k"}})},
+	    {.body = item(R"({"type":"web_search_call","id":"w"})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"type"}})},
+	    {.body = item(R"({"type":"item_reference","id":"r"})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"type"}})},
+	    {.body = item(R"({"type":"wat"})"), .error = at(Violation::UnknownValue, {P{"input"}, zero, P{"type"}})},
+	    {.body = item(R"({"content":"x"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"type"}})},
+	    {.body = item(R"({"type":"message","content":"x"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"role"}})},
+	    {.body = item(R"({"role":"robot","content":"x"})"), .error = at(Violation::UnknownValue, {P{"input"}, zero, P{"role"}})},
+	    {.body = item(R"({"role":"user"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"content"}})},
+	    {.body = item(R"({"role":"user","content":7})"), .error = at(shape(Expected::Content, Kind::Integer), {P{"input"}, zero, P{"content"}})},
+	    {.body = item(R"({"role":"user","content":"x","tool_call_id":"c"})"), .error = at(Violation::UnknownField, {P{"input"}, zero, P{"tool_call_id"}})},
+	    {.body = item(R"({"role":"user","content":"x","status":"in_progress"})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"status"}})},
+	    {.body = item(R"({"role":"user","content":"x","phase":"final_answer"})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"phase"}})},
+	    {.body = item(R"({"role":"user","content":[{"type":"input_text","text":"a"},{"type":"input_image","image_url":"u"}]})"),
+	     .error = at(Violation::Unsupported, {P{"input"}, zero, P{"content"}, P{std::size_t{1}}, P{"type"}})},
+	    {.body = item(R"({"role":"user","content":[{"type":"input_file","file_id":"f"}]})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"content"}, zero, P{"type"}})},
+	    {.body = item(R"({"role":"assistant","content":[{"type":"refusal","refusal":"no"}]})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"content"}, zero, P{"type"}})},
+	    {.body = item(R"({"role":"user","content":[{"type":"output_text","text":"a"}]})"), .error = at(Violation::UnknownValue, {P{"input"}, zero, P{"content"}, zero, P{"type"}})},
+	    {.body = item(R"({"role":"user","content":[{"type":"sticker"}]})"), .error = at(Violation::UnknownValue, {P{"input"}, zero, P{"content"}, zero, P{"type"}})},
+	    {.body = item(R"({"role":"user","content":[{"text":"a"}]})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"content"}, zero, P{"type"}})},
+	    {.body = item(R"({"role":"user","content":[{"type":"input_text"}]})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"content"}, zero, P{"text"}})},
+	    {.body = item(R"({"role":"user","content":[{"type":"input_text","text":"a","cache_control":{}}]})"),
+	     .error = at(Violation::UnknownField, {P{"input"}, zero, P{"content"}, zero, P{"cache_control"}})},
+	    {.body = item(R"({"role":"user","content":[{"type":"input_text","text":"a","prompt_cache_breakpoint":{"mode":"explicit"}}]})"),
+	     .error = at(Violation::Unsupported, {P{"input"}, zero, P{"content"}, zero, P{"prompt_cache_breakpoint"}})},
+	    {.body = item(R"({"role":"assistant","content":[{"type":"output_text","text":"a","annotations":[{"type":"url_citation"}]}]})"),
+	     .error = at(Violation::Unsupported, {P{"input"}, zero, P{"content"}, zero, P{"annotations"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":"[1]"})"), .error = at(shape(Expected::Object, Kind::Array), {P{"input"}, zero, P{"arguments"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":"{\"a\":"})"), .error = at(parse(json::ParseFault::Truncated), {P{"input"}, zero, P{"arguments"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":"{\"a\":1,\"a\":2}"})"),
+	     .error = at(parse(json::ParseFault::DuplicateKey), {P{"input"}, zero, P{"arguments"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":{}})"), .error = at(shape(Expected::String, Kind::Object), {P{"input"}, zero, P{"arguments"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"arguments"}})},
+	    {.body = item(R"({"type":"function_call","name":"f","arguments":"{}"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"call_id"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":"{}","caller":{"type":"program","caller_id":"p"}})"),
+	     .error = at(Violation::Unsupported, {P{"input"}, zero, P{"caller"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":"{}","namespace":"n"})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"namespace"}})},
+	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":"{}","output":"o"})"), .error = at(Violation::UnknownField, {P{"input"}, zero, P{"output"}})},
+	    {.body = item(R"({"type":"function_call_output","output":"x"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"call_id"}})},
+	    {.body = item(R"({"type":"function_call_output","call_id":"c"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"output"}})},
+	    {.body = item(R"({"type":"function_call_output","call_id":"c","output":[{"type":"input_image","image_url":"u"}]})"),
+	     .error = at(Violation::Unsupported, {P{"input"}, zero, P{"output"}, zero, P{"type"}})},
+	    {.body = item(R"({"type":"custom_tool_call","call_id":"c","name":"t"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"input"}})},
+	    {.body = item(R"({"type":"custom_tool_call","call_id":"c","name":"t","input":"i","status":"completed"})"), .error = at(Violation::UnknownField, {P{"input"}, zero, P{"status"}})},
+	    {.body = item(R"({"type":"custom_tool_call_output","call_id":"c","output":"o","name":"t"})"), .error = at(Violation::UnknownField, {P{"input"}, zero, P{"name"}})},
+	    {.body = item(R"({"type":"reasoning","summary":[{"type":"summary_text","text":"s"}]})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"summary"}})},
+	    {.body = item(R"({"type":"reasoning","encrypted_content":"e"})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"encrypted_content"}})},
+	    {.body = item(R"({"type":"reasoning","content":"x"})"), .error = at(shape(Expected::Array, Kind::String), {P{"input"}, zero, P{"content"}})},
+	    {.body = item(R"({"type":"reasoning","content":[{"type":"input_text","text":"x"}]})"), .error = at(Violation::UnknownValue, {P{"input"}, zero, P{"content"}, zero, P{"type"}})},
+	    {.body = item(R"({"type":"reasoning","role":"assistant"})"), .error = at(Violation::UnknownField, {P{"input"}, zero, P{"role"}})},
+	    {.body = tool(R"({"type":"web_search"})"), .error = at(Violation::Unsupported, {P{"tools"}, zero, P{"type"}})},
+	    {.body = tool(R"({"type":"mcp","server_label":"s"})"), .error = at(Violation::Unsupported, {P{"tools"}, zero, P{"type"}})},
+	    {.body = tool(R"({"type":"magic"})"), .error = at(Violation::UnknownValue, {P{"tools"}, zero, P{"type"}})},
+	    {.body = tool(R"({"name":"f"})"), .error = at(Violation::MissingField, {P{"tools"}, zero, P{"type"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":null})"), .error = at(Violation::MissingField, {P{"tools"}, zero, P{"strict"}})},
+	    {.body = tool(R"({"type":"function","name":"f","strict":true})"), .error = at(Violation::MissingField, {P{"tools"}, zero, P{"parameters"}})},
+	    {.body = tool(R"({"type":"function","parameters":null,"strict":true})"), .error = at(Violation::MissingField, {P{"tools"}, zero, P{"name"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":[],"strict":true})"), .error = at(shape(Expected::Object, Kind::Array), {P{"tools"}, zero, P{"parameters"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":null,"strict":"yes"})"), .error = at(shape(Expected::Boolean, Kind::String), {P{"tools"}, zero, P{"strict"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":null,"strict":true,"defer_loading":true})"), .error = at(Violation::Unsupported, {P{"tools"}, zero, P{"defer_loading"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":null,"strict":true,"allowed_callers":["programmatic"]})"),
+	     .error = at(Violation::Unsupported, {P{"tools"}, zero, P{"allowed_callers"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":null,"strict":true,"output_schema":{}})"), .error = at(Violation::Unsupported, {P{"tools"}, zero, P{"output_schema"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":null,"strict":true,"function":{}})"), .error = at(Violation::UnknownField, {P{"tools"}, zero, P{"function"}})},
+	    {.body = tool(R"({"type":"function","name":"f","parameters":null,"strict":true,"format":null})"), .error = at(Violation::UnknownField, {P{"tools"}, zero, P{"format"}})},
+	    {.body = tool(R"({"type":"custom","name":"c","parameters":{}})"), .error = at(Violation::UnknownField, {P{"tools"}, zero, P{"parameters"}})},
+	    {.body = tool(R"({"type":"custom"})"), .error = at(Violation::MissingField, {P{"tools"}, zero, P{"name"}})},
+	    {.body = tool(R"({"type":"custom","name":"c","format":{"type":"grammar","syntax":"ebnf","definition":"x"}})"),
+	     .error = at(Violation::UnknownValue, {P{"tools"}, zero, P{"format"}, P{"syntax"}})},
+	    {.body = tool(R"({"type":"custom","name":"c","format":{"type":"grammar","syntax":"lark"}})"), .error = at(Violation::MissingField, {P{"tools"}, zero, P{"format"}, P{"definition"}})},
+	    {.body = tool(R"({"type":"custom","name":"c","format":{"type":"grammar","definition":"x"}})"), .error = at(Violation::MissingField, {P{"tools"}, zero, P{"format"}, P{"syntax"}})},
+	    {.body = tool(R"({"type":"custom","name":"c","format":{"type":"text","definition":"x"}})"), .error = at(Violation::UnknownField, {P{"tools"}, zero, P{"format"}, P{"definition"}})},
+	    {.body = tool(R"({"type":"custom","name":"c","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"x"}}})"),
+	     .error = at(Violation::UnknownField, {P{"tools"}, zero, P{"format"}, P{"grammar"}})},
+	    {.body = tool(R"({"type":"custom","name":"c","format":{"type":"cfg"}})"), .error = at(Violation::UnknownValue, {P{"tools"}, zero, P{"format"}, P{"type"}})},
+	    {.body = with(R"("tool_choice":"maybe")"), .error = at(Violation::UnknownValue, {P{"tool_choice"}})},
+	    {.body = with(R"("tool_choice":3)"), .error = at(shape(Expected::ToolChoice, Kind::Integer), {P{"tool_choice"}})},
+	    {.body = with(R"("tool_choice":{"type":"allowed_tools","mode":"auto","tools":[]})"), .error = at(Violation::Unsupported, {P{"tool_choice"}, P{"type"}})},
+	    {.body = with(R"("tool_choice":{"type":"web_search_preview"})"), .error = at(Violation::Unsupported, {P{"tool_choice"}, P{"type"}})},
+	    {.body = with(R"("tool_choice":{"type":"function"})"), .error = at(Violation::MissingField, {P{"tool_choice"}, P{"name"}})},
+	    {.body = with(R"("tool_choice":{"type":"function","function":{"name":"f"}})"), .error = at(Violation::UnknownField, {P{"tool_choice"}, P{"function"}})},
+	    {.body = with(R"("text":{"format":{"type":"xml"}})"), .error = at(Violation::UnknownValue, {P{"text"}, P{"format"}, P{"type"}})},
+	    {.body = with(R"("text":{"format":{"type":"json_schema","name":"n"}})"), .error = at(Violation::MissingField, {P{"text"}, P{"format"}, P{"schema"}})},
+	    {.body = with(R"("text":{"format":{"type":"json_schema","schema":{}}})"), .error = at(Violation::MissingField, {P{"text"}, P{"format"}, P{"name"}})},
+	    {.body = with(R"("text":{"format":{"type":"json_schema","name":"n","schema":[]}})"),
+	     .error = at(shape(Expected::Object, Kind::Array), {P{"text"}, P{"format"}, P{"schema"}})},
+	    {.body = with(R"("text":{"format":{"type":"json_object","name":"n"}})"), .error = at(Violation::UnknownField, {P{"text"}, P{"format"}, P{"name"}})},
+	    {.body = with(R"("text":{"verbosity":"high"})"), .error = at(Violation::Unsupported, {P{"text"}, P{"verbosity"}})},
+	    {.body = with(R"("text":{"style":"terse"})"), .error = at(Violation::UnknownField, {P{"text"}, P{"style"}})},
+	    {.body = with(R"("response_format":{"type":"text"})"), .error = at(Violation::UnknownField, {P{"response_format"}})},
 	};
 	auto decoder = make_decoder();
 	return std::ranges::all_of(refusals, [&decoder](Refusal const& refusal) {
@@ -634,69 +796,15 @@ struct Refusal {
 	});
 }
 
-/** The shapes harnesses resend that the endpoint must take: null content, null tool calls, echoed nulls. */
-[[nodiscard]] auto harness_resends_accepted() -> bool {
+/** The defaults an absent member takes: auto tool choice, free text, `xhigh` thinking, stored, whole. */
+[[nodiscard]] auto absent_members_take_the_defaults() -> bool {
 	auto decoder = make_decoder();
-	auto const decoded = decoder->decode_copy(R"({
-		"model": "qwen3.8",
-		"messages": [
-			{"role": "user", "content": "list files"},
-			{"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{\"path\": \".\", \"depth\": 2}"}}], "refusal": null, "annotations": []},
-			{"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
-			{"role": "assistant", "content": null, "reasoning_content": "done", "tool_calls": null, "function_call": null, "audio": null}
-		],
-		"stream": true, "stream_options": {"include_usage": true},
-		"temperature": 0, "max_tokens": 4096, "n": 1, "presence_penalty": 0, "frequency_penalty": 0.0,
-		"chat_template_kwargs": {"enable_thinking": false}
-	})");
-	if (!decoded) {
-		std::println("{}", json::describe(decoded.error()));
-		return false;
-	}
-	auto const& messages = decoded->messages;
-	auto const& call = std::get<json::AssistantMessage>(messages[1]);
-	return messages.size() == 4 && call.content.empty() && call.tool_calls.size() == 1 && call.tool_calls[0].arguments.size() == 2 &&
-	       std::get<std::string>(call.tool_calls[0].arguments[0].value) == "." && std::get<json::JsonText>(call.tool_calls[0].arguments[1].value).text() == "2" &&
-	       std::get<json::AssistantMessage>(messages[3]).reasoning_content == "done" && decoded->delivery == json::Delivery::StreamWithUsage &&
-	       decoded->temperature == 0.0 && decoded->max_tokens == 4096 && decoded->template_options.thinking == json::Thinking::Disabled;
-}
-
-/**
- * The chat template's defaults, decided once: a turn thinks unless `enable_thinking` is false, a thinking turn's
- * effort is `xhigh` unless named, and past turns keep their reasoning unless `preserve_thinking` is false; an absent
- * or `null` option is the default.
- */
-[[nodiscard]] auto template_defaults_resolve() -> bool {
-	auto decoder = make_decoder();
-	auto constexpr flags = std::array<std::string_view, 4>{"", "null", "true", "false"};
-	auto constexpr efforts = std::array<std::string_view, 5>{"", "null", "\"low\"", "\"medium\"", "\"xhigh\""};
-	for (auto const enable : flags) {
-		for (auto const preserve : flags) {
-			for (auto const effort : efforts) {
-				auto kwargs = std::string{};
-				auto const add = [&kwargs](std::string_view name, std::string_view value) {
-					if (!value.empty()) {
-						kwargs += std::format("{}\"{}\":{}", kwargs.empty() ? "" : ",", name, value);
-					}
-				};
-				add("enable_thinking", enable);
-				add("preserve_thinking", preserve);
-				add("reasoning_effort", effort);
-				auto const decoded = decoder->decode_copy(std::format(R"({{"messages":[],"chat_template_kwargs":{{{}}}}})", kwargs));
-				if (!decoded) {
-					return false;
-				}
-				auto const& options = decoded->template_options;
-				auto const expected_effort = effort == "\"low\"" ? json::ReasoningEffort::Low : effort == "\"medium\"" ? json::ReasoningEffort::Medium : json::ReasoningEffort::XHigh;
-				if (json::thinking(options) != (enable == "false" ? json::Thinking::Disabled : json::Thinking::Enabled) ||
-				    json::past_thinking(options) != (preserve == "false" ? json::PastThinking::Dropped : json::PastThinking::Preserved) ||
-				    json::reasoning_effort(options) != expected_effort) {
-					return false;
-				}
-			}
-		}
-	}
-	return true;
+	auto const decoded = decoder->decode_copy(R"({"input":"hello"})");
+	return decoded && decoded->input == std::vector<json::InputItem>{json::MessageItem{.role = json::Role::User, .text = "hello"}} &&
+	       decoded->tool_choice == json::ToolChoice{json::ToolChoiceMode::Auto} && decoded->format == json::TextFormat{json::TextFormatMode::Text} &&
+	       decoded->effort == json::Effort::XHigh && decoded->storage == json::Storage::Stored && decoded->delivery == json::Delivery::Whole &&
+	       !decoded->model && !decoded->instructions && decoded->tools.empty() && decoded->metadata.empty() && !decoded->max_output_tokens &&
+	       !decoded->temperature && !decoded->top_p && !decoded->previous_response_id;
 }
 
 /** Mutated requests never crash the decoder (the sanitizers are the oracle): each decodes or is refused. */
@@ -708,12 +816,12 @@ struct Refusal {
 	for (auto index = std::size_t{0}; index < count; ++index) {
 		auto body = encode(random_request(rng, *scratch), rng);
 		for (auto edits = 1 + rng() % 3; edits > 0 && !body.empty(); --edits) {
-			auto const at = rng() % body.size();
+			auto const position = rng() % body.size();
 			auto constexpr bytes = std::string_view{"{}[],:\"\\0tfn \x80"};
 			if (coin(rng)) {
-				body[at] = bytes[rng() % bytes.size()];
+				body[position] = bytes[rng() % bytes.size()];
 			} else {
-				body.erase(at, 1);
+				body.erase(position, 1);
 			}
 		}
 		refused += decoder->decode_copy(body).has_value() ? 0 : 1;
@@ -728,8 +836,7 @@ auto main() -> int {
 	    engine::testing::Case{.name = "generated requests in any order and spelling decode to themselves (seed 1)", .holds = requests_round_trip(1, 3000)},
 	    engine::testing::Case{.name = "generated requests in any order and spelling decode to themselves (seed 2)", .holds = requests_round_trip(2, 3000)},
 	    engine::testing::Case{.name = "each refusal names its fault and the member at fault", .holds = refusals_name_the_member()},
-	    engine::testing::Case{.name = "harness resends of tool-call and reasoning-only turns decode", .holds = harness_resends_accepted()},
-	    engine::testing::Case{.name = "the chat template's thinking, effort and past-reasoning defaults resolve once", .holds = template_defaults_resolve()},
+	    engine::testing::Case{.name = "absent members take the sdk's defaults", .holds = absent_members_take_the_defaults()},
 	    engine::testing::Case{.name = "mutated requests decode or are refused, never crash (seed 3)", .holds = mutated_requests_handled(3, 5000)},
 	};
 	return engine::testing::report(cases);

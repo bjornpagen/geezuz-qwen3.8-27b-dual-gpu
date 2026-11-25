@@ -9,61 +9,63 @@ import :text;
 import :value;
 import :containers;
 import :reader;
+import :decode_error;
 import :request;
 import :decode_support;
 import :decode_neutral;
-import :decode_messages;
 import :decode_format;
 import :decode_tools;
+import :decode_input;
 
 namespace engine::json {
 
-[[nodiscard]] auto stop(Body& value) -> Decoded<std::vector<std::string>> {
-	auto const kind = kind_of(value);
-	if (!kind) {
-		return std::unexpected(kind.error());
+/** `reasoning.effort`: the template's four settings; the sdk's other efforts are refused by name. */
+[[nodiscard]] auto effort(Body& value) -> Decoded<Effort> {
+	auto const read = text(value);
+	if (!read) {
+		return std::unexpected(read.error());
 	}
-	switch (*kind) {
-	case Kind::Null:
-		return lift(value.as_null()).transform([] { return std::vector<std::string>{}; });
-	case Kind::String:
-		return text(value).transform([](std::string read) { return std::vector<std::string>{std::move(read)}; });
-	case Kind::Array: {
-		auto sequences = std::vector<std::string>{};
-		auto const visited = each_element(value, [&sequences](std::size_t index, Body& element) -> Decoded<void> {
-			if (index == max_stop_sequences) {
-				return refuse(TooMany{.limit = max_stop_sequences});
-			}
-			return text(element).transform([&sequences](std::string read) { sequences.push_back(std::move(read)); });
-		});
-		if (!visited) {
-			// Too many is a fault of the whole list, not of its last element.
-			auto error = visited.error();
-			if (std::holds_alternative<TooMany>(error.fault)) {
-				error.path.clear();
-			}
-			return std::unexpected(std::move(error));
-		}
-		return sequences;
+	if (*read == "none") {
+		return Effort::None;
 	}
-	case Kind::Boolean:
-	case Kind::Integer:
-	case Kind::Real:
-	case Kind::Object:
-		return refuse(WrongShape{.expected = Expected::Stop, .found = *kind});
+	if (*read == "low") {
+		return Effort::Low;
 	}
-	std::unreachable();
+	if (*read == "medium") {
+		return Effort::Medium;
+	}
+	if (*read == "xhigh") {
+		return Effort::XHigh;
+	}
+	if (*read == "minimal" || *read == "high" || *read == "max") {
+		return refuse(Violation::Unsupported);
+	}
+	return refuse(Violation::UnknownValue);
 }
 
-/** `stream_options.include_usage`, read from a present `stream_options`. */
-[[nodiscard]] auto include_usage(Body& value) -> Decoded<bool> {
-	auto include = std::optional<bool>{};
-	auto const visited = each_member(value, [&include](std::string_view name, Body& member) -> Decoded<void> {
-		if (name == "include_usage") {
-			return nullable<bool>(member, [](Body& flag) { return lift(flag.as_boolean()); }).transform([&include](std::optional<bool> read) {
-				include.emplace(read.value_or(false));
+/** `reasoning`: its effort, and members the engine accepts only at their neutral value. */
+[[nodiscard]] auto reasoning(Body& value) -> Decoded<std::optional<Effort>> {
+	auto read = std::optional<Effort>{};
+	auto const visited = each_member(value, [&read](std::string_view name, Body& member) -> Decoded<void> {
+		if (name == "effort") {
+			return nullable<Effort>(member, [](Body& inner) { return effort(inner); }).transform([&read](std::optional<Effort> decoded) {
+				read = decoded;
 			});
 		}
+		if (auto const wanted = tolerated(reasoning_tolerated, name)) {
+			return neutral(member, *wanted);
+		}
+		return refuse(Violation::UnknownField);
+	});
+	if (!visited) {
+		return std::unexpected(visited.error());
+	}
+	return read;
+}
+
+/** `stream_options`: only obfuscation, which this server never writes. */
+[[nodiscard]] auto stream_options(Body& value) -> Decoded<bool> {
+	auto const visited = each_member(value, [](std::string_view name, Body& member) -> Decoded<void> {
 		if (name == "include_obfuscation") {
 			return neutral(member, Neutral::False);
 		}
@@ -72,48 +74,38 @@ namespace engine::json {
 	if (!visited) {
 		return std::unexpected(visited.error());
 	}
-	return include.value_or(false);
+	return true;
 }
 
-[[nodiscard]] auto template_options(Body& value) -> Decoded<TemplateOptions> {
-	auto options = TemplateOptions{};
-	auto const visited = each_member(value, [&options](std::string_view name, Body& member) -> Decoded<void> {
-		auto const flag = [&member] { return nullable<bool>(member, [](Body& inner) { return lift(inner.as_boolean()); }); };
-		if (name == "enable_thinking") {
-			return flag().transform([&options](std::optional<bool> read) {
-				options.thinking = read.transform([](bool on) { return on ? Thinking::Enabled : Thinking::Disabled; });
-			});
+/** `metadata`: string pairs within the sdk's bounds. */
+[[nodiscard]] auto metadata(Body& value) -> Decoded<std::vector<MetadataPair>> {
+	auto pairs = std::vector<MetadataPair>{};
+	auto const visited = each_member(value, [&pairs](std::string_view key, Body& member) -> Decoded<void> {
+		if (pairs.size() == max_metadata_pairs) {
+			return refuse(TooMany{.limit = max_metadata_pairs});
 		}
-		if (name == "preserve_thinking") {
-			return flag().transform([&options](std::optional<bool> read) {
-				options.past_thinking = read.transform([](bool on) { return on ? PastThinking::Preserved : PastThinking::Dropped; });
-			});
+		if (key.size() > max_metadata_key_bytes) {
+			return refuse(TooLong{.limit = max_metadata_key_bytes});
 		}
-		if (name == "reasoning_effort") {
-			auto const effort = nullable<std::string>(member, [](Body& inner) { return text(inner); });
-			if (!effort) {
-				return std::unexpected(effort.error());
-			}
-			if (!*effort) {
-				return {};
-			}
-			if (**effort == "low") {
-				options.reasoning_effort = ReasoningEffort::Low;
-			} else if (**effort == "medium") {
-				options.reasoning_effort = ReasoningEffort::Medium;
-			} else if (**effort == "xhigh") {
-				options.reasoning_effort = ReasoningEffort::XHigh;
-			} else {
-				return refuse(Violation::UnknownValue);
-			}
-			return {};
+		auto read = text(member);
+		if (!read) {
+			return std::unexpected(read.error());
 		}
-		return refuse(Violation::UnknownField);
+		if (read->size() > max_metadata_value_bytes) {
+			return refuse(TooLong{.limit = max_metadata_value_bytes});
+		}
+		pairs.push_back(MetadataPair{.key = std::string{key}, .value = *std::move(read)});
+		return {};
 	});
 	if (!visited) {
-		return std::unexpected(visited.error());
+		auto error = visited.error();
+		// Too many is a fault of the whole object, not of its last member.
+		if (std::holds_alternative<TooMany>(error.fault)) {
+			error.path.clear();
+		}
+		return std::unexpected(std::move(error));
 	}
-	return options;
+	return pairs;
 }
 
 /** An optional member read with `read`; `null` leaves it absent. */
@@ -122,63 +114,66 @@ template<class T, class F>
 	return nullable<T>(value, read).transform([&slot](std::optional<T> decoded) { slot = std::move(decoded); });
 }
 
-[[nodiscard]] auto request(Body& root, Fragments& fragments) -> Decoded<ChatRequest> {
-	auto decoded = ChatRequest{
+[[nodiscard]] auto create(Body& root, Fragments& fragments) -> Decoded<CreateRequest> {
+	auto decoded = CreateRequest{
 	    .model = std::nullopt,
-	    .messages = {},
+	    .input = {},
+	    .instructions = std::nullopt,
 	    .tools = {},
-	    .tool_choice = std::nullopt,
-	    .delivery = Delivery::Whole,
-	    .max_tokens = std::nullopt,
+	    .tool_choice = ToolChoiceMode::Auto,
+	    .format = TextFormatMode::Text,
+	    .effort = Effort::XHigh,
+	    .max_output_tokens = std::nullopt,
 	    .temperature = std::nullopt,
 	    .top_p = std::nullopt,
-	    .top_k = std::nullopt,
-	    .min_p = std::nullopt,
-	    .seed = std::nullopt,
-	    .stop = {},
-	    .template_options = {},
-	    .response_format = ResponseFormatMode::Text,
+	    .delivery = Delivery::Whole,
+	    .storage = Storage::Stored,
+	    .previous_response_id = std::nullopt,
+	    .metadata = {},
 	};
-	auto messages = std::optional<std::vector<Message>>{};
+	auto input_items = std::optional<std::vector<InputItem>>{};
 	auto stream = std::optional<bool>{};
-	auto stream_usage = std::optional<bool>{};
-	auto max_tokens = std::optional<std::int64_t>{};
-	auto max_completion_tokens = std::optional<std::int64_t>{};
+	auto options = std::optional<bool>{};
+	auto store = std::optional<bool>{};
+	auto choice = std::optional<ToolChoice>{};
+	auto format = std::optional<TextFormat>{};
+	auto chosen_effort = std::optional<Effort>{};
+	auto pairs = std::optional<std::vector<MetadataPair>>{};
 	auto const integer = [](Body& value) { return lift(value.as_integer()); };
-	auto const real = [](Body& value) { return number(value); };
+	auto const real = [](Body& value) { return lift(value.as_real()); };
+	auto const boolean = [](Body& value) { return lift(value.as_boolean()); };
+	auto const string = [](Body& value) { return text(value); };
 	auto const visited = each_member(root, [&](std::string_view name, Body& member) -> Decoded<void> {
-		if (name == "messages") {
-			auto& list = messages.emplace();
-			return each_element(member, [&](std::size_t, Body& element) -> Decoded<void> {
-				return message(element, fragments).transform([&list](Message read) { list.push_back(std::move(read)); });
-			});
+		if (name == "input") {
+			return input(member, fragments).transform([&input_items](std::vector<InputItem> read) { input_items = std::move(read); });
+		}
+		if (name == "model") {
+			return text(member).transform([&decoded](std::string&& read) { decoded.model = std::move(read); });
+		}
+		if (name == "instructions") {
+			return assign(decoded.instructions, member, string);
 		}
 		if (name == "tools") {
 			return nullable<bool>(member, [&](Body& list) -> Decoded<bool> {
 				       return each_element(list, [&](std::size_t, Body& element) -> Decoded<void> {
-					              return tool(element, fragments).transform([&decoded](Tool read) { decoded.tools.push_back(std::move(read)); });
+					              return tool(element).transform([&decoded](Tool read) { decoded.tools.push_back(std::move(read)); });
 				              })
 				           .transform([] { return true; });
 			       })
 			    .transform([](std::optional<bool>) {});
 		}
-		if (name == "model") {
-			return assign(decoded.model, member, [](Body& value) { return text(value); });
-		}
 		if (name == "tool_choice") {
-			return assign(decoded.tool_choice, member, [](Body& value) { return tool_choice(value); });
+			return assign(choice, member, [](Body& value) { return tool_choice(value); });
 		}
-		if (name == "stream") {
-			return assign(stream, member, [](Body& value) { return lift(value.as_boolean()); });
+		if (name == "text") {
+			return assign(format, member, [](Body& value) { return text_config(value); });
 		}
-		if (name == "stream_options") {
-			return assign(stream_usage, member, [](Body& value) { return include_usage(value); });
+		if (name == "reasoning") {
+			return nullable<std::optional<Effort>>(member, [](Body& value) { return reasoning(value); })
+			    .transform([&chosen_effort](std::optional<std::optional<Effort>> read) { chosen_effort = read.value_or(std::nullopt); });
 		}
-		if (name == "max_tokens") {
-			return assign(max_tokens, member, integer);
-		}
-		if (name == "max_completion_tokens") {
-			return assign(max_completion_tokens, member, integer);
+		if (name == "max_output_tokens") {
+			return assign(decoded.max_output_tokens, member, integer);
 		}
 		if (name == "temperature") {
 			return assign(decoded.temperature, member, real);
@@ -186,65 +181,58 @@ template<class T, class F>
 		if (name == "top_p") {
 			return assign(decoded.top_p, member, real);
 		}
-		if (name == "top_k") {
-			return assign(decoded.top_k, member, integer);
+		if (name == "stream") {
+			return assign(stream, member, boolean);
 		}
-		if (name == "min_p") {
-			return assign(decoded.min_p, member, real);
+		if (name == "stream_options") {
+			return assign(options, member, [](Body& value) { return stream_options(value); });
 		}
-		if (name == "seed") {
-			return assign(decoded.seed, member, integer);
+		if (name == "store") {
+			return assign(store, member, boolean);
 		}
-		if (name == "stop") {
-			return stop(member).transform([&decoded](std::vector<std::string> read) { decoded.stop = std::move(read); });
+		if (name == "previous_response_id") {
+			return assign(decoded.previous_response_id, member, string);
 		}
-		if (name == "response_format") {
-			return nullable<ResponseFormat>(member, [](Body& value) { return response_format(value); }).transform([&decoded](std::optional<ResponseFormat> read) {
-				decoded.response_format = std::move(read).value_or(ResponseFormat{ResponseFormatMode::Text});
-			});
+		if (name == "metadata") {
+			return assign(pairs, member, [](Body& value) { return metadata(value); });
 		}
-		if (name == "chat_template_kwargs") {
-			return nullable<TemplateOptions>(member, [](Body& value) { return template_options(value); }).transform([&decoded](std::optional<TemplateOptions> read) {
-				decoded.template_options = read.value_or(TemplateOptions{});
-			});
-		}
-		if (auto const neutral_value = tolerated(request_tolerated, name)) {
-			return neutral(member, *neutral_value);
+		if (auto const wanted = tolerated(create_tolerated, name)) {
+			return neutral(member, *wanted);
 		}
 		return refuse(Violation::UnknownField);
 	});
 	if (!visited) {
 		return std::unexpected(visited.error());
 	}
-	if (!messages) {
-		return refuse_at("messages", Violation::MissingField);
+	if (!input_items) {
+		return refuse_at("input", Violation::MissingField);
 	}
-	decoded.messages = std::move(*messages);
-	if (max_tokens && max_completion_tokens) {
-		return refuse_at("max_completion_tokens", Conflict{.other = "max_tokens"});
-	}
-	decoded.max_tokens = max_completion_tokens ? max_completion_tokens : max_tokens;
+	decoded.input = std::move(*input_items);
+	decoded.tool_choice = std::move(choice).value_or(ToolChoice{ToolChoiceMode::Auto});
+	decoded.format = std::move(format).value_or(TextFormat{TextFormatMode::Text});
+	decoded.effort = chosen_effort.value_or(Effort::XHigh);
+	decoded.storage = store.value_or(true) ? Storage::Stored : Storage::Unstored;
+	decoded.metadata = std::move(pairs).value_or(std::vector<MetadataPair>{});
 	if (!stream.value_or(false)) {
-		if (stream_usage) {
+		if (options) {
 			return refuse_at("stream_options", Conflict{.other = "stream"});
 		}
 		decoded.delivery = Delivery::Whole;
 	} else {
-		decoded.delivery = stream_usage.value_or(false) ? Delivery::StreamWithUsage : Delivery::Stream;
+		decoded.delivery = Delivery::Stream;
 	}
 	return decoded;
 }
 
 /**
- * Decodes OpenAI chat requests into `ChatRequest`, one at a time, refusing every request it cannot serve exactly
- * with the member at fault. It owns its two readers (the body's, and one for JSON a request holds in a string), each
- * allocated once; decoding reads every part of the request, so nothing it accepts goes unchecked.
+ * Decodes Responses create requests into `CreateRequest`, one at a time, refusing every request it cannot serve
+ * exactly with the member at fault. It owns its two readers (the body's, and one for the JSON a function call's
+ * arguments hold in a string), each allocated once; decoding reads every part of the request, so nothing it accepts
+ * goes unchecked.
  *
- * Unknown members are refused by name, at every level. OpenAI's own endpoint refuses unrecognized arguments, so no
- * OpenAI client depends on extras being ignored; and an ignored sampling or output parameter would serve the request
- * differently from what it asked for. Parameters OpenAI defines that the engine does not implement are accepted
- * only with their neutral value (`n: 1`, `presence_penalty: 0`, `logprobs: false`, ...), which clients commonly send
- * as defaults; account identifiers (`user`, `prompt_cache_key`) are accepted and dropped.
+ * Unknown members are refused by name, at every level: the sdk's own types are the reference, and an ignored member
+ * would serve the request differently from what it asked for. Members the sdk defines that the engine does not
+ * implement are accepted only at their neutral value; deprecated ones are refused as deprecated.
  */
 export class RequestDecoder {
 public:
@@ -261,28 +249,28 @@ public:
 	}
 
 	/** Decodes a body whose storage extends `padding` bytes past its end, in place. */
-	[[nodiscard]] auto decode(PaddedView text) -> core::Result<ChatRequest, DecodeError> {
+	[[nodiscard]] auto decode(PaddedView text) -> core::Result<CreateRequest, DecodeError> {
 		auto root = lift(body_->read(text));
 		if (!root) {
 			return std::unexpected(root.error());
 		}
-		return finish(request(*root, *fragments_));
+		return finish(create(*root, *fragments_));
 	}
 
 	/** Copies a body into the decoder's padded buffer, then decodes it. */
-	[[nodiscard]] auto decode_copy(std::string_view text) -> core::Result<ChatRequest, DecodeError> {
+	[[nodiscard]] auto decode_copy(std::string_view text) -> core::Result<CreateRequest, DecodeError> {
 		auto root = lift(body_->read_copy(text));
 		if (!root) {
 			return std::unexpected(root.error());
 		}
-		return finish(request(*root, *fragments_));
+		return finish(create(*root, *fragments_));
 	}
 
 private:
 	RequestDecoder(std::unique_ptr<Reader<request_bounds>> body, std::unique_ptr<Fragments> fragments)
 	    : body_{std::move(body)}, fragments_{std::move(fragments)} {}
 
-	[[nodiscard]] auto finish(Decoded<ChatRequest> decoded) -> core::Result<ChatRequest, DecodeError> {
+	[[nodiscard]] auto finish(Decoded<CreateRequest> decoded) -> core::Result<CreateRequest, DecodeError> {
 		if (!decoded) {
 			auto error = decoded.error();
 			std::ranges::reverse(error.path);

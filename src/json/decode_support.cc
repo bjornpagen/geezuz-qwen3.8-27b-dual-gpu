@@ -9,13 +9,13 @@ import :text;
 import :value;
 import :containers;
 import :reader;
-import :request;
+import :decode_error;
 
 namespace engine::json {
 
 /**
- * The bounds of a JSON text a request carries inside itself: a tool call's arguments sent as a string, and a tool
- * definition read again on its own. The first is a string of the request, so no such text is longer than one.
+ * The bounds of a JSON text a request carries inside itself: a function call's arguments, sent as a string. It is a
+ * string of the request, so no such text is longer than one.
  */
 export inline constexpr Bounds fragment_bounds{
     .document_bytes = request_bounds.string_bytes,
@@ -32,11 +32,6 @@ using Fragments = Reader<fragment_bounds>;
 
 template<class T>
 using Decoded = core::Result<T, DecodeError>;
-
-/** A `function` member that was present, and the name it gave, if any. */
-struct Named {
-	std::optional<std::string> name;
-};
 
 [[nodiscard]] auto refuse(DecodeFault fault) -> std::unexpected<DecodeError> {
 	return std::unexpected(DecodeError{.fault = std::move(fault), .path = {}});

@@ -9,64 +9,15 @@ import :text;
 import :value;
 import :containers;
 import :reader;
+import :decode_error;
 import :request;
 import :decode_support;
 import :decode_neutral;
 
 namespace engine::json {
 
-using Fragment = Value<fragment_bounds>;
-
-/** A grammar's members as read, before the format's type says which of them belong. */
-struct GrammarDraft {
-	std::optional<std::string> syntax;
-	std::optional<std::string> definition;
-};
-
-[[nodiscard]] auto grammar_fields(Fragment& value) -> Decoded<GrammarDraft> {
-	auto draft = GrammarDraft{};
-	auto const visited = each_member(value, [&draft](std::string_view name, Fragment& member) -> Decoded<void> {
-		if (name == "syntax") {
-			return text(member).transform([&draft](std::string read) { draft.syntax = std::move(read); });
-		}
-		if (name == "definition") {
-			return text(member).transform([&draft](std::string read) { draft.definition = std::move(read); });
-		}
-		return refuse(Violation::UnknownField);
-	});
-	if (!visited) {
-		return std::unexpected(visited.error());
-	}
-	return draft;
-}
-
-/** A grammar from its members; `within` is where they sit, innermost first. */
-[[nodiscard]] auto grammar(GrammarDraft draft, std::vector<PathStep> const& within) -> Decoded<Grammar> {
-	auto const at = [&within](std::string_view name, DecodeFault fault) {
-		auto path = std::vector<PathStep>{std::string{name}};
-		path.insert(path.end(), within.begin(), within.end());
-		return std::unexpected(DecodeError{.fault = std::move(fault), .path = std::move(path)});
-	};
-	if (!draft.syntax) {
-		return at("syntax", Violation::MissingField);
-	}
-	if (!draft.definition) {
-		return at("definition", Violation::MissingField);
-	}
-	if (*draft.syntax == "lark") {
-		return Grammar{.syntax = GrammarSyntax::Lark, .definition = std::move(*draft.definition)};
-	}
-	if (*draft.syntax == "regex") {
-		return Grammar{.syntax = GrammarSyntax::Regex, .definition = std::move(*draft.definition)};
-	}
-	return at("syntax", Violation::UnknownValue);
-}
-
-/**
- * A custom tool's `format`: free text, or a grammar. The grammar's syntax and definition are taken nested under
- * `grammar`, as Chat Completions documents it, or beside `type`, as the Responses API spells it.
- */
-[[nodiscard]] auto custom_format(Fragment& value) -> Decoded<std::optional<Grammar>> {
+/** A custom tool's `format`: `{"type": "text"}`, or `{"type": "grammar", "syntax", "definition"}`; `null` is text. */
+[[nodiscard]] auto custom_format(Body& value) -> Decoded<std::optional<Grammar>> {
 	auto const kind = kind_of(value);
 	if (!kind) {
 		return std::unexpected(kind.error());
@@ -75,22 +26,19 @@ struct GrammarDraft {
 		return lift(value.as_null()).transform([] { return std::optional<Grammar>{}; });
 	}
 	auto type = std::optional<std::string>{};
-	auto nested = std::optional<GrammarDraft>{};
-	auto flat = GrammarDraft{};
+	auto syntax = std::optional<std::string>{};
+	auto definition = std::optional<std::string>{};
 	auto seen = std::vector<std::string>{};
-	auto const visited = each_member(value, [&](std::string_view name, Fragment& member) -> Decoded<void> {
+	auto const visited = each_member(value, [&](std::string_view name, Body& member) -> Decoded<void> {
 		seen.emplace_back(name);
 		if (name == "type") {
 			return text(member).transform([&type](std::string read) { type = std::move(read); });
 		}
-		if (name == "grammar") {
-			return grammar_fields(member).transform([&nested](GrammarDraft read) { nested = std::move(read); });
-		}
 		if (name == "syntax") {
-			return text(member).transform([&flat](std::string read) { flat.syntax = std::move(read); });
+			return text(member).transform([&syntax](std::string read) { syntax = std::move(read); });
 		}
 		if (name == "definition") {
-			return text(member).transform([&flat](std::string read) { flat.definition = std::move(read); });
+			return text(member).transform([&definition](std::string read) { definition = std::move(read); });
 		}
 		// Which members belong depends on the type, which may come later: decided after the loop.
 		return {};
@@ -101,68 +49,58 @@ struct GrammarDraft {
 	if (!type) {
 		return refuse_at("type", Violation::MissingField);
 	}
-	auto constexpr text_fields = std::to_array<std::string_view>({"type"});
-	auto constexpr nested_fields = std::to_array<std::string_view>({"type", "grammar"});
-	auto constexpr flat_fields = std::to_array<std::string_view>({"type", "syntax", "definition"});
-	auto const allowed = *type == "text" ? std::span<std::string_view const>{text_fields}
-	                     : *type != "grammar" ? std::span<std::string_view const>{}
-	                     : nested ? std::span<std::string_view const>{nested_fields}
-	                              : std::span<std::string_view const>{flat_fields};
 	if (*type != "text" && *type != "grammar") {
 		return refuse_at("type", Violation::UnknownValue);
 	}
+	auto const grammar = *type == "grammar";
 	for (auto const& name : seen) {
-		if (std::ranges::find(allowed, name) == allowed.end()) {
+		if (name != "type" && !(grammar && (name == "syntax" || name == "definition"))) {
 			return refuse_at(name, Violation::UnknownField);
 		}
 	}
-	if (*type == "text") {
+	if (!grammar) {
 		return std::optional<Grammar>{};
 	}
-	auto const read = nested ? grammar(std::move(*nested), {"grammar"}) : grammar(std::move(flat), {});
-	return read.transform([](Grammar decoded) { return std::optional<Grammar>{std::move(decoded)}; });
+	if (!syntax) {
+		return refuse_at("syntax", Violation::MissingField);
+	}
+	if (!definition) {
+		return refuse_at("definition", Violation::MissingField);
+	}
+	if (*syntax == "lark") {
+		return Grammar{.syntax = GrammarSyntax::Lark, .definition = std::move(*definition)};
+	}
+	if (*syntax == "regex") {
+		return Grammar{.syntax = GrammarSyntax::Regex, .definition = std::move(*definition)};
+	}
+	return refuse_at("syntax", Violation::UnknownValue);
 }
 
-/** A `json_schema` response format's members, read before the format's type says whether they belong. */
-[[nodiscard]] auto json_schema(Body& value) -> Decoded<JsonSchemaFormat> {
+/** `text.format`: free text, any JSON object, or JSON matching a schema. */
+[[nodiscard]] auto text_format(Body& value) -> Decoded<TextFormat> {
+	auto type = std::optional<std::string>{};
 	auto name = std::optional<std::string>{};
+	auto description = std::optional<std::string>{};
 	auto schema = std::optional<JsonText>{};
+	auto seen = std::vector<std::string>{};
 	auto const visited = each_member(value, [&](std::string_view field, Body& member) -> Decoded<void> {
+		seen.emplace_back(field);
+		if (field == "type") {
+			return text(member).transform([&type](std::string read) { type = std::move(read); });
+		}
 		if (field == "name") {
 			return text(member).transform([&name](std::string read) { name = std::move(read); });
 		}
 		if (field == "description") {
-			return nullable<std::string>(member, [](Body& description) { return text(description); }).transform([](auto const&) {});
+			return nullable<std::string>(member, [](Body& inner) { return text(inner); }).transform([&description](std::optional<std::string> read) {
+				description = std::move(read);
+			});
 		}
 		if (field == "schema") {
 			return schema_of(member).transform([&schema](std::optional<JsonText> read) { schema = std::move(read); });
 		}
 		if (field == "strict") {
 			return any_boolean(member);
-		}
-		return refuse(Violation::UnknownField);
-	});
-	if (!visited) {
-		return std::unexpected(visited.error());
-	}
-	if (!name) {
-		return refuse_at("name", Violation::MissingField);
-	}
-	return JsonSchemaFormat{.name = std::move(*name), .schema = std::move(schema)};
-}
-
-/** `response_format`: what the content region must be. */
-[[nodiscard]] auto response_format(Body& value) -> Decoded<ResponseFormat> {
-	auto type = std::optional<std::string>{};
-	auto schema = std::optional<JsonSchemaFormat>{};
-	auto seen = std::vector<std::string>{};
-	auto const visited = each_member(value, [&](std::string_view name, Body& member) -> Decoded<void> {
-		seen.emplace_back(name);
-		if (name == "type") {
-			return text(member).transform([&type](std::string read) { type = std::move(read); });
-		}
-		if (name == "json_schema") {
-			return json_schema(member).transform([&schema](JsonSchemaFormat read) { schema = std::move(read); });
 		}
 		// Which members belong depends on the type, which may come later: decided after the loop.
 		return {};
@@ -177,21 +115,44 @@ struct GrammarDraft {
 		return refuse_at("type", Violation::UnknownValue);
 	}
 	auto const takes_schema = *type == "json_schema";
-	for (auto const& name : seen) {
-		if (name != "type" && !(takes_schema && name == "json_schema")) {
-			return refuse_at(name, Violation::UnknownField);
+	for (auto const& field : seen) {
+		if (field != "type" && !takes_schema) {
+			return refuse_at(field, Violation::UnknownField);
 		}
 	}
 	if (*type == "text") {
-		return ResponseFormatMode::Text;
+		return TextFormatMode::Text;
 	}
 	if (*type == "json_object") {
-		return ResponseFormatMode::JsonObject;
+		return TextFormatMode::JsonObject;
+	}
+	if (!name) {
+		return refuse_at("name", Violation::MissingField);
 	}
 	if (!schema) {
-		return refuse_at("json_schema", Violation::MissingField);
+		return refuse_at("schema", Violation::MissingField);
 	}
-	return std::move(*schema);
+	return JsonSchemaFormat{.name = std::move(*name), .description = std::move(description), .schema = std::move(*schema)};
+}
+
+/** `text`: its format, and a verbosity the model has no control over. */
+[[nodiscard]] auto text_config(Body& value) -> Decoded<TextFormat> {
+	auto format = TextFormat{TextFormatMode::Text};
+	auto const visited = each_member(value, [&format](std::string_view name, Body& member) -> Decoded<void> {
+		if (name == "format") {
+			return nullable<TextFormat>(member, [](Body& inner) { return text_format(inner); }).transform([&format](std::optional<TextFormat> read) {
+				format = std::move(read).value_or(TextFormat{TextFormatMode::Text});
+			});
+		}
+		if (name == "verbosity") {
+			return neutral(member, Neutral::Medium);
+		}
+		return refuse(Violation::UnknownField);
+	});
+	if (!visited) {
+		return std::unexpected(visited.error());
+	}
+	return format;
 }
 
 }
