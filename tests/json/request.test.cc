@@ -56,7 +56,7 @@ using Scratch = json::Reader<json::request_bounds>;
 	return model::serialize(model::Model{.value = std::move(object)}, model::Style{.spelling = model::Spelling::Raw, .spacing = model::Spacing::Compact}, rng);
 }
 
-[[nodiscard]] auto random_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
+[[nodiscard]] auto random_function_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
 	auto const name = "fn_" + std::to_string(rng() % 1000);
 	auto const parameters = coin(rng) ? std::optional<json::JsonText>{json_text(scratch, compact_object(rng, rng() % 4))} : std::nullopt;
 	auto definition = Text{};
@@ -73,11 +73,70 @@ using Scratch = json::Reader<json::request_bounds>;
 				function.null("parameters");
 			}
 			if (coin(rng)) {
-				function.boolean("strict", false);
+				function.boolean("strict", coin(rng));
 			}
 		});
 	});
-	return json::Tool{.name = name, .parameters = parameters, .definition = json_text(scratch, definition.bytes)};
+	return json::Tool{.name = name, .input = json::FunctionTool{.parameters = parameters}, .definition = json_text(scratch, definition.bytes)};
+}
+
+/** A custom tool, its format spelled every way it may be: absent, text, or a grammar nested or flat. */
+[[nodiscard]] auto random_custom_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
+	auto const name = "custom_" + std::to_string(rng() % 1000);
+	auto const grammar = coin(rng) ? std::optional<json::Grammar>{json::Grammar{
+	                                     .syntax = coin(rng) ? json::GrammarSyntax::Lark : json::GrammarSyntax::Regex,
+	                                     .definition = model::random_text(rng, 30),
+	                                 }}
+	                               : std::nullopt;
+	auto definition = Text{};
+	json::write_object(definition, [&](Members& tool) {
+		tool.string("type", "custom");
+		tool.object("custom", [&](Members& custom) {
+			custom.string("name", name);
+			if (coin(rng)) {
+				custom.string("description", model::random_text(rng, 10));
+			}
+			auto const syntax = [&grammar] { return grammar->syntax == json::GrammarSyntax::Lark ? "lark" : "regex"; };
+			if (grammar && coin(rng)) {
+				custom.object("format", [&](Members& format) {
+					format.string("type", "grammar");
+					format.object("grammar", [&](Members& nested) {
+						nested.string("definition", grammar->definition);
+						nested.string("syntax", syntax());
+					});
+				});
+			} else if (grammar) {
+				custom.object("format", [&](Members& format) {
+					format.string("syntax", syntax());
+					format.string("type", "grammar");
+					format.string("definition", grammar->definition);
+				});
+			} else if (coin(rng)) {
+				custom.object("format", [](Members& format) { format.string("type", "text"); });
+			} else if (coin(rng)) {
+				custom.null("format");
+			}
+		});
+	});
+	return json::Tool{.name = name, .input = json::CustomTool{.grammar = grammar}, .definition = json_text(scratch, definition.bytes)};
+}
+
+[[nodiscard]] auto random_tool(std::mt19937_64& rng, Scratch& scratch) -> json::Tool {
+	return coin(rng) ? random_function_tool(rng, scratch) : random_custom_tool(rng, scratch);
+}
+
+[[nodiscard]] auto random_format(std::mt19937_64& rng, Scratch& scratch) -> json::ResponseFormat {
+	switch (rng() % 4) {
+	case 0:
+		return json::ResponseFormatMode::Text;
+	case 1:
+		return json::ResponseFormatMode::JsonObject;
+	default:
+		return json::JsonSchemaFormat{
+		    .name = "schema_" + std::to_string(rng() % 100),
+		    .schema = coin(rng) ? std::optional<json::JsonText>{json_text(scratch, compact_object(rng, rng() % 4))} : std::nullopt,
+		};
+	}
 }
 
 [[nodiscard]] auto random_call(std::mt19937_64& rng, Scratch& scratch) -> json::ToolCall {
@@ -141,6 +200,7 @@ template<class T>
 	        .reasoning_effort = maybe(rng, std::array{json::ReasoningEffort::Low, json::ReasoningEffort::Medium, json::ReasoningEffort::XHigh}[rng() % 3]),
 	        .past_thinking = maybe(rng, coin(rng) ? json::PastThinking::Preserved : json::PastThinking::Dropped),
 	    },
+	    .response_format = random_format(rng, scratch),
 	};
 	for (auto count = rng() % 6; count > 0; --count) {
 		request.messages.push_back(random_message(rng, scratch));
@@ -288,12 +348,13 @@ enum class Field : std::uint8_t {
 	Sampling,
 	Stop,
 	Template,
+	Format,
 	Neutral,
 };
 
 /** Writes a request in a random order of members and a random choice of the spellings each member allows. */
 [[nodiscard]] auto encode(json::ChatRequest const& request, std::mt19937_64& rng) -> std::string {
-	auto fields = std::vector<Field>{Field::Messages, Field::Model, Field::Tools, Field::ToolChoice, Field::Delivery, Field::MaxTokens, Field::Sampling, Field::Stop, Field::Template, Field::Neutral};
+	auto fields = std::vector<Field>{Field::Messages, Field::Model, Field::Tools, Field::ToolChoice, Field::Delivery, Field::MaxTokens, Field::Sampling, Field::Stop, Field::Template, Field::Format, Field::Neutral};
 	std::ranges::shuffle(fields, rng);
 	auto out = Text{};
 	json::write_object(out, [&](Members& written) {
@@ -397,6 +458,29 @@ enum class Field : std::uint8_t {
 				}
 				break;
 			}
+			case Field::Format:
+				if (std::holds_alternative<json::JsonSchemaFormat>(request.response_format)) {
+					auto const& format = std::get<json::JsonSchemaFormat>(request.response_format);
+					written.object("response_format", [&](Members& written_format) {
+						written_format.object("json_schema", [&](Members& schema) {
+							if (coin(rng)) {
+								schema.boolean("strict", coin(rng));
+							}
+							schema.string("name", format.name);
+							if (format.schema) {
+								schema.json("schema", *format.schema);
+							}
+						});
+						written_format.string("type", "json_schema");
+					});
+				} else if (std::get<json::ResponseFormatMode>(request.response_format) == json::ResponseFormatMode::JsonObject) {
+					written.object("response_format", [](Members& format) { format.string("type", "json_object"); });
+				} else if (coin(rng)) {
+					written.object("response_format", [](Members& format) { format.string("type", "text"); });
+				} else if (coin(rng)) {
+					written.null("response_format");
+				}
+				break;
 			case Field::Neutral:
 				if (coin(rng)) {
 					written.integer("n", 1);
@@ -405,7 +489,6 @@ enum class Field : std::uint8_t {
 					written.boolean("logprobs", false);
 					written.object("logit_bias", [](Members&) {});
 					written.string("user", "client-42");
-					written.object("response_format", [](Members& format) { format.string("type", "text"); });
 					written.array("modalities", [](Elements& modalities) { modalities.string("text"); });
 					written.boolean("parallel_tool_calls", true);
 					written.null("metadata");
@@ -489,9 +572,22 @@ struct Refusal {
 	     .error = at(parse(json::ParseFault::DuplicateKey), {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"function"}, P{"arguments"}})},
 	    {.body = R"({"messages":[{"role":"assistant","tool_calls":[{"id":"c","function":{"name":"f","extra":1}}]}]})",
 	     .error = at(Violation::UnknownField, {P{"messages"}, P{std::size_t{0}}, P{"tool_calls"}, P{std::size_t{0}}, P{"function"}, P{"extra"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"x"}}]})", .error = at(Violation::Unsupported, {P{"tools"}, P{std::size_t{0}}, P{"type"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"web_search"}]})", .error = at(Violation::Unsupported, {P{"tools"}, P{std::size_t{0}}, P{"type"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f"},"custom":{"name":"f"}}]})", .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{}}]})", .error = at(Violation::MissingField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"name"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"grammar","grammar":{"syntax":"ebnf","definition":"x"}}}}]})",
+	     .error = at(Violation::UnknownValue, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"grammar"}, P{"syntax"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"grammar","syntax":"lark"}}}]})",
+	     .error = at(Violation::MissingField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"definition"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"text","definition":"x"}}}]})",
+	     .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"definition"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"x"},"syntax":"lark"}}}]})",
+	     .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"syntax"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"custom","custom":{"name":"c","format":{"type":"cfg"}}}]})",
+	     .error = at(Violation::UnknownValue, {P{"tools"}, P{std::size_t{0}}, P{"custom"}, P{"format"}, P{"type"}})},
 	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f"},"cache_control":{}}]})", .error = at(Violation::UnknownField, {P{"tools"}, P{std::size_t{0}}, P{"cache_control"}})},
-	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f","strict":true}}]})", .error = at(Violation::Unsupported, {P{"tools"}, P{std::size_t{0}}, P{"function"}, P{"strict"}})},
+	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f","strict":"yes"}}]})",
+	     .error = at(shape(Expected::Boolean, Kind::String), {P{"tools"}, P{std::size_t{0}}, P{"function"}, P{"strict"}})},
 	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":[]}}]})",
 	     .error = at(shape(Expected::Object, Kind::Array), {P{"tools"}, P{std::size_t{0}}, P{"function"}, P{"parameters"}})},
 	    {.body = R"({"messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{"a":tru}}}]})", .error = at(parse(json::ParseFault::InvalidLiteral), {P{"tools"}, P{std::size_t{0}}})},
@@ -514,7 +610,14 @@ struct Refusal {
 	    {.body = R"({"messages":[],"presence_penalty":0.5})", .error = at(Violation::Unsupported, {P{"presence_penalty"}})},
 	    {.body = R"({"messages":[],"logprobs":true})", .error = at(Violation::Unsupported, {P{"logprobs"}})},
 	    {.body = R"({"messages":[],"logit_bias":{"50256":-100}})", .error = at(Violation::Unsupported, {P{"logit_bias"}})},
-	    {.body = R"({"messages":[],"response_format":{"type":"json_object"}})", .error = at(Violation::Unsupported, {P{"response_format"}})},
+	    {.body = R"({"messages":[],"response_format":{"type":"xml"}})", .error = at(Violation::UnknownValue, {P{"response_format"}, P{"type"}})},
+	    {.body = R"({"messages":[],"response_format":{"type":"json_schema"}})", .error = at(Violation::MissingField, {P{"response_format"}, P{"json_schema"}})},
+	    {.body = R"({"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{}}}})",
+	     .error = at(Violation::MissingField, {P{"response_format"}, P{"json_schema"}, P{"name"}})},
+	    {.body = R"({"messages":[],"response_format":{"type":"json_object","json_schema":{"name":"n"}}})", .error = at(Violation::UnknownField, {P{"response_format"}, P{"json_schema"}})},
+	    {.body = R"({"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":[]}}})",
+	     .error = at(shape(Expected::Object, Kind::Array), {P{"response_format"}, P{"json_schema"}, P{"schema"}})},
+	    {.body = R"({"messages":[],"response_format":"json"})", .error = at(shape(Expected::Object, Kind::String), {P{"response_format"}})},
 	    {.body = R"({"messages":[],"parallel_tool_calls":false})", .error = at(Violation::Unsupported, {P{"parallel_tool_calls"}})},
 	    {.body = R"({"messages":[],"reasoning_effort":"high"})", .error = at(Violation::Unsupported, {P{"reasoning_effort"}})},
 	    {.body = R"({"messages":[],"modalities":["text","audio"]})", .error = at(Violation::Unsupported, {P{"modalities"}})},

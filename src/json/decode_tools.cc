@@ -12,8 +12,54 @@ import :reader;
 import :request;
 import :decode_support;
 import :decode_neutral;
+import :decode_format;
 
 namespace engine::json {
+
+/** A function tool's `function` member. */
+[[nodiscard]] auto function_tool(Fragment& value, std::optional<std::string>& name) -> Decoded<FunctionTool> {
+	auto tool = FunctionTool{.parameters = std::nullopt};
+	auto const visited = each_member(value, [&](std::string_view field, Fragment& member) -> Decoded<void> {
+		if (field == "name") {
+			return text(member).transform([&name](std::string read) { name = std::move(read); });
+		}
+		if (field == "description") {
+			return nullable<std::string>(member, [](Fragment& description) { return text(description); }).transform([](auto const&) {});
+		}
+		if (field == "parameters") {
+			return schema_of(member).transform([&tool](std::optional<JsonText> schema) { tool.parameters = std::move(schema); });
+		}
+		if (field == "strict") {
+			return any_boolean(member);
+		}
+		return refuse(Violation::UnknownField);
+	});
+	if (!visited) {
+		return std::unexpected(visited.error());
+	}
+	return tool;
+}
+
+/** A custom tool's `custom` member. */
+[[nodiscard]] auto custom_tool(Fragment& value, std::optional<std::string>& name) -> Decoded<CustomTool> {
+	auto tool = CustomTool{.grammar = std::nullopt};
+	auto const visited = each_member(value, [&](std::string_view field, Fragment& member) -> Decoded<void> {
+		if (field == "name") {
+			return text(member).transform([&name](std::string read) { name = std::move(read); });
+		}
+		if (field == "description") {
+			return nullable<std::string>(member, [](Fragment& description) { return text(description); }).transform([](auto const&) {});
+		}
+		if (field == "format") {
+			return custom_format(member).transform([&tool](std::optional<Grammar> read) { tool.grammar = std::move(read); });
+		}
+		return refuse(Violation::UnknownField);
+	});
+	if (!visited) {
+		return std::unexpected(visited.error());
+	}
+	return tool;
+}
 
 /** A tools element: kept whole as written, then read again on its own for what the engine needs from it. */
 [[nodiscard]] auto tool(Body& value, Fragments& fragments) -> Decoded<Tool> {
@@ -26,43 +72,24 @@ namespace engine::json {
 		return std::unexpected(root.error());
 	}
 	auto type = std::optional<std::string>{};
-	auto parameters = std::optional<JsonText>{};
-	auto function = std::optional<Named>{};
-	auto other = std::optional<std::string>{};
-	auto const visited = each_member(*root, [&](std::string_view member, Value<fragment_bounds>& inner) -> Decoded<void> {
+	auto function_name = std::optional<std::string>{};
+	auto custom_name = std::optional<std::string>{};
+	auto function = std::optional<FunctionTool>{};
+	auto custom = std::optional<CustomTool>{};
+	auto seen = std::vector<std::string>{};
+	auto const visited = each_member(*root, [&](std::string_view member, Fragment& inner) -> Decoded<void> {
+		seen.emplace_back(member);
 		if (member == "type") {
 			return text(inner).transform([&type](std::string read) { type = std::move(read); });
 		}
-		if (member != "function") {
-			other = other.value_or(std::string{member});
-			return {};
+		if (member == "function") {
+			return function_tool(inner, function_name).transform([&function](FunctionTool read) { function = std::move(read); });
 		}
-		function.emplace();
-		return each_member(inner, [&](std::string_view field, Value<fragment_bounds>& field_value) -> Decoded<void> {
-			if (field == "name") {
-				return text(field_value).transform([&named = *function](std::string read) { named.name = std::move(read); });
-			}
-			if (field == "description") {
-				return nullable<std::string>(field_value, [](Value<fragment_bounds>& description) { return text(description); }).transform([](auto const&) {});
-			}
-			if (field == "parameters") {
-				auto const kind = kind_of(field_value);
-				if (!kind) {
-					return std::unexpected(kind.error());
-				}
-				if (*kind == Kind::Null) {
-					return lift(field_value.as_null());
-				}
-				if (*kind != Kind::Object) {
-					return refuse(WrongShape{.expected = Expected::Object, .found = *kind});
-				}
-				return lift(field_value.capture()).transform([&parameters](JsonText schema) { parameters = std::move(schema); });
-			}
-			if (field == "strict") {
-				return neutral(field_value, Neutral::False);
-			}
-			return refuse(Violation::UnknownField);
-		});
+		if (member == "custom") {
+			return custom_tool(inner, custom_name).transform([&custom](CustomTool read) { custom = std::move(read); });
+		}
+		// Which members belong depends on the type, which may come later: decided after the loop.
+		return {};
 	});
 	if (!visited) {
 		return std::unexpected(visited.error());
@@ -73,19 +100,32 @@ namespace engine::json {
 	if (!type) {
 		return refuse_at("type", Violation::MissingField);
 	}
-	if (*type != "function") {
+	if (*type != "function" && *type != "custom") {
 		return refuse_type(unsupported_tool_types, *type);
 	}
-	if (other) {
-		return refuse_at(*other, Violation::UnknownField);
+	auto const& payload = *type;
+	for (auto const& name : seen) {
+		if (name != "type" && name != payload) {
+			return refuse_at(name, Violation::UnknownField);
+		}
 	}
-	if (!function) {
-		return refuse_at("function", Violation::MissingField);
+	auto const missing_name = [&payload] { return std::unexpected(DecodeError{.fault = Violation::MissingField, .path = {"name", payload}}); };
+	if (payload == "function") {
+		if (!function) {
+			return refuse_at("function", Violation::MissingField);
+		}
+		if (!function_name) {
+			return missing_name();
+		}
+		return Tool{.name = std::move(*function_name), .input = std::move(*function), .definition = std::move(*definition)};
 	}
-	if (!function->name) {
-		return std::unexpected(DecodeError{.fault = Violation::MissingField, .path = {"name", "function"}});
+	if (!custom) {
+		return refuse_at("custom", Violation::MissingField);
 	}
-	return Tool{.name = std::move(*function->name), .parameters = std::move(parameters), .definition = std::move(*definition)};
+	if (!custom_name) {
+		return missing_name();
+	}
+	return Tool{.name = std::move(*custom_name), .input = std::move(*custom), .definition = std::move(*definition)};
 }
 
 [[nodiscard]] auto tool_choice(Body& value) -> Decoded<ToolChoice> {

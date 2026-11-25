@@ -32,8 +32,6 @@ enum class Neutral : std::uint8_t {
 	True,
 	EmptyObject,
 	EmptyArray,
-	/** `{"type": "text"}`: plain text output. */
-	TextFormat,
 	/** `["text"]`: text output only. */
 	TextModalities,
 };
@@ -84,23 +82,6 @@ template<Bounds B>
 }
 
 template<Bounds B>
-[[nodiscard]] auto is_text_format(Value<B>& value) -> Decoded<bool> {
-	auto plain = false;
-	auto other = false;
-	auto const visited = each_member(value, [&](std::string_view name, Value<B>& member) -> Decoded<void> {
-		if (name != "type") {
-			other = true;
-			return {};
-		}
-		return text(member).transform([&plain](std::string const& type) { plain = type == "text"; });
-	});
-	if (!visited) {
-		return std::unexpected(visited.error());
-	}
-	return plain && !other;
-}
-
-template<Bounds B>
 [[nodiscard]] auto is_text_modalities(Value<B>& value) -> Decoded<bool> {
 	auto texts = std::size_t{0};
 	auto other = false;
@@ -146,8 +127,6 @@ template<Bounds B>
 			return is_empty(value, Kind::Object);
 		case Neutral::EmptyArray:
 			return is_empty(value, Kind::Array);
-		case Neutral::TextFormat:
-			return *kind == Kind::Object ? is_text_format(value) : Decoded<bool>{false};
 		case Neutral::TextModalities:
 			return *kind == Kind::Array ? is_text_modalities(value) : Decoded<bool>{false};
 		}
@@ -183,7 +162,6 @@ constexpr auto request_tolerated = std::to_array<Tolerated>({
     {.name = "top_logprobs", .neutral = Neutral::Null},
     {.name = "logit_bias", .neutral = Neutral::EmptyObject},
     {.name = "parallel_tool_calls", .neutral = Neutral::True},
-    {.name = "response_format", .neutral = Neutral::TextFormat},
     {.name = "store", .neutral = Neutral::False},
     {.name = "metadata", .neutral = Neutral::Null},
     {.name = "modalities", .neutral = Neutral::TextModalities},
@@ -209,7 +187,8 @@ constexpr auto assistant_tolerated = std::to_array<Tolerated>({
 constexpr auto unsupported_part_types = std::to_array<std::string_view>({"image_url", "input_audio", "file", "refusal", "image", "video"});
 
 /** Tool and tool-choice types OpenAI defines beyond functions. */
-constexpr auto unsupported_tool_types = std::to_array<std::string_view>({"custom", "allowed_tools", "web_search", "file_search", "code_interpreter"});
+constexpr auto unsupported_tool_types =
+    std::to_array<std::string_view>({"custom", "allowed_tools", "web_search", "file_search", "code_interpreter", "computer_use_preview", "mcp"});
 
 /** Refuses a `type` the decoder does not take: unsupported when OpenAI defines it, unknown otherwise. */
 template<std::size_t N>

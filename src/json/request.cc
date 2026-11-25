@@ -82,17 +82,67 @@ export struct ForcedFunction {
 
 export using ToolChoice = std::variant<ToolChoiceMode, ForcedFunction>;
 
+/** A function tool's input: an arguments object matching its parameter schema, or any object without one. */
+export struct FunctionTool {
+	std::optional<JsonText> parameters;
+
+	[[nodiscard]] auto operator==(FunctionTool const&) const -> bool = default;
+};
+
+/** The grammar dialects a custom tool's input may be given in: the lark dialect OpenAI documents, and a regex. */
+export enum class GrammarSyntax : std::uint8_t {
+	Lark,
+	Regex,
+};
+
+/** A grammar as the client wrote it; compiling it is the grammar's own concern. */
+export struct Grammar {
+	GrammarSyntax syntax;
+	std::string definition;
+
+	[[nodiscard]] auto operator==(Grammar const&) const -> bool = default;
+};
+
+/** A custom tool's input: free text, or text its grammar accepts. */
+export struct CustomTool {
+	std::optional<Grammar> grammar;
+
+	[[nodiscard]] auto operator==(CustomTool const&) const -> bool = default;
+};
+
+export using ToolInput = std::variant<FunctionTool, CustomTool>;
+
 /**
- * A function tool. The chat template renders the tool as the client wrote it, so `definition` keeps the whole tools
- * element; `parameters` is its JSON schema, for reading tool-call arguments back by their declared types.
+ * A tool. The chat template renders each tool as the client wrote it, so `definition` keeps the whole tools element;
+ * `input` is what constrains a call's input. Every tool is enforced: a function tool's `strict` is accepted at both
+ * values and changes nothing.
  */
 export struct Tool {
 	std::string name;
-	std::optional<JsonText> parameters;
+	ToolInput input;
 	JsonText definition;
 
 	[[nodiscard]] auto operator==(Tool const&) const -> bool = default;
 };
+
+/** `response_format` without a schema: free text, or any one JSON object. */
+export enum class ResponseFormatMode : std::uint8_t {
+	Text,
+	JsonObject,
+};
+
+/**
+ * `response_format` of type `json_schema`: the content is JSON matching `schema`, or any JSON value without one.
+ * Every schema is enforced, so its `strict` is accepted at both values and changes nothing.
+ */
+export struct JsonSchemaFormat {
+	std::string name;
+	std::optional<JsonText> schema;
+
+	[[nodiscard]] auto operator==(JsonSchemaFormat const&) const -> bool = default;
+};
+
+export using ResponseFormat = std::variant<ResponseFormatMode, JsonSchemaFormat>;
 
 /** An argument the chat template renders as its text when it is a string, and as JSON otherwise. */
 export using ArgumentValue = std::variant<std::string, JsonText>;
@@ -168,6 +218,8 @@ export struct ChatRequest {
 	/** Stop sequences; a lone string is a list of one. */
 	std::vector<std::string> stop;
 	TemplateOptions template_options;
+	/** Absent, `null` and `{"type": "text"}` are all free text. */
+	ResponseFormat response_format;
 
 	[[nodiscard]] auto operator==(ChatRequest const&) const -> bool = default;
 };

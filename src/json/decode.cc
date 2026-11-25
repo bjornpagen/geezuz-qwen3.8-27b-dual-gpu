@@ -13,6 +13,7 @@ import :request;
 import :decode_support;
 import :decode_neutral;
 import :decode_messages;
+import :decode_format;
 import :decode_tools;
 
 namespace engine::json {
@@ -136,6 +137,7 @@ template<class T, class F>
 	    .seed = std::nullopt,
 	    .stop = {},
 	    .template_options = {},
+	    .response_format = ResponseFormatMode::Text,
 	};
 	auto messages = std::optional<std::vector<Message>>{};
 	auto stream = std::optional<bool>{};
@@ -195,6 +197,11 @@ template<class T, class F>
 		}
 		if (name == "stop") {
 			return stop(member).transform([&decoded](std::vector<std::string> read) { decoded.stop = std::move(read); });
+		}
+		if (name == "response_format") {
+			return nullable<ResponseFormat>(member, [](Body& value) { return response_format(value); }).transform([&decoded](std::optional<ResponseFormat> read) {
+				decoded.response_format = std::move(read).value_or(ResponseFormat{ResponseFormatMode::Text});
+			});
 		}
 		if (name == "chat_template_kwargs") {
 			return nullable<TemplateOptions>(member, [](Body& value) { return template_options(value); }).transform([&decoded](std::optional<TemplateOptions> read) {

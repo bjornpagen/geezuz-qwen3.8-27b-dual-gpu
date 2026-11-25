@@ -13,6 +13,7 @@ target_sources(engine_json PUBLIC FILE_SET CXX_MODULES FILES
 	decode_support.cc
 	decode_neutral.cc
 	decode_messages.cc
+	decode_format.cc
 	decode_tools.cc
 	decode.cc
 	response.cc

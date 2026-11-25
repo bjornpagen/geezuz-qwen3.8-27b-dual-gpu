@@ -12,6 +12,7 @@ export import :request;
 export import :decode_support;
 export import :decode_neutral;
 export import :decode_messages;
+export import :decode_format;
 export import :decode_tools;
 export import :decode;
 export import :response;

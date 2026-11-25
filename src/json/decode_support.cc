@@ -166,4 +166,26 @@ template<Bounds B, class F>
 	}
 }
 
+/** A JSON schema member: kept as its exact text, checked whole; `null` leaves it absent. */
+template<Bounds B>
+[[nodiscard]] auto schema_of(Value<B>& value) -> Decoded<std::optional<JsonText>> {
+	auto const kind = kind_of(value);
+	if (!kind) {
+		return std::unexpected(kind.error());
+	}
+	if (*kind == Kind::Null) {
+		return lift(value.as_null()).transform([] { return std::optional<JsonText>{}; });
+	}
+	if (*kind != Kind::Object) {
+		return refuse(WrongShape{.expected = Expected::Object, .found = *kind});
+	}
+	return lift(value.capture()).transform([](JsonText schema) { return std::optional<JsonText>{std::move(schema)}; });
+}
+
+/** A boolean member the engine accepts at both values without acting on it (`strict`: everything is enforced). */
+template<Bounds B>
+[[nodiscard]] auto any_boolean(Value<B>& value) -> Decoded<void> {
+	return nullable<bool>(value, [](Value<B>& flag) { return lift(flag.as_boolean()); }).transform([](std::optional<bool>) {});
+}
+
 }
