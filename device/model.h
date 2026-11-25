@@ -291,22 +291,28 @@ struct Instances {
 	Count mtp;
 };
 
-[[nodiscard]] consteval auto layer_instances(Scope scope) -> Instances {
-	auto const mtp_of = [](Mixer mixer) {
-		return mtp_mixer == mixer ? mtp_layers : 0;
-	};
+/** Whether a decoder layer with `mixer` holds the tensors of `scope`. */
+[[nodiscard]] constexpr auto in_layer(Scope scope, Mixer mixer) -> bool {
 	switch (scope) {
 	case Scope::Model:
 	case Scope::Mtp:
-		return {.trunk = 0, .mtp = 0};
+		return false;
 	case Scope::DecoderLayer:
-		return {.trunk = trunk_layers, .mtp = mtp_layers};
+		return true;
 	case Scope::LinearAttentionLayer:
-		return {.trunk = trunk_layers_of(Mixer::LinearAttention), .mtp = mtp_of(Mixer::LinearAttention)};
+		return mixer == Mixer::LinearAttention;
 	case Scope::FullAttentionLayer:
-		return {.trunk = trunk_layers_of(Mixer::FullAttention), .mtp = mtp_of(Mixer::FullAttention)};
+		return mixer == Mixer::FullAttention;
 	}
 	__builtin_unreachable();
+}
+
+[[nodiscard]] consteval auto layer_instances(Scope scope) -> Instances {
+	auto trunk = Count{0};
+	for (auto const mixer : trunk_mixers) {
+		trunk += in_layer(scope, mixer) ? 1 : 0;
+	}
+	return {.trunk = trunk, .mtp = in_layer(scope, mtp_mixer) ? mtp_layers : 0};
 }
 
 struct Range {
