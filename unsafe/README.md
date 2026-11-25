@@ -7,3 +7,4 @@ is stored asynchronously, no kernel user data holds an address, readiness return
 state. AGENTS.md §5.2 and §15.
 
 - `fail/` — `engine.fail`: the always-on `invariant` (reached from dialect code as `engine::core::invariant`).
+- `file/` — `engine.file`: read-only whole-file mappings (the checkpoint, the baked image, test inputs).
