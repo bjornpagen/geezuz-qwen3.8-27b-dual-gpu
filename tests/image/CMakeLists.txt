@@ -7,6 +7,7 @@ target_link_libraries(engine_image_synthetic PUBLIC engine_language_profile engi
 
 engine_test(image SOURCES image.test.cc LINK engine_image engine_image_synthetic engine_model)
 engine_test(image.identity SOURCES identity.test.cc LINK engine_image engine_model)
+engine_test(image.describe SOURCES describe.test.cc LINK engine_core engine_file engine_image)
 
 engine_death_test(image.wrong_extent SOURCES wrong_extent.death.cc LINK engine_image engine_image_synthetic)
 
