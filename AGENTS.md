@@ -548,8 +548,9 @@ Required:
   `try_wait` and no `expect_tx`, so a wait is a `test_wait.parity` spin with `nanosleep` backoff and `cp.async`
   completion is counted in arrivals. No `__syncthreads` in steady state; named barriers (`bar.sync id, n`) only for
   fixed sub-groups;
-- **l2 control**: `createpolicy.fractional` with evict_first on the weight stream and evict_last on activations, kv
-  tiles and flags; `prefetch.global.L2` for run-ahead; `discard.global.L2` on dead scratch;
+- **l2 control**: `createpolicy.fractional` with evict_first on every single-use stream (weights, kv tiles, deltanet
+  state: each is read once per cycle) and evict_last on what is reused (activations, flags, exchange buffers);
+  `prefetch.global.L2` for run-ahead; `discard.global.L2` on dead scratch;
 - **fragments**: `ldmatrix` (and `.trans`) from xor-swizzled shared memory with zero bank conflicts;
   `mma.sync.m16n8k16` bf16 × bf16 → fp32; register double-buffering across k-steps;
 - **reductions**: `redux.sync` for integers, butterfly `shfl.sync` for floats in a fixed order (determinism);

@@ -56,6 +56,9 @@ tower). the engine computes exactly that function:
   weights that |v| stays below 2^70, so the scaled fp32 accumulators cannot overflow at any context length.
 - speculative decoding verifies exactly (greedy is exact; sampling uses rejection sampling).
 - sampling parameters are exact for every value the server accepts; anything else is refused with a named error.
+- every generation is constrained by its request's grammar (1.4b): the engine samples exactly from the model's
+  distribution restricted to the tokens the grammar allows at each position, renormalized. the cpu reference applies
+  the same masks. there is no unconstrained path.
 - the only allowed differences are floating-point summation order and the tensor core's own fp32 accumulation, which
   on sm_86 is not ieee: it sums products in blocks of 8, aligned to the largest and truncated (docs/HARDWARE.md).
 
@@ -295,7 +298,7 @@ baseline keeps geezuz's algorithm, but its building blocks are these primitives 
 - dp4a and any int8 or fp16-accumulate math path;
 - cooperative-groups `grid.sync` and atomic-counter grid barriers in the dataflow core (allowed only in the step-1
   baseline, deleted at step 2);
-- per-phase kernel launches;
+- per-phase kernel launches in the decode cycle (prefill may run a short fixed sequence of kernels per chunk);
 - weight-stream loads without a cache policy;
 - unswizzled shared tiles with bank conflicts;
 - texture / surface paths, `printf`, dynamic shared allocation decided at runtime.
@@ -417,6 +420,35 @@ boundary.
   - `/v1/models`, `/health`, `/status`, plus `X-Request-Id` tagging.
   - unsupported parameters are refused with a named 400. assistant turns with `content: null` (tool-call-only or
     reasoning-only turns that harnesses resend) are accepted as empty; adrien hit http 400s on exactly this.
+  - `response_format` (`text`, `json_object`, `json_schema`), `strict` on function tools (accepted at both values:
+    every tool is enforced), and custom tools whose `format` is a lark grammar: see 1.4b.
+
+## 1.4b constrained decoding (every request, owner decision)
+
+every request decodes under a grammar; there is no unconstrained mode, so there is one sampling path.
+
+- **the grammar of a request** is the qwen3.8 output grammar (the reasoning region when thinking is on, then content
+  and/or tool calls in the template's tool-call syntax, then the end token) composed with:
+  - each function tool's argument grammar, compiled from its json schema; every tool is strict;
+  - `tool_choice`: `none` forbids tool calls, `required` demands at least one, a forced function demands that one;
+  - `response_format`: `json_object` or `json_schema` constrains the content region;
+  - custom tools whose `format` is a lark grammar (the llguidance / openai lark dialect) or a regex, constraining that
+    tool's input.
+  so tool calls always parse, arguments always match their schema, and `tool_choice` is honoured. a schema or grammar
+  feature the engine does not implement is refused with a named 400, never approximated.
+- **`engine.grammar`**: a lark frontend, a lexer compiled from the terminals (regex to automaton), an earley parser
+  over lexemes, a json-schema compiler to the same grammar form, and token masks computed by walking the tokenizer's
+  byte-level token trie against the parser state. bounded memory, typed errors, no runtime dependency on a python or
+  rust grammar library. the mask for one position targets well under 100 us on the host.
+- **exactness**: masking comes first, then the sampling filters (top-k, top-p, min-p, temperature) over the allowed
+  tokens; greedy is the argmax over allowed tokens. the end token is allowed only where the grammar accepts.
+- **with speculation**: every verify row is masked exactly. the host computes the masks for the committed token and
+  for each drafted prefix while the next cycle's weight stream runs, and the lm_head top-k excludes masked rows (each
+  card's mask is in its row order, through `engine.vocabulary`). drafts may come from the unmasked mtp distribution:
+  rejection sampling stays exact, and a draft the grammar forbids is simply rejected. whether masking the drafts too
+  pays is measured, not assumed.
+- **masks reach the device** through the mapped ring: one 248,077-bit mask (31 kb) per verify row, at most ~40 rows
+  per cycle.
 
 ## 1.5 kv pool and prefix cache (port)
 
