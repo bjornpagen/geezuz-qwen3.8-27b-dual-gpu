@@ -1,0 +1,65 @@
+{
+  "version": 10,
+  "cmakeMinimumRequired": { "major": 4, "minor": 4, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_PROGRAM_PATH": "/opt/local/libexec/llvm-23/bin"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "dev: -O1, warnings as errors, trap-mode ubsan, device invariant checks",
+      "inherits": "base",
+      "cacheVariables": { "ENGINE_BUILD": "dev" }
+    },
+    {
+      "name": "release",
+      "displayName": "release: -O3, lto, device checks off",
+      "inherits": "base",
+      "cacheVariables": { "ENGINE_BUILD": "release" }
+    },
+    {
+      "name": "asan-ubsan",
+      "displayName": "asan-ubsan: host runtime sanitizers for the cpu test suite",
+      "inherits": "base",
+      "cacheVariables": { "ENGINE_BUILD": "asan-ubsan" }
+    },
+    {
+      "name": "profile",
+      "displayName": "profile: release plus the per-phase profiler",
+      "inherits": "base",
+      "cacheVariables": { "ENGINE_BUILD": "profile" }
+    },
+    {
+      "name": "lint",
+      "displayName": "lint: clang-tidy over the whole graph, dialect and quarantine profiles",
+      "inherits": "base",
+      "cacheVariables": { "ENGINE_BUILD": "lint" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan-ubsan", "configurePreset": "asan-ubsan" },
+    { "name": "profile", "configurePreset": "profile" },
+    { "name": "lint", "configurePreset": "lint" }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    { "name": "dev", "inherits": "base", "configurePreset": "dev" },
+    { "name": "release", "inherits": "base", "configurePreset": "release" },
+    { "name": "asan-ubsan", "inherits": "base", "configurePreset": "asan-ubsan" },
+    { "name": "profile", "inherits": "base", "configurePreset": "profile" }
+  ]
+}
