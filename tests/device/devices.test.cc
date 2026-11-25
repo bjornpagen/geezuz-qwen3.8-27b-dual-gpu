@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.model;
 import engine.prims;
 import engine.ptx;
 import engine.testing;
@@ -14,6 +15,7 @@ namespace fake = engine::driver_double;
 
 using device::DeviceError;
 using device::Devices;
+using engine::model::Card;
 using fake::CardModel;
 using fake::Fake;
 using fake::LinkModel;
@@ -60,8 +62,8 @@ using fake::Machine;
 	{
 		auto const opened = Devices::open(driver.driver());
 		holds = opened.has_value() && driver.peer_access(0, 1) && driver.peer_access(1, 0) && driver.live(fake::Kind::Context) == 2 &&
-		        driver.live(fake::Kind::ManagementSession) == 1 && opened->context(device::Rank::Zero).ordinal() == 0 &&
-		        opened->context(device::Rank::One).ordinal() == 1;
+		        driver.live(fake::Kind::ManagementSession) == 1 && opened->context(Card::Zero).ordinal() == 0 &&
+		        opened->context(Card::One).ordinal() == 1;
 	}
 	return holds && clean(driver);
 }
@@ -105,7 +107,8 @@ using fake::Machine;
 		if (card.sm_count != engine::device::prims::sm86.sms) {
 			return device::WrongCard{.ordinal = ordinal, .fact = device::CardFact::SmCount, .found = card.sm_count};
 		}
-		if (card.memory_bytes < device::memory_floor || card.memory_bytes > device::memory_ceiling) {
+		if (card.memory_bytes > engine::model::card_memory_bytes ||
+		    card.memory_bytes < engine::model::card_memory_bytes - engine::model::driver_reserve_bytes) {
 			return device::WrongCard{
 			    .ordinal = ordinal,
 			    .fact = device::CardFact::MemorySize,
@@ -237,8 +240,8 @@ template<class T, std::size_t N>
 	if (!opened) {
 		return false;
 	}
-	auto const zero = opened->memory_clock(device::Rank::Zero);
-	auto const one = opened->memory_clock(device::Rank::One);
+	auto const zero = opened->memory_clock(Card::Zero);
+	auto const one = opened->memory_clock(Card::One);
 	return zero == device::MemoryClock{.megahertz = 9501, .state = device::PerformanceState::P2} &&
 	       one == device::MemoryClock{.megahertz = 9751, .state = device::PerformanceState::P0};
 }
@@ -248,7 +251,7 @@ template<class T, std::size_t N>
 	machine.cards[1].performance_state = 32;
 	auto const driver = Fake{std::move(machine)};
 	auto const opened = Devices::open(driver.driver());
-	return opened.has_value() && opened->memory_clock(device::Rank::One) == device::MemoryClock{.megahertz = 9501, .state = std::nullopt};
+	return opened.has_value() && opened->memory_clock(Card::One) == device::MemoryClock{.megahertz = 9501, .state = std::nullopt};
 }
 
 [[nodiscard]] auto only_running_out_of_memory_is_worth_retrying() -> bool {

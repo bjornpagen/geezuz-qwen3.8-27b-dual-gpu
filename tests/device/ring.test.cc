@@ -4,6 +4,7 @@ import engine.core;
 import engine.device;
 import engine.driver;
 import engine.driver_double;
+import engine.model;
 import engine.testing;
 
 namespace {
@@ -12,8 +13,8 @@ namespace device = engine::device;
 namespace fake = engine::driver_double;
 
 using device::Devices;
-using device::Rank;
 using device::Ticket;
+using engine::model::Card;
 using fake::Fake;
 using fake::Machine;
 using fake::Served;
@@ -83,7 +84,7 @@ using Ring = device::Ring<Work, Answer, capacity>;
 	if (!opened) {
 		return false;
 	}
-	auto ring = Ring::create(opened->context(Rank::Zero));
+	auto ring = Ring::create(opened->context(Card::Zero));
 	if (!ring) {
 		return false;
 	}
@@ -156,7 +157,7 @@ using Ring = device::Ring<Work, Answer, capacity>;
 	if (!opened) {
 		return false;
 	}
-	auto ring = device::Ring<Work, Answer, slots>::create(opened->context(Rank::One));
+	auto ring = device::Ring<Work, Answer, slots>::create(opened->context(Card::One));
 	if (!ring) {
 		return false;
 	}
@@ -206,7 +207,7 @@ using Ring = device::Ring<Work, Answer, capacity>;
 	}
 	auto holds = true;
 	{
-		auto const ring = Ring::create(opened->context(Rank::Zero));
+		auto const ring = Ring::create(opened->context(Card::Zero));
 		holds = ring.has_value() && ring->in_flight() == 0 && driver.live(fake::Kind::HostMemory) == 1;
 	}
 	return holds && driver.live(fake::Kind::HostMemory) == 0 && driver.violations().empty();

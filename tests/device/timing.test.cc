@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.model;
 import engine.testing;
 
 namespace {
@@ -11,7 +12,7 @@ namespace device = engine::device;
 namespace fake = engine::driver_double;
 
 using device::Devices;
-using device::Rank;
+using engine::model::Card;
 using fake::Fake;
 using fake::Machine;
 
@@ -24,7 +25,7 @@ constexpr auto step = 0.25F;
 	if (!opened) {
 		return false;
 	}
-	auto const& context = opened->context(Rank::Zero);
+	auto const& context = opened->context(Card::Zero);
 	auto const stream = context.create_stream();
 	auto staging = context.allocate_mapped<std::uint32_t, 256>();
 	auto array = context.allocate<std::uint32_t, 256>();
@@ -63,7 +64,7 @@ constexpr auto step = 0.25F;
 	if (!opened) {
 		return false;
 	}
-	auto const& context = opened->context(Rank::One);
+	auto const& context = opened->context(Card::One);
 	auto const stream = context.create_stream();
 	auto const start = context.create_timed_event();
 	auto const end = context.create_timed_event();

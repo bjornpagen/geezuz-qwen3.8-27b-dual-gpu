@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.model;
 import engine.testing;
 
 namespace {
@@ -11,7 +12,7 @@ namespace device = engine::device;
 namespace fake = engine::driver_double;
 
 using device::Devices;
-using device::Rank;
+using engine::model::Card;
 using fake::Fake;
 using fake::Kind;
 using fake::Machine;
@@ -34,7 +35,7 @@ using Owned = std::variant<OneGib, FourGib, EightGib>;
 	if (!opened) {
 		return false;
 	}
-	auto const& context = opened->context(Rank::Zero);
+	auto const& context = opened->context(Card::Zero);
 	auto const capacity = Machine{}.cards[0].memory_bytes;
 	auto random = engine::testing::generator(seed);
 	auto owned = std::vector<Owned>{};
@@ -86,10 +87,10 @@ using Owned = std::variant<OneGib, FourGib, EightGib>;
 	if (!opened) {
 		return false;
 	}
-	auto const first = opened->context(Rank::Zero).allocate<std::byte, 8 * gib>();
-	auto const second = opened->context(Rank::Zero).allocate<std::byte, 8 * gib>();
-	auto const third = opened->context(Rank::Zero).allocate<std::byte, 8 * gib>();
-	auto const elsewhere = opened->context(Rank::One).allocate<std::byte, 8 * gib>();
+	auto const first = opened->context(Card::Zero).allocate<std::byte, 8 * gib>();
+	auto const second = opened->context(Card::Zero).allocate<std::byte, 8 * gib>();
+	auto const third = opened->context(Card::Zero).allocate<std::byte, 8 * gib>();
+	auto const elsewhere = opened->context(Card::One).allocate<std::byte, 8 * gib>();
 	return first && second && !third && elsewhere && driver.live(Kind::DeviceMemory) == 3 && first->address() != second->address();
 }
 
@@ -107,7 +108,7 @@ struct Pair {
 	if (!opened) {
 		return false;
 	}
-	auto mapped = opened->context(Rank::One).allocate_mapped<Pair, 1000>();
+	auto mapped = opened->context(Card::One).allocate_mapped<Pair, 1000>();
 	return mapped.has_value() && mapped->device_address() != 0 &&
 	       std::ranges::all_of(mapped->host(),
 	                           [](Pair const& pair) {
@@ -126,7 +127,7 @@ struct Workspace {
 };
 
 [[nodiscard]] auto build(Devices devices) -> std::optional<Workspace> {
-	auto const& context = devices.context(Rank::One);
+	auto const& context = devices.context(Card::One);
 	auto partials = context.allocate<float, 4096>();
 	auto staging = context.allocate_mapped<Pair, 64>();
 	auto stream = context.create_stream();
@@ -167,7 +168,7 @@ struct Workspace {
 	auto machine = std::optional<Devices>{std::move(*opened)};
 	auto allocated = false;
 	{
-		auto const stray = machine->context(Rank::Zero).allocate<float, 16>();
+		auto const stray = machine->context(Card::Zero).allocate<float, 16>();
 		allocated = stray.has_value();
 		machine.reset();
 	}
@@ -182,9 +183,9 @@ struct Workspace {
 	if (!opened) {
 		return false;
 	}
-	auto const producer = opened->context(Rank::Zero).create_stream();
-	auto const consumer = opened->context(Rank::One).create_stream();
-	auto const done = opened->context(Rank::Zero).create_event();
+	auto const producer = opened->context(Card::Zero).create_stream();
+	auto const consumer = opened->context(Card::One).create_stream();
+	auto const done = opened->context(Card::Zero).create_event();
 	if (!producer || !consumer || !done) {
 		return false;
 	}

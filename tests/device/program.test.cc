@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.model;
 import engine.prims;
 import engine.ptx;
 import engine.testing;
@@ -13,7 +14,7 @@ namespace device = engine::device;
 namespace fake = engine::driver_double;
 
 using device::Devices;
-using device::Rank;
+using engine::model::Card;
 using fake::Fake;
 using fake::Kind;
 using fake::Machine;
@@ -132,7 +133,7 @@ template<class K>
 	if (!opened) {
 		return false;
 	}
-	auto const& context = opened->context(Rank::One);
+	auto const& context = opened->context(Card::One);
 	auto const program = context.load<Probe, Wide>();
 	auto const stream = context.create_stream();
 	if (!program || !stream) {
@@ -168,7 +169,7 @@ template<class K>
 	if (!opened) {
 		return false;
 	}
-	auto const program = opened->context(Rank::Zero).load<Probe>();
+	auto const program = opened->context(Card::Zero).load<Probe>();
 	return !program &&
 	       program.error() == device::DeviceError{.reason = device::ModuleRejected{.status = device::Status::InvalidPtx, .log = log}} &&
 	       driver.live(Kind::Module) == 0;
@@ -181,7 +182,7 @@ template<class K>
 	if (!opened) {
 		return false;
 	}
-	auto const program = opened->context(Rank::Zero).load<Probe>();
+	auto const program = opened->context(Card::Zero).load<Probe>();
 	if (program || !std::holds_alternative<device::ModuleRejected>(program.error().reason)) {
 		return false;
 	}
@@ -195,7 +196,7 @@ template<class K>
 	if (!opened) {
 		return false;
 	}
-	auto const program = opened->context(Rank::Zero).load<Probe, Absent>();
+	auto const program = opened->context(Card::Zero).load<Probe, Absent>();
 	return !program && program.error() == device::DeviceError{.reason = device::KernelMissing{.entry = "absent"}} &&
 	       driver.live(Kind::Module) == 0 && driver.violations().empty();
 }
@@ -206,8 +207,8 @@ template<class K>
 	if (!opened) {
 		return false;
 	}
-	auto const narrow = opened->context(Rank::Zero).load<Narrow>();
-	auto const pair = opened->context(Rank::Zero).load<Pair>();
+	auto const narrow = opened->context(Card::Zero).load<Narrow>();
+	auto const pair = opened->context(Card::Zero).load<Pair>();
 	return !narrow &&
 	       narrow.error() == device::DeviceError{.reason =
 	                                                 device::KernelSignature{
@@ -234,7 +235,7 @@ template<class K>
 		if (!opened) {
 			return {0, false};
 		}
-		auto const& context = opened->context(Rank::Zero);
+		auto const& context = opened->context(Card::Zero);
 		auto const program = context.load<Probe>();
 		auto const stream = context.create_stream();
 		if (!program || !stream) {

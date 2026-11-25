@@ -4,6 +4,7 @@
 import std;
 import engine.device;
 import engine.driver_double;
+import engine.model;
 
 auto main() -> int {
 	auto const driver = engine::driver_double::Fake{engine::driver_double::Machine{.pending_queries = 1'000}};
@@ -11,7 +12,7 @@ auto main() -> int {
 	if (!opened) {
 		return 0;
 	}
-	auto const& context = opened->context(engine::device::Rank::Zero);
+	auto const& context = opened->context(engine::model::Card::Zero);
 	auto staging = context.allocate_mapped<std::uint32_t, 64>();
 	auto array = context.allocate<std::uint32_t, 64>();
 	auto const stream = context.create_stream();

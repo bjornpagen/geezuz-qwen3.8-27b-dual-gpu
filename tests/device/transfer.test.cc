@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.model;
 import engine.file;
 import engine.hugepage;
 import engine.testing;
@@ -14,7 +15,7 @@ namespace fake = engine::driver_double;
 
 using device::Devices;
 using device::EventState;
-using device::Rank;
+using engine::model::Card;
 using fake::Fake;
 using fake::Kind;
 using fake::Machine;
@@ -44,8 +45,8 @@ template<class Destination, class Source>
 	}
 	auto random = engine::testing::generator(seed);
 	auto holds = true;
-	for (auto const rank : device::ranks) {
-		auto const& context = opened->context(rank);
+	for (auto const card : device::card_pair) {
+		auto const& context = opened->context(card);
 		auto staging = context.allocate_mapped<std::uint32_t, words>();
 		auto back = context.allocate_mapped<std::uint32_t, words>();
 		auto array = context.allocate<std::uint32_t, words>();
@@ -78,7 +79,7 @@ template<class Destination, class Source>
 	if (!opened) {
 		return false;
 	}
-	auto const& context = opened->context(Rank::One);
+	auto const& context = opened->context(Card::One);
 	auto region = engine::hugepage::Region::allocate(4096);
 	if (!region) {
 		return false;
@@ -116,8 +117,8 @@ template<class Destination, class Source>
 	if (!opened) {
 		return false;
 	}
-	auto const& zero = opened->context(Rank::Zero);
-	auto const& one = opened->context(Rank::One);
+	auto const& zero = opened->context(Card::Zero);
+	auto const& one = opened->context(Card::One);
 	auto staging = zero.allocate_mapped<std::uint32_t, words>();
 	auto back = one.allocate_mapped<std::uint32_t, words>();
 	auto source = zero.allocate<std::uint32_t, words>();
@@ -155,7 +156,7 @@ template<class Destination, class Source>
 	if (!opened) {
 		return false;
 	}
-	auto const& context = opened->context(Rank::Zero);
+	auto const& context = opened->context(Card::Zero);
 	auto staging = context.allocate_mapped<std::uint32_t, words>();
 	auto array = context.allocate<std::uint32_t, words>();
 	auto const stream = context.create_stream();
@@ -179,7 +180,7 @@ template<class Destination, class Source>
 		if (!opened) {
 			return {0, false};
 		}
-		auto const& context = opened->context(Rank::Zero);
+		auto const& context = opened->context(Card::Zero);
 		auto staging = context.allocate_mapped<std::uint32_t, words>();
 		auto array = context.allocate<std::uint32_t, words>();
 		auto const stream = context.create_stream();
