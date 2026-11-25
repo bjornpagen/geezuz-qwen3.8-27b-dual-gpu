@@ -22,7 +22,6 @@ import :sums;
 
 namespace engine::ref {
 
-namespace math = engine::device::prims::math;
 namespace model = engine::model;
 
 using model::Count;
@@ -50,7 +49,8 @@ export struct Sequence {
 	}
 };
 
-auto add_into(Rows<float>& residual, Rows<float> const& sum) -> void {
+/** The residual + a matmul's sum across the cards, element by element (`model::Sum::Weights`' last addition). */
+export auto add_into(Rows<float>& residual, Rows<float> const& sum) -> void {
 	for (auto const [into, add] : std::views::zip(residual.values, sum.values)) {
 		into = into + add;
 	}
@@ -127,17 +127,23 @@ template<Accumulation A>
 	return project<A>(checkpoint, model.pool(), plans.out, attended);
 }
 
+/** down_proj's input from gate_proj's and up_proj's outputs: `model::mlp_product`, rounded once (`Value::MlpProduct`). */
+export [[nodiscard]] auto mlp_products(Rows<float> const& gate, Rows<float> const& up) -> Rows<Bf16> {
+	core::invariant(gate.width == up.width && gate.values.size() == up.values.size());
+	auto product = Rows<Bf16>::zeros(gate.count(), gate.width);
+	for (auto const [into, g, u] : std::views::zip(product.values, gate.values, up.values)) {
+		into = round(model::mlp_product(g, u));
+	}
+	return product;
+}
+
 template<Accumulation A>
 auto feed_forward(Model& model, MlpPlans const& plans, Rows<float>& residual) -> void {
 	auto const& checkpoint = model.checkpoint();
 	auto const in = normed(residual, plans.post_norm);
 	auto const gate = project<A>(checkpoint, model.pool(), plans.gate, in);
 	auto const up = project<A>(checkpoint, model.pool(), plans.up, in);
-	auto product = Rows<Bf16>::zeros(in.count(), model::ffn);
-	for (auto const [into, g, u] : std::views::zip(product.values, gate.values, up.values)) {
-		into = round(math::silu(g) * u);
-	}
-	add_into(residual, project<A>(checkpoint, model.pool(), plans.down, product));
+	add_into(residual, project<A>(checkpoint, model.pool(), plans.down, mlp_products(gate, up)));
 }
 
 /** One decoder layer over `residual`: its mixer, reading and extending `state`, then its mlp. */

@@ -67,7 +67,7 @@ struct Float64 {
 		auto const group = Small::value_heads / Small::key_heads;
 		for (auto head = Count{0}; head < Small::value_heads; ++head) {
 			auto const kh = head / group;
-			auto const q = normalize(std::span{convolved}.subspan(kh * Small::key_dim, Small::key_dim), static_cast<double>(model::deltanet_query_scale));
+			auto const q = normalize(std::span{convolved}.subspan(kh * Small::key_dim, Small::key_dim), 1.0 / static_cast<double>(model::deltanet::query_divisor));
 			auto const k = normalize(std::span{convolved}.subspan(key_features + (kh * Small::key_dim), Small::key_dim), 1.0);
 			auto const v = std::span{convolved}.subspan((2 * key_features) + (head * Small::value_dim), Small::value_dim);
 			auto const beta = 1.0 / (1.0 + std::exp(-static_cast<double>(in.b[head])));

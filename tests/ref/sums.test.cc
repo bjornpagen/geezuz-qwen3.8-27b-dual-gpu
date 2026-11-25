@@ -73,7 +73,7 @@ using model::Count;
 			}
 			partials[lane] = partial;
 		}
-		auto const got = ref::lane_dot<128>(std::span<float const, 128>{x}, std::span<float const, 128>{y});
+		auto const got = ref::lane_dot<ref::lanes, 128>(std::span<float const, 128>{x}, std::span<float const, 128>{y});
 		if (std::bit_cast<std::uint32_t>(got) != std::bit_cast<std::uint32_t>(halving(partials))) {
 			return false;
 		}
@@ -111,7 +111,7 @@ using model::Count;
 			each = static_cast<float>(value);
 			want += value * value;
 		}
-		if (ref::lane_squares<256>(std::span<float const, 256>{x}) != static_cast<float>(want)) {
+		if (ref::lane_squares<ref::lanes, 256>(std::span<float const, 256>{x}) != static_cast<float>(want)) {
 			return false;
 		}
 	}
