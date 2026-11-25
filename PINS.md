@@ -217,13 +217,27 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
 - retire: when clang-tidy no longer crashes on the reproducer (the parse-once shape stays; the rule for other units
   goes)
 
-## clang-tidy-reserved-identifier-crash
+## clang-modules-noexcept-concept-profile
 
-- symptom: clang-tidy 23.1.5 crashes intermittently, only in parallel lint builds, inside `bugprone-reserved-identifier`
-  while deserializing a concept specialization from a module file (`StmtProfiler::VisitConceptSpecializationExpr`).
-  seen on `src/pipeline/pipeline.cc`, `facade.cc` and `seams.cc`; re-running the same command passes, so it cannot be
-  reproduced on demand.
-- decision: the compiler enforces the same rule deterministically on every build (`-Wreserved-identifier` in
-  `ENGINE_WARNINGS`, clean over the whole tree when added), so the dialect profile turns the tidy check off
-  (`.clang-tidy`). nothing is lost and the lint gate stays trustworthy.
-- retire: when clang-tidy no longer crashes there; the compiler warning stays either way.
+- symptom: clang 23.1.5 (clang++ and clang-tidy alike) intermittently dies (SIGSEGV/SIGBUS/abort) reading a BMI:
+  `ASTDeclReader::VisitImplicitConceptSpecializationDecl` reads a concept argument whose `SubstTemplateTypeParmType`
+  names a function template specialization typed `noexcept(<concept-id>)`; building that type profiles the same
+  concept specialization (`FunctionProtoType::Profile` -> `StmtProfiler::VisitConceptSpecializationExpr`) before its
+  arguments are written, so it reads uninitialized memory. the read happens on every compile of any unit that
+  deserializes stdexec's sender customization points; whether it crashes depends on the allocator's leftovers, so a
+  rerun passes (measured: 29/100 clang-tidy runs on `tests/pipeline/doubles.cc`, 1/60 clang++ on `engine.test.cc`).
+  not a race: every BMI has one producer and is read only through dyndep. upstream llvm/llvm-project#191361, fixed on
+  main by f970f59a9d4e (#224528); not in 23.1.5, 23.1.6 or release/23.x.
+- trigger: a `noexcept` operand that names a concept-id directly, on a template instantiated into a BMI. a
+  requires-clause, a constrained parameter, a non-concept noexcept expression, or a concept wrapped in a
+  `constexpr bool` variable template does not trigger it.
+- sites: none in the project; the pinned stdexec has 142 such operands, reached through `import stdexec`.
+- rule (AGENTS.md): no `noexcept` operand in project code names a concept directly.
+- reproducer: module `a` declares `template <class> concept C = true; template <class T> int fn() noexcept(C<T>);
+  export using t = decltype(fn<int>());` and a unit does `import a; t x;`. under lldb a breakpoint on
+  `StmtProfiler::VisitConceptSpecializationExpr` is hit while `VisitImplicitConceptSpecializationDecl` for the same
+  declaration is still on the stack. full reproducers and the oracle are described in the toolchain lane's report.
+- note: an earlier pin blamed `bugprone-reserved-identifier`; turning that check off did not stop the crashes. it stays
+  off because `-Wreserved-identifier` enforces the same rule on every build.
+- retire: when the pinned clang on both machines contains f970f59a (LLVM 24.1, or a 23.1.x carrying the backport) and
+  the breakpoint above is no longer hit; the rule goes with it.

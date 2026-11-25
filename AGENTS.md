@@ -588,6 +588,10 @@ Forbidden as dispatch: `enable_if`, SFINAE tricks, `void_t` detection, tag dispa
 registration, CRTP, inheritance. Type traits remain for representation facts. Specialization is not a substitute
 for a concept.
 
+A `noexcept` operand never names a concept directly (`noexcept(Concept<T>)`): clang 23 reads uninitialized memory when
+it deserializes such a type from a module and crashes at random (PIN(clang-modules-noexcept-concept-profile)). Use a
+requires-clause, a constrained parameter, or a `constexpr bool` variable template that wraps the concept.
+
 ## 19. No exact-type semantic dispatch
 
 `if constexpr (std::same_as<T, Foo>) ... else if constexpr (std::same_as<T, Bar>)` is forbidden for behaviour.
