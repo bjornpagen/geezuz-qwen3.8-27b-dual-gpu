@@ -86,6 +86,19 @@ public:
 		}
 	}
 
+	/**
+	 * Every live handle, in slot order: a lazy view over this table, valid while it lives and only while nothing is
+	 * inserted or released (its filter reads the table's state, which must hold still while it is iterated).
+	 */
+	[[nodiscard]] auto handles() const {
+		return std::views::iota(std::size_t{0}, Capacity) | std::views::filter([this](std::size_t index) {
+			       return slots_[index].value.has_value();
+		       }) |
+		       std::views::transform([this](std::size_t index) {
+			       return H{.bits = (slots_[index].generation << index_bits) | core::narrow<std::uint64_t>(index)};
+		       });
+	}
+
 	[[nodiscard]] auto live_count() const -> std::size_t {
 		return core::narrow<std::size_t>(std::ranges::count_if(slots_, [](Slot const& slot) {
 			return slot.value.has_value();

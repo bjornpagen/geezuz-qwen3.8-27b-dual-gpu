@@ -25,6 +25,20 @@ struct Model {
 	std::size_t retired;
 };
 
+/** `handles()` lists exactly the model's live handles, in slot order, each once. */
+template<class Table>
+[[nodiscard]] auto handles_match(Table const& table, Model const& model) -> bool {
+	auto listed = std::vector<std::uint64_t>{};
+	for (auto const handle : table.handles()) {
+		listed.push_back(handle.bits);
+	}
+	auto const index = [](std::uint64_t bits) {
+		return bits & ((std::uint64_t{1} << Table::index_bits) - 1);
+	};
+	auto const live = model.live | std::views::keys | std::ranges::to<std::set>();
+	return listed.size() == live.size() && std::ranges::to<std::set>(listed) == live && std::ranges::is_sorted(listed, std::less{}, index);
+}
+
 template<std::size_t Capacity, std::uint8_t GenerationBits>
 [[nodiscard]] auto agrees_with_model(std::uint64_t seed, std::size_t steps) -> bool {
 	using Table = engine::handle::Table<int, ProbeHandle, Capacity, GenerationBits>;
@@ -60,6 +74,7 @@ template<std::size_t Capacity, std::uint8_t GenerationBits>
 			holds = holds && found.has_value() && *found == value;
 		}
 		holds = holds && table->live_count() == model.live.size() && table->retired_count() == model.retired;
+		holds = holds && handles_match(*table, model);
 	}
 	return holds;
 }
