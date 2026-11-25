@@ -141,11 +141,8 @@ struct Refusal {
 	       reading->integer(body, {"usage", "total_tokens"}) == 17 && reading->real(body, {"temperature"}) == 1.0 &&
 	       reading->real(body, {"top_p"}) == 0.95 && reading->text(body, {"reasoning", "effort"}) == "xhigh" &&
 	       reading->boolean(body, {"store"}) == true && reading->text(body, {"metadata", "k"}) == "v" && submission.tag == "whole-1" &&
-	       conversation && submission.prompt == openai::Prompt{openai::Fresh{.conversation = *conversation}} &&
-	       submission.constraints == openai::Constraints{.tools = {},
-	                                                     .tool_choice = json::ToolChoiceMode::Auto,
-	                                                     .format = json::TextFormatMode::Text,
-	                                                     .thinking = chat::Thinking::Enabled} &&
+	       conversation && submission.prompt == openai::Prompt{openai::Fresh{.conversation = *conversation}} && submission.tools.empty() &&
+	       openai::thinking_of(submission.prompt) == chat::Thinking::Enabled &&
 	       submission.limit == sched::Limit{sched::UntilContextFull{}} && sample && sample->temperature() == 1.0 && sample->top_p() == 0.95;
 }
 
@@ -180,7 +177,7 @@ struct Refusal {
 	auto const low = sample(2);
 	auto const medium = sample(3);
 	return submissions.size() == 5 && none && none->temperature() == 0.7 && none->top_p() == 0.8 &&
-	       submissions[0].second.constraints.thinking == chat::Thinking::Disabled &&
+	       openai::thinking_of(submissions[0].second.prompt) == chat::Thinking::Disabled &&
 	       reading->real(answers[0].body, {"temperature"}) == 0.7 &&
 	       std::holds_alternative<engine::sampling::Greedy>(submissions[1].second.sampling) && low && low->top_p() == 0.5 &&
 	       submissions[2].second.limit == sched::Limit{sched::AtMost{.tokens = 9}} &&
@@ -455,6 +452,37 @@ auto set(Request& request, Member const& member) -> void {
 		 .status = 404,
 		 .code = "response_not_found",
 		 .param = "previous_response_id"},
+	    {.name = "a function schema keyword the grammar does not implement",
+		 .members = tools(
+	         R"([{"type":"function","name":"f","parameters":{"type":"object","properties":{"n":{"type":"integer","multipleOf":3}}},"strict":true}])",
+	         std::nullopt),
+		 .raw = {},
+		 .status = 400,
+		 .code = "schema_multiple_of",
+		 .param = "tools[0].parameters"},
+	    {.name = "a format schema keyword the grammar does not implement",
+		 .members =
+		     {{.name = "text",
+		       .value =
+		           R"({"format":{"type":"json_schema","name":"n","schema":{"type":"object","properties":{"n":{"type":"integer","multipleOf":3}}}}})"}},
+		 .raw = {},
+		 .status = 400,
+		 .code = "schema_multiple_of",
+		 .param = "text.format.schema"},
+	    {.name = "a custom tool's lark that does not parse",
+		 .members =
+		     tools(R"([{"type":"custom","name":"run","format":{"type":"grammar","syntax":"lark","definition":"start: ("}}])", std::nullopt),
+		 .raw = {},
+		 .status = 400,
+		 .code = "lark_syntax",
+		 .param = "tools"},
+	    {.name = "a custom tool's regex with lookaround",
+		 .members =
+		     tools(R"([{"type":"custom","name":"run","format":{"type":"grammar","syntax":"regex","definition":"(?=a)a"}}])", std::nullopt),
+		 .raw = {},
+		 .status = 400,
+		 .code = "regex_lookaround",
+		 .param = "tools[0].format"},
 	};
 }
 
@@ -514,6 +542,34 @@ auto set(Request& request, Member const& member) -> void {
 		}
 	}
 	return true;
+}
+
+/**
+ * A string bound the grammar's automata cannot hold is refused by name, before admission: `maxLength` 100 on a tool
+ * argument compiles, 1,000 grows one lexeme's automaton past its state bound; past the regex repetition bound it is too large outright.
+ */
+[[nodiscard]] auto string_bounds_are_refused_by_name() -> bool {
+	auto h = serving();
+	auto reading = Json::make();
+	if (!h || !reading) {
+		return false;
+	}
+	auto const with_length = [](std::size_t length) {
+		return std::format(
+		    R"({{"input":"hi","tools":[{{"type":"function","name":"f","strict":true,"parameters":{{"type":"object","properties":{{"s":{{"type":"string","maxLength":{}}}}}}}}}]}})",
+		    length);
+	};
+	h->service.engine().queue(Script{{openai::Accepted{}, stopped({1}, usage(1, 0, 1, 0))}});
+	auto const fits = ask(*h, create(with_length(100), ""));
+	auto const grows = ask(*h, create(with_length(1000), ""));
+	auto const huge = ask(*h, create(with_length(200'000), ""));
+	if (!fits || !grows || !huge) {
+		return false;
+	}
+	auto const grown = refusal_of(*reading, *grows);
+	auto const outright = refusal_of(*reading, *huge);
+	return fits->status == 200 && grown.status == 400 && grown.code == "automaton_too_large" && outright.status == 400 &&
+	       outright.code == "schema_too_large" && outright.param == "tools[0].parameters" && h->service.engine().submissions().size() == 1;
 }
 
 /** A tool whose definition outgrows one JSON fragment of the chat format is refused at the boundary, not rendered. */
@@ -1004,7 +1060,7 @@ auto call_run(std::vector<Seen>& out, std::int64_t index, std::string_view strea
 	return turns &&
 	       submission.prompt ==
 	           openai::Prompt{openai::Continued{.sequence = sequence, .turns = *turns, .options = chat::options_of(json::Effort::Low)}} &&
-	       submission.constraints.thinking == chat::Thinking::Enabled && submission.constraints.tools.size() == 1 &&
+	       openai::thinking_of(submission.prompt) == chat::Thinking::Enabled && submission.tools.size() == 1 &&
 	       reading->text(continued->body, {"previous_response_id"}) == *parent;
 }
 
@@ -1099,6 +1155,7 @@ auto main() -> int {
 		                      .holds = mutated_requests_are_refused_by_name(2)},
 	    engine::testing::Case{.name = "the efforts the template lacks are refused listing the four it has",
 		                      .holds = unserved_efforts_name_the_served_ones()},
+	    engine::testing::Case{.name = "string bounds past the grammar's automata are refused by name", .holds = string_bounds_are_refused_by_name()},
 	    engine::testing::Case{.name = "a tool too large for the chat format is refused at the boundary",
 		                      .holds = oversized_tools_are_refused()},
 	    engine::testing::Case{.name = "a stream is the sdk's events, in order, numbered from 0",

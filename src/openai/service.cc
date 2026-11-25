@@ -7,6 +7,7 @@ import engine.grammar;
 import engine.http;
 import engine.json;
 import engine.model;
+import engine.net;
 import engine.pipeline;
 import engine.store;
 import :boundary;
@@ -20,6 +21,22 @@ namespace engine::openai {
 
 /** The create route's body bounds: the decoder's document bound, padded so it reads the body in place. */
 export inline constexpr http::BodyBounds body_bounds{.bytes = json::request_bounds.document_bytes, .padding = json::padding};
+
+/**
+ * How long a client may take to send one whole request (up to the 16 MB a create body may be), and how long an idle
+ * keep-alive connection is kept. A response the engine is still working on has no deadline of its own.
+ */
+export inline constexpr auto read_timeout = std::chrono::milliseconds{60'000};
+
+/** How long a client may leave the server's pending output unread before it counts as gone and its request ends. */
+export inline constexpr auto write_timeout = std::chrono::milliseconds{30'000};
+
+/** The server's configuration: listening at `endpoint` with the service's timeouts, its request ids seeded by `sources`. */
+export template<Sources S>
+[[nodiscard]] auto server_config(net::Endpoint endpoint, S& sources) -> http::ServerConfig {
+	return http::ServerConfig{
+	    .endpoint = endpoint, .read_timeout = read_timeout, .write_timeout = write_timeout, .id_seed = sources.draw()};
+}
 
 /** The http server the service runs behind; the engine posts its updates through this server's poster. */
 export using Server = http::Server<Update, body_bounds>;
@@ -81,7 +98,7 @@ struct Live {
 	core::invariant(pipeline::outgrown(overran.fault));
 	auto const bound = overran.fault.fault == grammar::MatchFault::LexerTooLarge ? "its lexer's" : "a parser row's";
 	return ApiError{
-	    .code = Code::GrammarTooLarge,
+	    .code = Code::GrammarOverrun,
 	    .message = std::format("the request's grammar outgrew {} bound while the reply was decoded; the reply ended there", bound),
 	    .param = std::nullopt,
 	};
@@ -123,11 +140,11 @@ export template<Engine E, Sources S, Limits L>
 class BasicService {
 public:
 	[[nodiscard]] static auto open(E engine, S sources) -> core::Result<BasicService, json::ReadError> {
-		auto decoder = json::RequestDecoder::make();
-		if (!decoder) {
-			return std::unexpected(decoder.error());
+		auto gate = Gate::make();
+		if (!gate) {
+			return std::unexpected(gate.error());
 		}
-		return BasicService{std::move(engine), std::move(sources), *std::move(decoder)};
+		return BasicService{std::move(engine), std::move(sources), *std::move(gate)};
 	}
 
 	[[nodiscard]] auto serve(http::Exchange exchange, http::Request<body_bounds> request) -> http::Answer {
@@ -189,8 +206,8 @@ public:
 	}
 
 private:
-	BasicService(E engine, S sources, json::RequestDecoder decoder)
-	    : engine_{std::move(engine)}, sources_{std::move(sources)}, decoder_{std::move(decoder)}, started_{sources_.unix_seconds()} {
+	BasicService(E engine, S sources, Gate gate)
+	    : engine_{std::move(engine)}, sources_{std::move(sources)}, gate_{std::move(gate)}, started_{sources_.unix_seconds()} {
 		live_.reserve(http::max_connections);
 		orphans_.reserve(L.requests);
 	}
@@ -205,13 +222,7 @@ private:
 			});
 		}
 		auto const& body = route.body;
-		auto decoded = decoder_.decode(json::PaddedView::over(body.padded(), body.length()));
-		if (!decoded) {
-			return error_response(refusal(decoded.error()));
-		}
-		auto admitted = admit(*std::move(decoded), id.text(), sources_, [this](store::ResponseId stored) {
-			return store_.find(stored);
-		});
+		auto admitted = gate_.admit_padded(json::PaddedView::over(body.padded(), body.length()), id.text(), sources_, store_);
 		if (!admitted) {
 			return error_response(admitted.error());
 		}
@@ -382,25 +393,12 @@ private:
 	}
 
 	[[nodiscard]] auto steps(Live& live, Output const& output) -> std::vector<Step> {
-		if (auto const reasoning = core::alternative<Reasoning>(output)) {
-			return live.assembly.text(Text::Reasoning, reasoning->text, sources_);
+		auto made = live.assembly.take(output, sources_);
+		if (auto const finished = core::alternative<Finished>(output)) {
+			live.producer = Producer::Done;
+			keep(live, finished->ending);
 		}
-		if (auto const content = core::alternative<Content>(output)) {
-			return live.assembly.text(Text::Answer, content->text, sources_);
-		}
-		if (auto const begin = core::alternative<CallBegin>(output)) {
-			return live.assembly.begin(*begin, sources_);
-		}
-		if (auto const end = core::alternative<CallEnd>(output)) {
-			return live.assembly.end(*end);
-		}
-		// After its verdict a request's outputs are its reply's, then its finish.
-		auto const finished = core::alternative<Finished>(output);
-		core::invariant(finished.has_value());
-		live.producer = Producer::Done;
-		auto finishing = live.assembly.finish(*finished, sources_.unix_seconds());
-		keep(live, finished->ending);
-		return finishing;
+		return made;
 	}
 
 	/** Stores a finished response that asked to be stored, with its input items and the exact sequence it leaves. */
@@ -520,7 +518,7 @@ private:
 
 	E engine_;
 	S sources_;
-	json::RequestDecoder decoder_;
+	Gate gate_;
 	store::BasicStore<L.store> store_;
 	std::int64_t started_;
 	Readiness readiness_ = Loading{};

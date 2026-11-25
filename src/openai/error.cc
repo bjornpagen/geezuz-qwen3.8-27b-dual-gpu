@@ -3,8 +3,10 @@ export module engine.openai:error;
 
 import std;
 import engine.core;
+import engine.grammar;
 import engine.http;
 import engine.json;
+import engine.regex;
 
 namespace engine::openai {
 
@@ -43,10 +45,12 @@ export enum class Code : std::uint8_t {
 	ResponseNotFound,
 	PreviousResponseIncomplete,
 	PreviousResponseMismatch,
+	/** A continuation asked of a caller that keeps no stored responses (the cli). */
+	PreviousResponseUnavailable,
 	/** The rendered prompt and the requested output do not fit the context. */
 	ContextLengthExceeded,
 	/** The request's grammar outgrew the engine's bounds while the reply was decoded; the reply ended there. */
-	GrammarTooLarge,
+	GrammarOverrun,
 	/** The engine is still loading; the same request succeeds once it serves. */
 	EngineLoading,
 	/** The engine failed and serves nothing more; a restart is the operator's call. */
@@ -115,10 +119,12 @@ export [[nodiscard]] constexpr auto spelling(Code code) -> std::string_view {
 		return "previous_response_incomplete";
 	case Code::PreviousResponseMismatch:
 		return "previous_response_mismatch";
+	case Code::PreviousResponseUnavailable:
+		return "previous_response_unavailable";
 	case Code::ContextLengthExceeded:
 		return "context_length_exceeded";
-	case Code::GrammarTooLarge:
-		return "grammar_too_large";
+	case Code::GrammarOverrun:
+		return "grammar_overrun";
 	case Code::EngineLoading:
 		return "engine_loading";
 	case Code::EngineFailed:
@@ -172,19 +178,13 @@ export [[nodiscard]] constexpr auto status_of(Code code) -> http::StatusCode {
 	case Code::NoUserQuery:
 	case Code::PreviousResponseIncomplete:
 	case Code::PreviousResponseMismatch:
+	case Code::PreviousResponseUnavailable:
 	case Code::ContextLengthExceeded:
-	case Code::GrammarTooLarge:
+	case Code::GrammarOverrun:
 	case Code::StreamBacklog:
 		return http::StatusCode::BadRequest;
 	}
 	std::unreachable();
-}
-
-/** OpenAI's error `type`: the client's fault, or the server's. */
-[[nodiscard]] constexpr auto type_of(Code code) -> std::string_view {
-	auto const status = status_of(code);
-	return status == http::StatusCode::ServiceUnavailable || status == http::StatusCode::InternalServerError ? "server_error"
-	                                                                                                         : "invalid_request_error";
 }
 
 /** Whether the same request, sent again unchanged, could be served: only when the server was short or not yet up. */
@@ -219,8 +219,9 @@ export [[nodiscard]] constexpr auto retry_of(Code code) -> core::Retry {
 	case Code::ResponseNotFound:
 	case Code::PreviousResponseIncomplete:
 	case Code::PreviousResponseMismatch:
+	case Code::PreviousResponseUnavailable:
 	case Code::ContextLengthExceeded:
-	case Code::GrammarTooLarge:
+	case Code::GrammarOverrun:
 	case Code::EngineFailed:
 	case Code::ServerError:
 	case Code::ResponseTooLarge:
@@ -230,14 +231,171 @@ export [[nodiscard]] constexpr auto retry_of(Code code) -> core::Retry {
 	std::unreachable();
 }
 
+/** A grammar the request's tools or format compile to, refused: each case its own code. */
+export [[nodiscard]] constexpr auto spelling(grammar::Refusal refusal) -> std::string_view {
+	switch (refusal) {
+	case grammar::Refusal::SchemaShape:
+		return "schema_shape";
+	case grammar::Refusal::SchemaKeyword:
+		return "schema_keyword";
+	case grammar::Refusal::SchemaValue:
+		return "schema_value";
+	case grammar::Refusal::SchemaType:
+		return "schema_type";
+	case grammar::Refusal::SchemaReference:
+		return "schema_reference";
+	case grammar::Refusal::SchemaFormat:
+		return "schema_format";
+	case grammar::Refusal::SchemaOneOf:
+		return "schema_one_of";
+	case grammar::Refusal::SchemaMultipleOf:
+		return "schema_multiple_of";
+	case grammar::Refusal::SchemaBound:
+		return "schema_bound";
+	case grammar::Refusal::Empty:
+		return "grammar_empty";
+	case grammar::Refusal::SchemaOpenArgument:
+		return "schema_open_argument";
+	case grammar::Refusal::SchemaStringUnion:
+		return "schema_string_union";
+	case grammar::Refusal::SchemaRecursiveArgument:
+		return "schema_recursive_argument";
+	case grammar::Refusal::ToolParameters:
+		return "tool_parameters";
+	case grammar::Refusal::ToolName:
+		return "tool_name";
+	case grammar::Refusal::ToolDuplicate:
+		return "tool_duplicate";
+	case grammar::Refusal::ToolUnknown:
+		return "tool_unknown";
+	case grammar::Refusal::LarkSyntax:
+		return "lark_syntax";
+	case grammar::Refusal::LarkUndefined:
+		return "lark_undefined";
+	case grammar::Refusal::LarkRecursiveTerminal:
+		return "lark_recursive_terminal";
+	case grammar::Refusal::LarkNoStart:
+		return "lark_no_start";
+	case grammar::Refusal::LarkPriority:
+		return "lark_priority";
+	case grammar::Refusal::LarkTemplate:
+		return "lark_template";
+	case grammar::Refusal::LarkDirective:
+		return "lark_directive";
+	case grammar::Refusal::LarkToken:
+		return "lark_token";
+	case grammar::Refusal::LarkOption:
+		return "lark_option";
+	case grammar::Refusal::LarkOperator:
+		return "lark_operator";
+	case grammar::Refusal::Regex:
+		return "regex";
+	case grammar::Refusal::SchemaTooLarge:
+		return "schema_too_large";
+	case grammar::Refusal::SchemaTooMany:
+		return "schema_too_many";
+	case grammar::Refusal::LarkTooLarge:
+		return "lark_too_large";
+	case grammar::Refusal::AutomatonTooLarge:
+		return "automaton_too_large";
+	case grammar::Refusal::GrammarTooLarge:
+		return "grammar_too_large";
+	}
+	std::unreachable();
+}
+
+/** A custom tool's regular expression, refused: each fault its own code. */
+export [[nodiscard]] constexpr auto spelling(regex::Fault fault) -> std::string_view {
+	switch (fault) {
+	case regex::Fault::UnexpectedEnd:
+		return "regex_unexpected_end";
+	case regex::Fault::UnbalancedGroup:
+		return "regex_unbalanced_group";
+	case regex::Fault::NothingToRepeat:
+		return "regex_nothing_to_repeat";
+	case regex::Fault::BadRepetition:
+		return "regex_bad_repetition";
+	case regex::Fault::RepetitionTooLarge:
+		return "regex_repetition_too_large";
+	case regex::Fault::BadEscape:
+		return "regex_bad_escape";
+	case regex::Fault::BadClass:
+		return "regex_bad_class";
+	case regex::Fault::BadCharacter:
+		return "regex_bad_character";
+	case regex::Fault::TooDeep:
+		return "regex_too_deep";
+	case regex::Fault::TooLarge:
+		return "regex_too_large";
+	case regex::Fault::Lookaround:
+		return "regex_lookaround";
+	case regex::Fault::LazyQuantifier:
+		return "regex_lazy_quantifier";
+	case regex::Fault::Anchor:
+		return "regex_anchor";
+	case regex::Fault::WordBoundary:
+		return "regex_word_boundary";
+	case regex::Fault::Backreference:
+		return "regex_backreference";
+	case regex::Fault::UnicodeProperty:
+		return "regex_unicode_property";
+	case regex::Fault::UnicodeCase:
+		return "regex_unicode_case";
+	case regex::Fault::ClassSyntax:
+		return "regex_class_syntax";
+	case regex::Fault::GroupSyntax:
+		return "regex_group_syntax";
+	}
+	std::unreachable();
+}
+
+/** A grammar refusal is the request as written: a 400, refused again if sent again. */
+[[nodiscard]] constexpr auto status_of(grammar::Refusal /*refusal*/) -> http::StatusCode {
+	return http::StatusCode::BadRequest;
+}
+
+[[nodiscard]] constexpr auto status_of(regex::Fault /*fault*/) -> http::StatusCode {
+	return http::StatusCode::BadRequest;
+}
+
+/**
+ * A refusal's stable `code`: the api's own, or one per grammar refusal and per regular expression fault, so a client
+ * can tell every condition apart.
+ */
+export using ErrorCode = std::variant<Code, grammar::Refusal, regex::Fault>;
+
+export [[nodiscard]] constexpr auto spelling(ErrorCode const& code) -> std::string_view {
+	return std::visit(
+	    [](auto chosen) {
+		    return spelling(chosen);
+	    },
+	    code);
+}
+
+export [[nodiscard]] constexpr auto status_of(ErrorCode const& code) -> http::StatusCode {
+	return std::visit(
+	    [](auto chosen) {
+		    return status_of(chosen);
+	    },
+	    code);
+}
+
+[[nodiscard]] constexpr auto type_of(ErrorCode const& code) -> std::string_view {
+	auto const status = status_of(code);
+	return status == http::StatusCode::ServiceUnavailable || status == http::StatusCode::InternalServerError ? "server_error"
+	                                                                                                         : "invalid_request_error";
+}
+
 /** A refusal: its code, a sentence a person reads, and the request member at fault in OpenAI's `param` spelling. */
 export struct [[nodiscard]] ApiError {
-	Code code;
+	ErrorCode code;
 	std::string message;
 	std::optional<std::string> param;
 
 	[[nodiscard]] constexpr auto retry() const -> core::Retry {
-		return retry_of(code);
+		// A grammar or regex refusal is of the request as written; the api's own codes say for themselves.
+		auto const own = core::alternative<Code>(code);
+		return own ? retry_of(*own) : core::Retry::Permanent;
 	}
 
 	[[nodiscard]] auto operator==(ApiError const&) const -> bool = default;

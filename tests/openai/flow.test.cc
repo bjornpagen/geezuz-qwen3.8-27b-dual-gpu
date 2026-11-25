@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import std;
 import engine.core;
+import engine.grammar;
 import engine.http;
 import engine.http_test_client;
 import engine.json;
@@ -408,6 +409,36 @@ enum class Departure : std::uint8_t {
 	return h->service.engine().cancellations().size() == 1 && h->service.engine().cancellations().front() == *exchange;
 }
 
+/**
+ * A request whose grammar outgrew its bounds while it decoded ends there by name: a whole response is refused 400
+ * `grammar_overrun`, a stream ends with that `error` event after what it said; neither is stored, nothing is cancelled.
+ */
+[[nodiscard]] auto an_overrun_grammar_ends_its_request() -> bool {
+	auto h = serving<small>(quick, Cancels::Answered);
+	auto reading = Json::make();
+	auto whole_peer = h ? client::connect(h->server.port()) : std::nullopt;
+	auto stream_peer = h ? client::connect(h->server.port()) : std::nullopt;
+	if (!reading || !whole_peer || !stream_peer) {
+		return false;
+	}
+	auto const fault = openai::Overran{.fault = engine::grammar::MatchError{.fault = engine::grammar::MatchFault::LexerTooLarge}};
+	auto const whole = submitted(*h, *whole_peer, hello);
+	auto const stream = submitted(*h, *stream_peer, hello_streamed);
+	if (!whole || !stream || !h->service.engine().post(*whole, {openai::Accepted{}, openai::Content{.text = "so far"}, fault}) ||
+	    !h->service.engine().post(*stream, {openai::Accepted{}, openai::Content{.text = "so far"}, fault})) {
+		return false;
+	}
+	auto const refused = h->ask(*whole_peer, "");
+	auto const streamed = h->ask(*stream_peer, "");
+	if (!refused || !streamed) {
+		return false;
+	}
+	auto const events = engine::http_test_client::decode_events(streamed->body);
+	return refused->status == 400 && code_of(*reading, *refused) == "grammar_overrun" && content_of(*reading, events) == "so far" &&
+	       reading->text(events.back(), {"type"}) == "error" && reading->text(events.back(), {"code"}) == "grammar_overrun" &&
+	       h->service.engine().cancellations().empty();
+}
+
 /** A whole response that outgrows one body is cancelled in the engine and answered 500 `response_too_large`. */
 [[nodiscard]] auto an_outgrown_whole_response_is_refused() -> bool {
 	auto h = serving<small>(quick, Cancels::Answered);
@@ -449,6 +480,8 @@ auto main() -> int {
 		                      .holds = a_departing_client_cancels_its_request(Departure::WhileGathering)},
 	    engine::testing::Case{.name = "a client leaving before acceptance cancels its request",
 		                      .holds = a_departing_client_cancels_its_request(Departure::BeforeAcceptance)},
+	    engine::testing::Case{.name = "a grammar that outgrew its bounds ends its request by name",
+		                      .holds = an_overrun_grammar_ends_its_request()},
 	    engine::testing::Case{.name = "a whole response that outgrows one body is refused 500",
 		                      .holds = an_outgrown_whole_response_is_refused()},
 	};

@@ -4,6 +4,7 @@ export module engine.openai:validate;
 import std;
 import engine.chat;
 import engine.core;
+import engine.grammar;
 import engine.json;
 import engine.model;
 import engine.sampling;
@@ -11,6 +12,7 @@ import engine.sched;
 import engine.store;
 import :boundary;
 import :error;
+import :compile;
 
 /**
  * A decoded request checked whole, once, at the boundary: what the decoder's shapes cannot say (the served model,
@@ -218,14 +220,47 @@ struct InputPrefix {
 	}
 };
 
+/** Where a continuation's stored response comes from: a store of the server's, read by id. */
+export template<class L>
+concept Lookup = requires(L& lookup, store::ResponseId id) {
+	{ lookup.find(id) } -> std::same_as<std::optional<store::Stored const&>>;
+};
+
+/** A caller that keeps no stored responses (the cli): a continuation is refused by name, never looked up. */
+export struct Storeless {
+	[[nodiscard]] constexpr auto operator==(Storeless const&) const -> bool = default;
+};
+
+/** The prompt a request continues from, through a store: the stored response its id names, if it is kept. */
+template<Lookup L>
+[[nodiscard]] auto prompt_of(json::CreateRequest const& request, L& store) -> core::Result<Prompt, ApiError> {
+	if (!request.previous_response_id) {
+		return fresh(request);
+	}
+	auto const id = store::ResponseId::parse(*request.previous_response_id);
+	return continued(request, id ? store.find(*id) : std::nullopt);
+}
+
+[[nodiscard]] inline auto prompt_of(json::CreateRequest const& request, Storeless /*storeless*/) -> core::Result<Prompt, ApiError> {
+	if (!request.previous_response_id) {
+		return fresh(request);
+	}
+	return refuse(Code::PreviousResponseUnavailable, "this caller keeps no stored responses to continue", "previous_response_id");
+}
+
+/** Where a continuation may come from: a store, or none at all. */
+export template<class P>
+concept Previous = requires(P& previous, json::CreateRequest const& request) {
+	{ prompt_of(request, previous) } -> std::same_as<core::Result<Prompt, ApiError>>;
+};
+
 /**
- * Checks a decoded request in the api's order (model, tools, tool choice, budget, sampling, then the chat or the
- * continuation) and admits it, or refuses it with the first fault. `previous` finds a stored response by id.
+ * Checks a decoded request in the api's order (model, tools, tool choice, the output grammar, budget, sampling, then
+ * the chat or the continuation) and admits it, or refuses it with the first fault. The grammar is compiled here, so a
+ * feature it does not implement is refused before the engine sees the request.
  */
-export template<Sources S, class Find>
-    requires std::invocable<Find&, store::ResponseId> &&
-	         std::same_as<std::invoke_result_t<Find&, store::ResponseId>, std::optional<store::Stored const&>>
-[[nodiscard]] auto admit(json::CreateRequest request, std::string_view tag, S& sources, Find previous) -> core::Result<Admitted, ApiError> {
+export template<Sources S, Previous P>
+[[nodiscard]] auto admit(json::CreateRequest request, std::string_view tag, S& sources, P& previous) -> core::Result<Admitted, ApiError> {
 	if (request.model && *request.model != model_id) {
 		return refuse(Code::ModelNotFound, std::format("the model '{}' does not exist; this server serves '{}'", *request.model, model_id),
 		              "model");
@@ -236,6 +271,10 @@ export template<Sources S, class Find>
 	if (auto const choice = check_choice(request.tool_choice, request.tools); !choice) {
 		return std::unexpected(choice.error());
 	}
+	auto compiled = compile_output(output_request(request.tools, request.tool_choice, request.format, request.effort));
+	if (!compiled) {
+		return std::unexpected(compiled.error());
+	}
 	auto const limit = limit_of(request.max_output_tokens);
 	if (!limit) {
 		return std::unexpected(limit.error());
@@ -244,13 +283,7 @@ export template<Sources S, class Find>
 	if (!sampled) {
 		return std::unexpected(sampled.error());
 	}
-	auto prompt = [&] -> core::Result<Prompt, ApiError> {
-		if (!request.previous_response_id) {
-			return fresh(request);
-		}
-		auto const id = store::ResponseId::parse(*request.previous_response_id);
-		return continued(request, id ? previous(*id) : std::nullopt);
-	}();
+	auto prompt = prompt_of(request, previous);
 	if (!prompt) {
 		return std::unexpected(prompt.error());
 	}
@@ -286,13 +319,8 @@ export template<Sources S, class Find>
 	        Submission{
 	            .tag = std::string{tag},
 	            .prompt = *std::move(prompt),
-	            .constraints =
-	                Constraints{
-	                    .tools = std::move(request.tools),
-	                    .tool_choice = std::move(request.tool_choice),
-	                    .format = std::move(request.format),
-	                    .thinking = chat::options_of(request.effort).thinking,
-	                },
+	            .grammar = *std::move(compiled),
+	            .tools = std::move(request.tools),
 	            .sampling = *sampled,
 	            .limit = *limit,
 	        },
@@ -300,6 +328,74 @@ export template<Sources S, class Find>
 	    .input = std::move(input),
 	    .delivery = request.delivery,
 	};
+}
+
+/**
+ * The boundary as a value: the request decoder and the admission after it, the one path from a create body to a
+ * validated submission, for the server and the cli alike. It owns the decoder's readers, allocated once.
+ */
+export class Gate {
+public:
+	[[nodiscard]] static auto make() -> core::Result<Gate, json::ReadError> {
+		auto decoder = json::RequestDecoder::make();
+		if (!decoder) {
+			return std::unexpected(decoder.error());
+		}
+		return Gate{*std::move(decoder)};
+	}
+
+	/** A create body whose storage extends `json::padding` bytes past its end, read in place, admitted. */
+	template<Sources S, Previous P>
+	[[nodiscard]] auto admit_padded(json::PaddedView body, std::string_view tag, S& sources, P& previous)
+	    -> core::Result<Admitted, ApiError> {
+		auto decoded = decoder_.decode(body);
+		if (!decoded) {
+			return std::unexpected(refusal(decoded.error()));
+		}
+		return admit(*std::move(decoded), tag, sources, previous);
+	}
+
+	/** A create body, copied into the decoder's padded buffer, admitted. */
+	template<Sources S, Previous P>
+	[[nodiscard]] auto admit_text(std::string_view body, std::string_view tag, S& sources, P& previous)
+	    -> core::Result<Admitted, ApiError> {
+		auto decoded = decoder_.decode_copy(body);
+		if (!decoded) {
+			return std::unexpected(refusal(decoded.error()));
+		}
+		return admit(*std::move(decoded), tag, sources, previous);
+	}
+
+private:
+	explicit Gate(json::RequestDecoder decoder) : decoder_{std::move(decoder)} {}
+
+	json::RequestDecoder decoder_;
+};
+
+/**
+ * Plain text as a request: one user message with every default the api gives an absent member (thinking at `xhigh`,
+ * no tools, free text, the context as the budget), answered whole and not stored. The text must be utf-8.
+ */
+export template<Sources S>
+[[nodiscard]] auto say(std::string text, std::string_view tag, S& sources) -> core::Result<Admitted, ApiError> {
+	auto request = json::CreateRequest{
+	    .model = std::nullopt,
+	    .input = {json::MessageItem{.role = json::Role::User, .text = std::move(text)}},
+	    .instructions = std::nullopt,
+	    .tools = {},
+	    .tool_choice = json::ToolChoiceMode::Auto,
+	    .format = json::TextFormatMode::Text,
+	    .effort = json::Effort::XHigh,
+	    .max_output_tokens = std::nullopt,
+	    .temperature = std::nullopt,
+	    .top_p = std::nullopt,
+	    .delivery = json::Delivery::Whole,
+	    .storage = json::Storage::Unstored,
+	    .previous_response_id = std::nullopt,
+	    .metadata = {},
+	};
+	auto storeless = Storeless{};
+	return admit(std::move(request), tag, sources, storeless);
 }
 
 }

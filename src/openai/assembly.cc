@@ -15,41 +15,41 @@ import :boundary;
 namespace engine::openai {
 
 /** `response.output_item.added` for the item at `index`. */
-struct Added {
+export struct Added {
 	std::uint32_t index;
 };
 
 /** `response.content_part.added` for the text item at `index`. */
-struct PartOpened {
+export struct PartOpened {
 	std::uint32_t index;
 };
 
 /** More text of the item at `index`: its text, its arguments or its input. */
-struct Delta {
+export struct Delta {
 	std::uint32_t index;
 	std::string text;
 };
 
 /** The `.done` event of the item's text. */
-struct TextClosed {
+export struct TextClosed {
 	std::uint32_t index;
 };
 
 /** `response.content_part.done` for the text item at `index`. */
-struct PartClosed {
+export struct PartClosed {
 	std::uint32_t index;
 };
 
 /** `response.output_item.done` for the item at `index`. */
-struct Done {
+export struct Done {
 	std::uint32_t index;
 };
 
 /** What a stream says, in order, as a response grows. */
-using Step = std::variant<Added, PartOpened, Delta, TextClosed, PartClosed, Done>;
+export using Step = std::variant<Added, PartOpened, Delta, TextClosed, PartClosed, Done>;
 
 /** The two kinds of text a reply writes outside its calls. */
-enum class Text : std::uint8_t {
+export enum class Text : std::uint8_t {
 	Reasoning,
 	Answer,
 };
@@ -106,9 +106,32 @@ struct Settle {
 };
 
 /** One response under construction. */
-class Assembly {
+export class Assembly {
 public:
 	explicit Assembly(json::Response response) : response_{std::move(response)} {}
+
+	/**
+	 * One output of an accepted reply (its texts, its calls, its finish), and the steps a stream announces it by.
+	 * `sources` names new items and stamps the finish. The verdicts and the other terminal answers are the caller's.
+	 */
+	template<Sources S>
+	[[nodiscard]] auto take(Output const& output, S& sources) -> std::vector<Step> {
+		if (auto const reasoning = core::alternative<Reasoning>(output)) {
+			return text(Text::Reasoning, reasoning->text, sources);
+		}
+		if (auto const content = core::alternative<Content>(output)) {
+			return text(Text::Answer, content->text, sources);
+		}
+		if (auto const opened = core::alternative<CallBegin>(output)) {
+			return begin(*opened, sources);
+		}
+		if (auto const closed = core::alternative<CallEnd>(output)) {
+			return end(*closed);
+		}
+		// After its verdict, an accepted request's reply says only its texts and calls, then its finish.
+		core::invariant(std::holds_alternative<Finished>(output));
+		return finish(std::get<Finished>(output), sources.unix_seconds());
+	}
 
 	/** More text of `kind`: it extends the open item of its kind, or closes the open item and opens its own. */
 	template<Sources S>

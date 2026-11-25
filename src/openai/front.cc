@@ -132,15 +132,6 @@ private:
 	std::optional<Callee> open_;
 };
 
-/**
- * What starts a request's grammar: its constraints, compiled, to a parser state. The engine's grammar plugs in here;
- * the request's constraints were checked against it at the boundary, so starting one does not fail.
- */
-export template<class P>
-concept Grammars = std::movable<P> && requires(P& grammars, Constraints const& constraints) {
-	{ grammars.start(constraints) } -> pipeline::GrammarState;
-};
-
 /** A submission's prompt as the engine runs it, and where its blocks begin. */
 struct RenderedPrompt {
 	std::vector<tokenizer::Id> prompt;
@@ -158,25 +149,25 @@ struct RenderedPrompt {
 
 /**
  * The api's adapter in front of the engine, for `pipeline::BasicPipeline`: it renders each submission with the chat
- * format (a continuation as its stored sequence and the new turns after it), starts its grammar with `P`, and answers
- * it with a `Reply`. It runs on the engine's thread only.
+ * format (a continuation as its stored sequence and the new turns after it), starts the matcher of its compiled grammar,
+ * and answers it with a `Reply`. It runs on the engine's thread only; the matcher reads the engine's vocabulary, which
+ * the pipeline owns and lends it on each call.
  */
-export template<Grammars P>
-class Front {
+export class Front {
 public:
 	using Submission = openai::Submission;
 	using Output = openai::Output;
 	using Update = openai::Update;
 	using Tag = std::string;
-	using Grammar = decltype(std::declval<P&>().start(std::declval<Constraints const&>()));
+	using Grammar = grammar::Matcher;
 	using Reply = openai::Reply;
 
-	[[nodiscard]] static auto make(P grammars) -> core::Result<Front, json::ReadError> {
+	[[nodiscard]] static auto make() -> core::Result<Front, json::ReadError> {
 		auto renderer = chat::Renderer::make();
 		if (!renderer) {
 			return std::unexpected(renderer.error());
 		}
-		return Front{std::move(grammars), *std::move(renderer)};
+		return Front{*std::move(renderer)};
 	}
 
 	[[nodiscard]] auto prepare(tokenizer::Tokenizer const& tokenizer, Submission submission) -> pipeline::Prepared<Tag, Grammar, Reply> {
@@ -191,15 +182,16 @@ public:
 		    .sampling = submission.sampling,
 		    .limit = submission.limit,
 		};
-		auto const& constraints = submission.constraints;
-		auto parser = chat::Parser::make(constraints.tools, constraints.thinking);
+		auto const thinking = thinking_of(submission.prompt);
+		auto parser = chat::Parser::make(submission.tools, thinking);
 		// Every tool's definition fits one fragment's bounds, which the boundary checked, so its schema reads back.
 		core::invariant(parser.has_value());
 		return pipeline::Prepared<Tag, Grammar, Reply>{
 		    .tag = std::move(submission.tag),
 		    .request = std::move(request),
-		    .grammar = grammars_.start(constraints),
-		    .reply = Reply{*std::move(parser), constraints.tools, constraints.thinking},
+		    // The grammar compiled at the boundary, so a matcher over it starts without a fault of its own.
+		    .grammar = grammar::Matcher::make(std::move(submission.grammar), grammar::engine_layout),
+		    .reply = Reply{*std::move(parser), submission.tools, thinking},
 		};
 	}
 
@@ -246,7 +238,7 @@ public:
 	}
 
 private:
-	Front(P grammars, chat::Renderer renderer) : grammars_{std::move(grammars)}, renderer_{std::move(renderer)} {}
+	explicit Front(chat::Renderer renderer) : renderer_{std::move(renderer)} {}
 
 	[[nodiscard]] auto render(tokenizer::Tokenizer const& tokenizer, Fresh const& fresh) -> RenderedPrompt {
 		auto prompt = renderer_.render(tokenizer, fresh.conversation);
@@ -271,7 +263,6 @@ private:
 		};
 	}
 
-	P grammars_;
 	chat::Renderer renderer_;
 };
 

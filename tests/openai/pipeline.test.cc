@@ -52,22 +52,9 @@ constexpr auto roomy =
     kv::Geometry{.block_tokens = 4, .pool_blocks = 400, .table_blocks = 96, .snapshot_blocks = 2, .snapshot_capacity = 24};
 constexpr auto tuning = sched::Tuning{.chunk_tokens = 16, .share = {.numerator = 1, .denominator = 4}};
 
-/**
- * The pipeline's scripted grammar double for every request, which the cards double checks each mask against; with
- * `overrun_at`, every request's grammar outgrows its bounds after that many tokens.
- */
-struct ScriptedGrammars {
-	doubles::Everything everything;
-	std::optional<std::size_t> overrun_at;
-
-	[[nodiscard]] auto start(openai::Constraints const& /*constraints*/) const -> doubles::GrammarDouble {
-		return doubles::GrammarDouble{everything, overrun_at};
-	}
-};
-
-using Front = openai::Front<ScriptedGrammars>;
-using Cards = doubles::CardsDouble<roomy, doubles::Rules::Scripted>;
-using Pipeline = pipeline::BasicPipeline<roomy, model::RowBudget::ThreeTiles, tuning, Cards, Front>;
+// Every request decodes under its real compiled grammar; the cards double checks each committed token against its mask.
+using Cards = doubles::CardsDouble<roomy, doubles::Rules::Compiled>;
+using Pipeline = pipeline::BasicPipeline<roomy, model::RowBudget::ThreeTiles, tuning, Cards, openai::Front>;
 
 constexpr auto limits =
     openai::Limits{.requests = 16, .backlog_bytes = std::size_t{1} << 20U, .store = {.responses = 16, .bytes = std::size_t{1} << 24U}};
@@ -93,14 +80,8 @@ struct Rig {
 	return *std::move(ids);
 }
 
-/** How the engine goes wrong, if it does: its cards break down, or every request's grammar outgrows its bounds. */
-struct Faults {
-	std::optional<doubles::Breakdown> breakdown;
-	std::optional<std::size_t> overrun_at;
-};
-
 /** Opens the rig with every seed the service's first draws can make scripted with the reply; Ready posted. */
-[[nodiscard]] auto rig(Faults faults) -> std::unique_ptr<Rig> {
+[[nodiscard]] auto rig(std::optional<doubles::Breakdown> breakdown) -> std::unique_ptr<Rig> {
 	auto out = std::make_unique<Rig>(Rig{.driver = std::make_unique<fake::Fake>(fake::Machine{}), .harness = nullptr});
 	auto tokenizer = tok::load();
 	if (!tokenizer) {
@@ -124,11 +105,11 @@ struct Faults {
 	    engine::openai_harness::quick,
 	    [&](http::Poster<openai::Update> poster) {
 		    auto devices = device::Devices::open(driver.driver());
-		    auto front = Front::make(ScriptedGrammars{.everything = doubles::Everything::make(), .overrun_at = faults.overrun_at});
+		    auto front = openai::Front::make();
 		    core::invariant(devices.has_value() && front.has_value());
 		    auto vocabulary = grammar::engine_vocabulary(*tokenizer);
 		    auto started = Pipeline::start(poster, *std::move(tokenizer), std::move(vocabulary),
-			                               Cards{*std::move(devices), std::move(scripts), faults.breakdown}, *std::move(front));
+			                               Cards{*std::move(devices), std::move(scripts), breakdown}, *std::move(front));
 		    core::invariant(started.has_value());
 		    return *std::move(started);
 	    },
@@ -157,7 +138,7 @@ struct Faults {
  */
 [[nodiscard]] auto requests_run_through_the_engine() -> bool {
 	auto const tokenizer = tok::load();
-	auto rigged = rig(Faults{.breakdown = std::nullopt, .overrun_at = std::nullopt});
+	auto rigged = rig(std::nullopt);
 	auto reading = Json::make();
 	if (!tokenizer || !rigged || !reading) {
 		return false;
@@ -211,7 +192,7 @@ struct Faults {
 
 /** Cards that fail under a stream end it with `response.failed`, and the service refuses what comes after. */
 [[nodiscard]] auto a_card_failure_reaches_the_client() -> bool {
-	auto rigged = rig(Faults{.breakdown = doubles::Breakdown{.verify = 1, .behind = std::nullopt}, .overrun_at = std::nullopt});
+	auto rigged = rig(doubles::Breakdown{.verify = 1, .behind = std::nullopt});
 	auto reading = Json::make();
 	if (!rigged || !reading) {
 		return false;
@@ -232,33 +213,6 @@ struct Faults {
 	       reading->text(health->body, {"status"}) == "failed";
 }
 
-/**
- * A grammar that outgrows its bounds ends its request: a whole response is refused `grammar_too_large`, a stream ends
- * with that `error` event after what it said, and neither is stored; the engine keeps serving.
- */
-[[nodiscard]] auto an_overrun_grammar_ends_its_request() -> bool {
-	auto rigged = rig(Faults{.breakdown = std::nullopt, .overrun_at = 3});
-	auto reading = Json::make();
-	if (!rigged || !reading) {
-		return false;
-	}
-	auto& h = *rigged->harness;
-	auto peer = client::connect(h.server.port());
-	if (!peer) {
-		return false;
-	}
-	auto const whole = h.ask(*peer, create(R"({"input":"hi","reasoning":{"effort":"none"}})", ""));
-	auto const streamed = h.ask(*peer, create(R"({"input":"hi","reasoning":{"effort":"none"},"stream":true})", ""));
-	auto const health = h.ask(*peer, get("/health", ""));
-	if (!whole || !streamed || !health) {
-		return false;
-	}
-	auto const events = client::decode_events(streamed->body);
-	return whole->status == 400 && reading->text(whole->body, {"error", "code"}) == "grammar_too_large" && !events.empty() &&
-	       reading->text(events.back(), {"type"}) == "error" && reading->text(events.back(), {"code"}) == "grammar_too_large" &&
-	       health->status == 200;
-}
-
 }
 
 auto main() -> int {
@@ -267,8 +221,6 @@ auto main() -> int {
 		                      .holds = requests_run_through_the_engine()},
 	    engine::testing::Case{.name = "a card failure under a stream reaches its client as response.failed",
 		                      .holds = a_card_failure_reaches_the_client()},
-	    engine::testing::Case{.name = "a grammar that outgrows its bounds ends its request by name",
-		                      .holds = an_overrun_grammar_ends_its_request()},
 	};
 	return engine::testing::report(checks);
 }

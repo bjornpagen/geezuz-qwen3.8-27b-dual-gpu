@@ -3,6 +3,7 @@ export module engine.openai:boundary;
 
 import std;
 import engine.chat;
+import engine.core;
 import engine.grammar;
 import engine.http;
 import engine.json;
@@ -20,20 +21,6 @@ namespace engine::openai {
 
 /** The one model this server serves, as `/v1/models` lists it and every response names it. */
 export inline constexpr std::string_view model_id = "Qwen3.8-27B-FP8";
-
-/**
- * What a request's output must obey, as the request gave it: the grammar's input, and the parser's. Validation has
- * established that tool names are distinct and well formed and that a forced choice names a tool of its kind.
- */
-export struct Constraints {
-	std::vector<json::Tool> tools;
-	json::ToolChoice tool_choice;
-	json::TextFormat format;
-	/** Whether the reply starts inside the thinking block: the grammar's reasoning region, the parser's first. */
-	chat::Thinking thinking;
-
-	[[nodiscard]] auto operator==(Constraints const&) const -> bool = default;
-};
 
 /** A request with no stored predecessor: its whole chat, rendered from the start. */
 export struct Fresh {
@@ -61,13 +48,22 @@ export struct Submission {
 	/** The request's id, naming it in status snapshots. */
 	std::string tag;
 	Prompt prompt;
-	Constraints constraints;
+	/** The output grammar its tools, tool choice, format and reasoning compiled to at the boundary. */
+	grammar::Grammar grammar;
+	/** Its tools, as its reply's parser reads its calls: function arguments cast by their schemas, a custom tool's input. */
+	std::vector<json::Tool> tools;
 	/** Already carrying its effort's defaults and a fresh seed. */
 	sampling::Params sampling;
 	sched::Limit limit;
-
-	[[nodiscard]] auto operator==(Submission const&) const -> bool = default;
 };
+
+/** Whether a prompt's generation prompt opened the thinking block: where its reply, and the reply's parser, start. */
+export [[nodiscard]] inline auto thinking_of(Prompt const& prompt) -> chat::Thinking {
+	if (auto const fresh = core::alternative<Fresh>(prompt)) {
+		return fresh->conversation.options().thinking;
+	}
+	return std::get<Continued>(prompt).options.thinking;
+}
 
 /** The prompt is rendered and fits: the request is queued for a slot. */
 export struct Accepted {

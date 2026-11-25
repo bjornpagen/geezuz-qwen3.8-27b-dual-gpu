@@ -5,9 +5,7 @@ import engine.core;
 import engine.grammar;
 import engine.json;
 import engine.openai;
-import engine.openai_engine_double;
 import engine.pipeline;
-import engine.pipeline_doubles;
 import engine.sampling;
 import engine.sched;
 import engine.testing;
@@ -22,7 +20,6 @@ namespace openai = engine::openai;
 namespace pipeline = engine::pipeline;
 namespace sched = engine::sched;
 namespace tok = engine::tokenizer;
-using engine::openai_engine_double::PermissiveGrammars;
 
 /** A card error of the tests' own: the front is generic over the cards' error, as the pipeline is. */
 struct [[nodiscard]] CardFailure {
@@ -35,9 +32,7 @@ struct [[nodiscard]] CardFailure {
 	[[nodiscard]] constexpr auto operator==(CardFailure const&) const -> bool = default;
 };
 
-using Front = openai::Front<PermissiveGrammars>;
-
-static_assert(pipeline::Front<Front, CardFailure>);
+static_assert(pipeline::Front<openai::Front, CardFailure>);
 
 [[nodiscard]] auto object(std::string_view text) -> json::JsonText {
 	auto reader = json::Reader<json::fragment_bounds>::make();
@@ -105,18 +100,18 @@ inline constexpr auto words = std::to_array<std::string_view>({"hello", "world",
 
 constexpr auto efforts = std::array{json::Effort::None, json::Effort::Low, json::Effort::Medium, json::Effort::XHigh};
 
-[[nodiscard]] auto submission(openai::Prompt prompt, std::vector<json::Tool> tools, chat::Thinking thinking, std::uint64_t seed)
+[[nodiscard]] auto submission(openai::Prompt prompt, std::vector<json::Tool> tools, json::Effort effort, std::uint64_t seed)
     -> openai::Submission {
 	auto const params =
 	    engine::sampling::parse({.temperature = std::nullopt, .top_p = std::nullopt}, engine::sampling::thinking_defaults, seed);
 	core::invariant(params.has_value());
+	auto compiled = openai::compile_output(openai::output_request(tools, json::ToolChoiceMode::Auto, json::TextFormatMode::Text, effort));
+	core::invariant(compiled.has_value());
 	return openai::Submission{
 	    .tag = std::format("req-{}", seed),
 	    .prompt = std::move(prompt),
-	    .constraints = {.tools = std::move(tools),
-		                .tool_choice = json::ToolChoiceMode::Auto,
-		                .format = json::TextFormatMode::Text,
-		                .thinking = thinking},
+	    .grammar = *std::move(compiled),
+	    .tools = std::move(tools),
 	    .sampling = *params,
 	    .limit = sched::AtMost{.tokens = 1 + (seed % 100)},
 	};
@@ -124,11 +119,11 @@ constexpr auto efforts = std::array{json::Effort::None, json::Effort::Low, json:
 
 /**
  * A fresh submission runs as the chat format renders its conversation: the prompt is the renderer's, its marks are
- * the renderer's block offsets, and its sampling, limit, tag and constraints reach the engine as they were given.
+ * the renderer's block offsets, and its sampling, limit and tag reach the engine as they were given.
  */
 [[nodiscard]] auto fresh_prompts_are_the_render(std::uint64_t seed, tok::Tokenizer const& tokenizer) -> bool {
 	auto rng = engine::testing::generator(seed);
-	auto front = Front::make(PermissiveGrammars{.everything = engine::pipeline_doubles::Everything::make()});
+	auto front = openai::Front::make();
 	auto renderer = chat::Renderer::make();
 	if (!front || !renderer) {
 		return false;
@@ -146,14 +141,13 @@ constexpr auto efforts = std::array{json::Effort::None, json::Effort::Low, json:
 		if (!expected) {
 			return false;
 		}
-		auto const asked = submission(openai::Fresh{.conversation = *conversation}, tools, chat::options_of(effort).thinking, rng());
+		auto const asked = submission(openai::Fresh{.conversation = *conversation}, tools, effort, rng());
 		auto const prepared = front->prepare(tokenizer, asked);
 		auto const& request = prepared.request;
 		auto const system_end = expected->first_turn > 0 ? std::optional<sched::Count>{expected->first_turn} : std::nullopt;
 		if (request.prompt != expected->ids || request.marks.system_end != system_end ||
 		    request.marks.last_user_start != expected->last_query || request.marks.generation_start != expected->generation ||
-		    request.sampling != asked.sampling || request.limit != asked.limit || prepared.tag != asked.tag ||
-		    prepared.grammar.constraints() != asked.constraints) {
+		    request.sampling != asked.sampling || request.limit != asked.limit || prepared.tag != asked.tag) {
 			return false;
 		}
 	}
@@ -166,7 +160,7 @@ constexpr auto efforts = std::array{json::Effort::None, json::Effort::Low, json:
  */
 [[nodiscard]] auto continuations_are_the_sequence_then_the_turns(std::uint64_t seed, tok::Tokenizer const& tokenizer) -> bool {
 	auto rng = engine::testing::generator(seed);
-	auto front = Front::make(PermissiveGrammars{.everything = engine::pipeline_doubles::Everything::make()});
+	auto front = openai::Front::make();
 	auto renderer = chat::Renderer::make();
 	if (!front || !renderer) {
 		return false;
@@ -191,7 +185,7 @@ constexpr auto efforts = std::array{json::Effort::None, json::Effort::Low, json:
 		auto expected = sequence;
 		expected.insert(expected.end(), rest->ids.begin(), rest->ids.end());
 		auto const asked = submission(openai::Continued{.sequence = sequence, .turns = *std::move(turns), .options = options},
-		                              tools_of(rng), options.thinking, rng());
+		                              tools_of(rng), effort, rng());
 		auto const prepared = front->prepare(tokenizer, asked);
 		if (prepared.request.prompt != expected || prepared.request.marks.generation_start != sequence.size() + rest->generation) {
 			return false;
@@ -206,6 +200,37 @@ constexpr auto efforts = std::array{json::Effort::None, json::Effort::Low, json:
 	auto ids = tokenizer.encode(pieces);
 	core::invariant(ids.has_value());
 	return *std::move(ids);
+}
+
+/**
+ * The engine starts each request's matcher from the grammar its request compiled to at the boundary: a request whose
+ * format is one JSON object, with thinking off, may begin with the object but not with a word, as a matcher of the same
+ * grammar says.
+ */
+[[nodiscard]] auto matchers_start_from_the_compiled_grammar(tok::Tokenizer const& tokenizer) -> bool {
+	auto front = openai::Front::make();
+	if (!front) {
+		return false;
+	}
+	auto const vocabulary = engine::grammar::engine_vocabulary(tokenizer);
+	auto const tools =
+	    std::vector<json::Tool>{json::Tool{.name = "run", .description = std::nullopt, .input = json::CustomTool{.grammar = std::nullopt}}};
+	auto const items = std::vector<json::InputItem>{json::MessageItem{.role = json::Role::User, .text = "go"}};
+	auto conversation = chat::conversation({.instructions = std::nullopt, .items = items, .tools = tools, .effort = json::Effort::None});
+	auto compiled = openai::compile_output(
+	    openai::output_request(tools, json::ToolChoiceMode::None, json::TextFormatMode::JsonObject, json::Effort::None));
+	if (!conversation || !compiled) {
+		return false;
+	}
+	auto direct = engine::grammar::Matcher::make(*compiled, engine::grammar::engine_layout);
+	auto asked = submission(openai::Fresh{.conversation = *std::move(conversation)}, tools, json::Effort::None, 7);
+	asked.grammar = *std::move(compiled);
+	auto prepared = front->prepare(tokenizer, std::move(asked));
+	auto const started = prepared.grammar.mask(vocabulary);
+	auto const expected = direct.mask(vocabulary);
+	auto const word = output_tokens(tokenizer, "Hello").front();
+	return started && expected && std::ranges::equal(started->tokens, expected->tokens) &&
+	       started->allows(output_tokens(tokenizer, "{").front()) && !started->allows(word);
 }
 
 /** What a reply's outputs say, gathered. */
@@ -341,7 +366,7 @@ auto hear(Heard& heard, std::vector<openai::Output> const& outputs) -> void {
 
 /** The front answers the engine's verdicts and posts its batches, snapshots and failure as the service reads them. */
 [[nodiscard]] auto the_front_maps_the_engine() -> bool {
-	auto front = Front::make(PermissiveGrammars{.everything = engine::pipeline_doubles::Everything::make()});
+	auto front = openai::Front::make();
 	if (!front) {
 		return false;
 	}
@@ -375,6 +400,8 @@ auto main() -> int {
 		                      .holds = continuations_are_the_sequence_then_the_turns(1, *tokenizer)},
 	    engine::testing::Case{.name = "a continuation is the stored sequence, then the new turns rendered after it (seed 2)",
 		                      .holds = continuations_are_the_sequence_then_the_turns(2, *tokenizer)},
+	    engine::testing::Case{.name = "the engine's matcher starts from the grammar compiled at the boundary",
+		                      .holds = matchers_start_from_the_compiled_grammar(*tokenizer)},
 	    engine::testing::Case{.name = "a reply fed token by token says what the parser says of its whole text",
 		                      .holds = replies_say_what_the_parser_says(*tokenizer)},
 	    engine::testing::Case{.name = "a character split across tokens arrives whole", .holds = split_characters_arrive_whole(*tokenizer)},

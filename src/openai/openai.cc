@@ -3,6 +3,7 @@ export module engine.openai;
 
 export import :error;
 export import :boundary;
+export import :compile;
 export import :front;
 export import :validate;
 export import :assembly;

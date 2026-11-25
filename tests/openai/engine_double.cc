@@ -3,18 +3,13 @@ export module engine.openai_engine_double;
 
 import std;
 import engine.core;
-import engine.grammar;
 import engine.http;
 import engine.net;
 import engine.openai;
-import engine.pipeline;
-import engine.pipeline_doubles;
 
 namespace engine::openai_engine_double {
 
 namespace openai = engine::openai;
-namespace pipeline = engine::pipeline;
-namespace pipeline_doubles = engine::pipeline_doubles;
 
 /** The outputs one request is answered with, in batches as an engine posts them: one batch per round. */
 export using Script = std::vector<std::vector<openai::Output>>;
@@ -90,52 +85,5 @@ private:
 };
 
 static_assert(openai::Engine<EngineDouble>);
-
-/**
- * A test double of a grammar's matcher that allows every token everywhere, and keeps the constraints it was started
- * with, so a test sees what reached the grammar.
- */
-export class PermissiveGrammar {
-public:
-	PermissiveGrammar(openai::Constraints constraints, pipeline_doubles::Everything everything)
-	    : constraints_{std::move(constraints)}, everything_{std::move(everything)} {}
-
-	[[nodiscard]] auto advance(grammar::Vocabulary const& /*vocabulary*/, pipeline::Token /*token*/)
-	    -> core::Result<void, grammar::MatchError> {
-		taken_ += 1;
-		return {};
-	}
-
-	auto rollback(std::size_t count) -> void {
-		core::invariant(count <= taken_);
-		taken_ -= count;
-	}
-
-	[[nodiscard]] auto mask(grammar::Vocabulary const& /*vocabulary*/) -> core::Result<grammar::MaskView, grammar::MatchError> {
-		return grammar::MaskView{.tokens = everything_.tokens, .rows = everything_.rows};
-	}
-
-	[[nodiscard]] auto constraints() const -> openai::Constraints const& {
-		return constraints_;
-	}
-
-private:
-	openai::Constraints constraints_;
-	pipeline_doubles::Everything everything_;
-	std::size_t taken_ = 0;
-};
-
-static_assert(pipeline::GrammarState<PermissiveGrammar>);
-
-/** A test double of the engine's grammars: every request's grammar allows every token the tokenizer has. */
-export struct PermissiveGrammars {
-	pipeline_doubles::Everything everything;
-
-	[[nodiscard]] auto start(openai::Constraints const& constraints) const -> PermissiveGrammar {
-		return PermissiveGrammar{constraints, everything};
-	}
-};
-
-static_assert(openai::Grammars<PermissiveGrammars>);
 
 }
