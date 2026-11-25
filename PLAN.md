@@ -412,23 +412,32 @@ boundary.
   - **the decode cycle is not a graph of senders**: it is one persistent kernel; senders submit cycles and collect
     results. a sender per phase would bring back ~340 launches per cycle.
   - the http reactor stays cpp-starter's owner-driven epoll state machine.
-- **api**:
-  - the reference is the newest openai sdk's chat completions types (openai-python's generated types for the latest
-    release, pinned in PINS.md): every modern field and shape is honoured or refused by name; deprecated and legacy
-    shapes (e.g. `functions` / `function_call`, `max_tokens` where the sdk has replaced it) are refused, never
-    translated.
+- **api: the openai responses api, only** (owner decision; chat completions is hard-deleted, with its code, tests and
+  docs):
+  - the reference is the newest openai sdk's responses types (openai-python's generated types, v3.59.0 at the cutover,
+    pinned in PINS.md): every field, item and event is honoured exactly, honoured only at a neutral value, or refused
+    by name; deprecated and legacy shapes are refused, never translated. fields outside the sdk are refused too (no
+    engine extensions: `top_k` and `min_p` are the model's recommended defaults, not request fields).
   - fail closed, as early as possible: every refusal happens at the first boundary that can decide it. a request is
     validated whole at the http boundary, including compiling its grammar (1.4b) under compile-time size bounds, so
     an unsupported schema or grammar feature is a named 400 before the request is admitted.
-  - `/v1/chat/completions`, streaming and not: `messages`, `tools`, `tool_choice`, `stream`, `max_tokens`,
-    `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`, and `chat_template_kwargs` (`enable_thinking`,
-    `reasoning_effort`, `preserve_thinking`).
-  - the response carries `reasoning_content`, `tool_calls`, and `usage.prompt_tokens_details.cached_tokens`.
+  - `POST /v1/responses`, streaming (the sdk's semantic events) and not: `input` as text or items (messages, function
+    calls and their outputs, custom tool calls and their outputs, reasoning items), `instructions`, `tools` (function
+    tools, every one strict; custom tools with `text` or `grammar` formats, lark or regex), `tool_choice`,
+    `text.format` (`text`, `json_object`, `json_schema`), `reasoning.effort`, `max_output_tokens`, `temperature`,
+    `top_p`, `stream`; usage carries cached input tokens.
+  - **stateful context, for speed**: responses are stored server-side (bounded, typed, evicted lru), and
+    `previous_response_id` continues from the stored response's exact token sequence, never a re-render. the prefix
+    cache keeps the kv and deltanet snapshot at each stored response's end, so a continuation prefills only its new
+    input. `GET` and `DELETE /v1/responses/{id}` and its input items follow the sdk; anything else stateful the sdk
+    has (conversations, background mode) is honoured or refused by name per the audit in docs/API.md.
+  - the sdk has no `stop` and no `seed` on responses, so neither exists here: generation ends at the grammar's end or
+    the output budget, and every request draws a fresh seed (determinism is tested through the engine's own tools).
+  - reasoning is first-class: the engine emits reasoning items with their text, and reasoning items passed back as
+    input render as the template's preserved thinking.
+  - a custom tool reaches the model as a template tool with one string parameter, `input`, whose value the tool's
+    grammar (lark or regex) or free text constrains; the call comes back as a `custom_tool_call` item.
   - `/v1/models`, `/health`, `/status`, plus `X-Request-Id` tagging.
-  - unsupported parameters are refused with a named 400. assistant turns with `content: null` (tool-call-only or
-    reasoning-only turns that harnesses resend) are accepted as empty; adrien hit http 400s on exactly this.
-  - `response_format` (`text`, `json_object`, `json_schema`), `strict` on function tools (accepted at both values:
-    every tool is enforced), and custom tools whose `format` is a lark grammar: see 1.4b.
 
 ## 1.4b constrained decoding (every request, owner decision)
 
@@ -438,7 +447,7 @@ every request decodes under a grammar; there is no unconstrained mode, so there 
   and/or tool calls in the template's tool-call syntax, then the end token) composed with:
   - each function tool's argument grammar, compiled from its json schema; every tool is strict;
   - `tool_choice`: `none` forbids tool calls, `required` demands at least one, a forced function demands that one;
-  - `response_format`: `json_object` or `json_schema` constrains the content region;
+  - `text.format`: `json_object` or `json_schema` constrains the output text;
   - custom tools whose `format` is a lark grammar (the llguidance / openai lark dialect) or a regex, constraining that
     tool's input.
   so tool calls always parse, arguments always match their schema, and `tool_choice` is honoured. a schema or grammar
