@@ -39,13 +39,14 @@ using engine::ptx::parse_header;
 
 // Budget records as the device compiler emits them: the longer name first, so a reader that matched a name's prefix
 // would take its record for the shorter one, and one record with its trailing zero bytes omitted.
-constexpr char records_text[] = ".version 9.0\n.target sm_86\n.address_size 64\n\n"
-                                ".visible .const .align 4 .b8 engine_budget_probe_wide[16] = {64, 0, 0, 0, 40, 0, 0, 0, 0, 16, 0, 0, 2};\n"
-                                ".visible .const .align 4 .b8 engine_budget_probe[16] = {32, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 1};\n"
-                                ".visible .const .align 4 .b8 engine_budget_probe_short[16] = {128, 0, 0, 0, 32};\n\n"
-                                ".visible .entry probe()\n{\n\tret;\n}\n";
+constexpr auto records_text =
+    std::to_array(".version 9.0\n.target sm_86\n.address_size 64\n\n"
+	              ".visible .const .align 4 .b8 engine_budget_probe_wide[16] = {64, 0, 0, 0, 40, 0, 0, 0, 0, 16, 0, 0, 2};\n"
+	              ".visible .const .align 4 .b8 engine_budget_probe[16] = {32, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 1};\n"
+	              ".visible .const .align 4 .b8 engine_budget_probe_short[16] = {128, 0, 0, 0, 32};\n\n"
+	              ".visible .entry probe()\n{\n\tret;\n}\n");
 
-constexpr auto records = engine::ptx::image(records_text);
+constexpr auto records = engine::ptx::image(std::span<char const>{records_text});
 
 [[nodiscard]] constexpr auto same(engine::device::prims::Budget left, engine::device::prims::Budget right) -> bool {
 	return left.threads == right.threads && left.registers_per_thread == right.registers_per_thread &&
