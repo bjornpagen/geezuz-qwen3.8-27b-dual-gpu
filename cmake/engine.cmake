@@ -41,6 +41,10 @@ set(ENGINE_DEVICE_FLAGS
 	-fno-exceptions
 	-fno-rtti
 	-O3
+	# Rounding is pinned in the ptx: clang's cuda default fuses products into sums (and ignores the contraction
+	# pragma while doing so), and an fp32 add or mul without `.rn` leaves the driver's jit free to fuse it again.
+	# Off, every fp32 operation is emitted with its rounding mode and every fma is one the source spelled.
+	-ffp-contract=off
 	-Xclang -target-feature -Xclang +ptx${ENGINE_PTX_ISA_MAJOR}${ENGINE_PTX_ISA_MINOR}
 	-DENGINE_PTX_ISA=${ENGINE_PTX_ISA_MAJOR}${ENGINE_PTX_ISA_MINOR}
 	-DENGINE_DEVICE_CHECKS=${ENGINE_DEVICE_CHECKS_VALUE}
