@@ -5,5 +5,7 @@ engine_test(file SOURCES file.test.cc LINK engine_file)
 # with known bytes, an empty one and an unreadable one.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/known" "mapped bytes\n\tare exactly the file")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/empty" "")
+# A previous configure left `unreadable` without read permission; removing it first keeps configure repeatable.
+file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/unreadable")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/unreadable" "x")
 file(CHMOD "${CMAKE_CURRENT_BINARY_DIR}/unreadable" PERMISSIONS OWNER_WRITE)
