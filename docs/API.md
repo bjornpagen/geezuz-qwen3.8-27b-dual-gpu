@@ -25,6 +25,10 @@ A member the sdk does not define is refused `unknown_parameter`; a value outside
 
 **D** marks an owner decision; **H** a change engine.http must make before the row is live.
 
+Live today: engine.json decodes every create param and input item and refuses as this table says, and writes the
+`Response`, its events, input item pages and deletions; engine.store holds stored responses. The routes, and the
+service that answers them, await **H1** and **H2**.
+
 ## routes
 
 | route | here | notes |
@@ -104,12 +108,12 @@ outputs as tool responses.
 | `function_call_output` | exact | `call_id` required (the sdk marks it optional; there is nothing to match without it); `output` a string or `input_text` parts; `caller`, `name`, `namespace` neutral absent |
 | `custom_tool_call` | exact | `call_id`, `name`, `input`; rendered as a call with one string parameter `input` |
 | `custom_tool_call_output` | exact | as `function_call_output` |
-| `reasoning` | exact | `content` `reasoning_text` parts are the turn's reasoning; `summary` neutral `[]`; `encrypted_content` neutral `null`; `status` neutral `completed`; it must open an assistant turn (`reasoning_without_turn`) |
+| `reasoning` | exact | `content` `reasoning_text` parts are the turn's reasoning; `summary` neutral `[]`; `encrypted_content` neutral `null`; `status` neutral `completed`; it opens an assistant turn, which the following assistant message and calls of the same run join |
 | `item_reference` | refused `unsupported_parameter` | |
 | every other item (`file_search_call`, `computer_call`, `computer_call_output`, `web_search_call`, `tool_search_call`, `tool_search_output`, `additional_tools`, `configuration_update`, `compaction`, `compaction_trigger`, `image_generation_call`, `code_interpreter_call`, `local_shell_call`, `local_shell_call_output`, `shell_call`, `shell_call_output`, `apply_patch_call`, `apply_patch_call_output`, `mcp_list_tools`, `mcp_approval_request`, `mcp_approval_response`, `mcp_call`, `program`, `program_output`) | refused `unsupported_parameter` | |
 
 The template's own rules hold: a system or developer message only first (`system_message_not_first`), at least one
-user query (`no_user_query`), an input that is not empty (`input_empty`).
+user query (`no_user_query`, which an empty input also fails).
 
 ### tools
 
