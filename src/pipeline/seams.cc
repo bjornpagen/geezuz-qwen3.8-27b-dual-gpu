@@ -2,10 +2,12 @@
 export module engine.pipeline:seams;
 
 import std;
+import engine.core;
 import engine.exec;
 import engine.http;
 import engine.kv;
 import engine.model;
+import engine.net;
 import engine.sched;
 import engine.tokenizer;
 import :masks;
@@ -22,8 +24,21 @@ namespace ex = engine::exec;
 /** The most drafts a row carries into a cycle. */
 export inline constexpr std::size_t max_drafts = model::drafts(model::max_draft_depth);
 
-/** One batch row's drafts, the first `drafts(depth)` of them meaningful. */
-export using DraftRow = std::array<Token, max_drafts>;
+/**
+ * One batch row's drafts, as the cards hold them: `count` tokens, at most the batch's depth, fewer when the mtp head
+ * has drafted less for the row (none for a row fresh from its prompt).
+ */
+export struct DraftRow {
+	std::array<Token, max_drafts> tokens;
+	std::size_t count;
+
+	[[nodiscard]] auto view() const -> std::span<Token const> {
+		core::invariant(count <= max_drafts);
+		return std::span{tokens}.first(count);
+	}
+
+	[[nodiscard]] auto operator==(DraftRow const&) const -> bool = default;
+};
 
 /** What the mtp head proposed for a batch: one row per batch row, in the batch's order. */
 export struct Drafts {
@@ -59,12 +74,13 @@ export using Prefill = std::variant<Reading, Sampling>;
  * - `verify(masks)`: hands the cycle each verify row's mask; completes with the batch's outcome and the buffer.
  * - `prefill(chunk)`: runs one prefill chunk on both cards; completes with its outcome.
  *
- * The masks are computed between `draft` and `verify`, while the cards stream the cycle's weights. Every sender may
- * fail with the device's error; none is stopped. A sender borrows the cards (as a scheduler borrows its context):
- * the pipeline waits for each before it calls the cards again.
+ * The masks are computed between `draft` and `verify`, while the cards stream the cycle's weights; a row's verify rows
+ * past its drafts repeat its last mask. Every sender may fail with the cards' own `Error`, which reaches the engine's
+ * owner whole; none is stopped. A sender borrows the cards (as a scheduler borrows its context): the pipeline waits
+ * for each before it calls the cards again.
  */
 export template<class C, kv::Geometry G>
-concept Cards = std::movable<C> && kv::Device<C, G> && requires(C& cards, sched::Batch batch, Masks masks, Prefill prefill) {
+concept Cards = std::movable<C> && kv::Device<C, G> && core::Classified<typename C::Error> && requires(C& cards, sched::Batch batch, Masks masks, Prefill prefill) {
 	{ cards.draft(std::move(batch)) } -> ex::sender;
 	{ cards.verify(std::move(masks)) } -> ex::sender;
 	{ cards.prefill(std::move(prefill)) } -> ex::sender;
@@ -91,7 +107,7 @@ concept GrammarState = std::movable<S> && requires(S& state, S const& held, Toke
 /**
  * Why generation ended, with the exact sequence the request leaves (the prompt as it ran, then every generated token),
  * which a stored response keeps: `Stopped` when the model ended its turn (the end-of-turn token last), `Truncated`
- * when the budget, the context or the pool ran out. A request whose client left ends silently and has no ending.
+ * when the budget, the context or the pool ran out. A request whose client left has none: it is answered `cancelled`.
  */
 export using Ending = std::variant<sched::Stopped, sched::Truncated>;
 
@@ -175,24 +191,52 @@ concept Reply = std::movable<R> && requires(R& reply, tokenizer::Tokenizer const
 	{ reply.end(tokenizer, finish) } -> std::same_as<std::vector<Output>>;
 };
 
+/** Why the engine stopped serving: the cards failed with their own error, or its thread could not wait for work. */
+export template<core::Classified CardError>
+struct [[nodiscard]] EngineError {
+	std::variant<CardError, net::NetError> cause;
+
+	[[nodiscard]] auto retry() const -> core::Retry {
+		return std::visit(
+		    [](auto const& failure) {
+			    return failure.retry();
+		    },
+		    cause);
+	}
+
+	[[nodiscard]] auto operator==(EngineError const&) const -> bool = default;
+};
+
 /**
  * The api in front of the engine: what a submission becomes on the engine's thread (rendered, tokenized, its grammar's
- * parser started), the outputs that answer it, and the updates the engine posts to the api's service. A request's
- * outputs are its verdict (`accepted` or `refused`), then what its reply makes of its tokens and its finish.
+ * parser started), the outputs that answer it, and the updates the engine posts to the api's service.
+ *
+ * Every submission is answered by exactly one terminal output, the last one addressed to its exchange: `refused`
+ * alone; or `accepted`, what its reply makes of its tokens, then its reply's `end`; or `cancelled` once its client
+ * left and the engine let go of it (at once while it waited for the scheduler, else at the next cycle boundary), after
+ * whatever was said before the cancel arrived (nothing, or `accepted` and some of its reply's outputs). So the
+ * requests without a terminal output are exactly those the engine holds. A cancel that arrives after the request's
+ * terminal output is answered by nothing.
+ *
+ * An engine that fails posts what it said before the failure, then `failed` as its last update, retried until the
+ * server's mailbox takes it or the engine is stopped: no request it has not answered will be. An engine that is
+ * stopped posts nothing more.
  */
-export template<class F>
+export template<class F, class CardError>
 concept Front = std::movable<F> && std::movable<typename F::Submission> && std::movable<typename F::Output> &&
                 std::movable<typename F::Update> && std::regular<typename F::Tag> && GrammarState<typename F::Grammar> &&
                 Reply<typename F::Reply, typename F::Output> &&
                 requires(F& front, tokenizer::Tokenizer const& tokenizer, F::Submission submission,
                          sched::PromptTooLong refused, std::vector<Addressed<typename F::Output>> outputs,
-                         Snapshot<typename F::Tag> snapshot) {
+                         Snapshot<typename F::Tag> snapshot, EngineError<CardError> const& error) {
 	                { front.prepare(tokenizer, std::move(submission)) }
 	                    -> std::same_as<Prepared<typename F::Tag, typename F::Grammar, typename F::Reply>>;
 	                { front.accepted() } -> std::same_as<typename F::Output>;
 	                { front.refused(refused) } -> std::same_as<typename F::Output>;
+	                { front.cancelled() } -> std::same_as<typename F::Output>;
 	                { front.batch(std::move(outputs)) } -> std::same_as<typename F::Update>;
 	                { front.status(std::move(snapshot)) } -> std::same_as<typename F::Update>;
+	                { front.failed(error) } -> std::same_as<typename F::Update>;
                 };
 
 }

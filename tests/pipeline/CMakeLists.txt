@@ -11,7 +11,7 @@ add_library(engine_pipeline_doubles)
 target_sources(engine_pipeline_doubles PUBLIC FILE_SET CXX_MODULES FILES doubles.cc)
 target_link_libraries(engine_pipeline_doubles
 	PUBLIC engine_language_profile engine_card_scheduler engine_core engine_device engine_exec engine_http engine_kv engine_kv_harness
-	engine_model engine_pipeline engine_sampling engine_sched engine_tokenizer)
+	engine_model engine_net engine_pipeline engine_sampling engine_sched engine_tokenizer)
 
 engine_test(pipeline.engine SOURCES engine.test.cc
 	LINK engine_pipeline engine_pipeline_doubles engine_device engine_driver_double engine_http engine_kv engine_net engine_sched

@@ -4,7 +4,6 @@ export module engine.pipeline:engine;
 import std;
 import engine.card_scheduler;
 import engine.core;
-import engine.device;
 import engine.exec;
 import engine.http;
 import engine.kv;
@@ -25,7 +24,7 @@ struct Submit {
 	Submission submission;
 };
 
-/** The client of a request is gone or too slow: the request ends at the next cycle boundary, silently. */
+/** The client of a request is gone or too slow: the request ends, answered `cancelled`. */
 export struct Cancel {
 	http::Exchange exchange;
 
@@ -48,21 +47,6 @@ static_assert(http::max_connections <= sched::max_requests, "the scheduler holds
 export template<class Submission>
 using Inbox = card_scheduler::Inbox<Intake<Submission>, intake_capacity>;
 
-/** Why the engine stopped serving: the cards failed, or its thread could not wait for work. */
-export struct [[nodiscard]] EngineError {
-	std::variant<device::DeviceError, net::NetError> cause;
-
-	[[nodiscard]] auto retry() const -> core::Retry {
-		return std::visit(
-		    [](auto const& failure) {
-			    return failure.retry();
-		    },
-		    cause);
-	}
-
-	[[nodiscard]] auto operator==(EngineError const&) const -> bool = default;
-};
-
 /** Rendered, and waiting for a request record of the scheduler: every one holds a request that has not finished. */
 struct Waiting {
 	sched::Submission request;
@@ -72,8 +56,8 @@ struct Waiting {
 enum class Client : std::uint8_t {
 	Present,
 	/**
-	 * It left: the request ends at the next cycle boundary. The cycle in flight may still report its tokens, and may
-	 * end the request anyway; none of that is posted.
+	 * It left: the request ends at the next cycle boundary and is then answered `cancelled`. The cycle in flight may
+	 * still report its tokens, and may end the request anyway; none of that is posted.
 	 */
 	Gone,
 };
@@ -85,7 +69,7 @@ struct Scheduled {
 };
 
 /** A request the engine holds, from its submission until the scheduler reports it finished. */
-template<Front F>
+template<class F>
 struct Live {
 	http::Exchange exchange;
 	F::Tag tag;
@@ -103,6 +87,12 @@ struct Overloaded : F... {
 inline constexpr auto repost_after = std::chrono::milliseconds{1};
 
 /**
+ * The longest a failed engine waits between posts of its failure: it backs off from `repost_after` while the server
+ * stays behind, and stays prompt enough for an owner that stops it.
+ */
+inline constexpr auto most_repost_after = std::chrono::milliseconds{32};
+
+/**
  * The engine's thread: one owner of the scheduler, the cards, and every request's grammar state and reply. Each round
  * takes what the reactor posted, plans a cycle (the pool's commands go to the cards as the scheduler issues them),
  * runs it, settles it, and turns the scheduler's events into the api's outputs, posted as one batch.
@@ -111,12 +101,14 @@ inline constexpr auto repost_after = std::chrono::milliseconds{1};
  * events; the work a round can do without the cards, taking and preparing new requests, runs on the same loop while
  * the cards compute. A batch's masks are made between its `draft` and its `verify`.
  */
-export template<kv::Geometry G, model::RowBudget B, sched::Tuning T, Cards<G> C, Front F>
+export template<kv::Geometry G, model::RowBudget B, sched::Tuning T, Cards<G> C, class F>
+    requires Front<F, typename C::Error>
 class Loop {
 	using Scheduler = sched::BasicScheduler<G, B, T>;
 	using Output = F::Output;
 	using Tag = F::Tag;
 	using Request = Live<F>;
+	using Failure = EngineError<typename C::Error>;
 
 public:
 	Loop(http::Poster<typename F::Update> poster, tokenizer::Tokenizer tokenizer, C cards, F front)
@@ -130,15 +122,27 @@ public:
 		lives_.reserve(http::max_connections + sched::max_requests);
 	}
 
-	/** Serves until the inbox is stopping, or until the cards or the thread's wait fail. */
-	[[nodiscard]] auto run(Inbox<typename F::Submission>& inbox) -> core::Result<void, EngineError> {
+	/**
+	 * Serves until the inbox is stopping, or until the cards or the thread's wait fail. A failure is posted to the
+	 * server as the engine's last update before it is returned.
+	 */
+	[[nodiscard]] auto run(Inbox<typename F::Submission>& inbox) -> core::Result<void, Failure> {
+		auto served = serve(inbox);
+		if (!served) {
+			fail(served.error(), inbox);
+		}
+		return served;
+	}
+
+private:
+	[[nodiscard]] auto serve(Inbox<typename F::Submission>& inbox) -> core::Result<void, Failure> {
 		while (!inbox.stopping()) {
 			take(inbox);
 			admit_waiting();
 			if (post() == Sent::Held) {
 				// No cycle adds to what the server has not taken yet: what is held stays one round's outputs.
 				if (auto waited = inbox.wait(net::Clock::now() + repost_after); !waited) {
-					return std::unexpected(EngineError{.cause = waited.error()});
+					return std::unexpected(Failure{.cause = waited.error()});
 				}
 				continue;
 			}
@@ -151,7 +155,7 @@ public:
 				}
 				auto const until = post() == Sent::Held ? std::optional{net::Clock::now() + repost_after} : std::nullopt;
 				if (auto waited = inbox.wait(until); !waited) {
-					return std::unexpected(EngineError{.cause = waited.error()});
+					return std::unexpected(Failure{.cause = waited.error()});
 				}
 				continue;
 			}
@@ -164,9 +168,34 @@ public:
 		return {};
 	}
 
-private:
+	/**
+	 * The failed engine's last posts: what it said before the failure, then the failure, posted again with a growing
+	 * pause while the server's mailbox is full. Nothing is posted after them.
+	 */
+	auto fail(Failure const& error, Inbox<typename F::Submission>& inbox) -> void {
+		gather();
+		outbox_.close(front_.failed(error));
+		auto pause = repost_after;
+		// A stopping owner learns the failure from `stop`, and may be the reactor's own thread, which drains nothing
+		// while it joins this one.
+		while (outbox_.flush() == Sent::Held && !inbox.stopping()) {
+			// The inbox's wait also ends at once when the owner stops the engine. A wait that cannot wait leaves no
+			// way to pace the retries, and the owner learns the failure from `stop` all the same.
+			if (!inbox.wait(net::Clock::now() + pause)) {
+				return;
+			}
+			pause = std::min(2 * pause, most_repost_after);
+		}
+	}
+
 	[[nodiscard]] static auto waiting(Request const& live) -> bool {
 		return std::holds_alternative<Waiting>(live.place);
+	}
+
+	/** Whether the request's client still waits for its terminal output. */
+	[[nodiscard]] static auto owed(Request const& live) -> bool {
+		auto const held = core::alternative<Scheduled>(live.place);
+		return !held || held->client == Client::Present;
 	}
 
 	[[nodiscard]] static auto holds(Request const& live, sched::RequestHandle request) -> bool {
@@ -251,10 +280,16 @@ private:
 		}
 	}
 
-	/** The client is gone: a waiting request is forgotten, a scheduled one ends at the next cycle boundary. */
+	/**
+	 * The client is gone. A waiting request is forgotten and answered `cancelled` at once; a scheduled one ends at the
+	 * next cycle boundary and is answered `cancelled` when the scheduler finishes it, so every request the engine
+	 * still holds is one the service counts as outstanding.
+	 */
 	auto drop(http::Exchange exchange) -> void {
-		auto const found = std::ranges::find(lives_, exchange, &Request::exchange);
-		// A request that finished before its client left is no longer held.
+		auto const found = std::ranges::find_if(lives_, [&](Request const& live) {
+			return live.exchange == exchange && owed(live);
+		});
+		// A request answered before its client left (finished or refused), or whose client already left, is owed nothing more.
 		if (found == lives_.end()) {
 			return;
 		}
@@ -263,6 +298,7 @@ private:
 			held->client = Client::Gone;
 			return;
 		}
+		round_.push_back({.exchange = exchange, .output = front_.cancelled()});
 		lives_.erase(found);
 	}
 
@@ -306,7 +342,9 @@ private:
 	}
 
 	auto end(Request& live, sched::Finished finished) -> void {
+		// The cycle in flight when the client left may have ended the request anyway: it is cancelled all the same.
 		if (std::get<Scheduled>(live.place).client == Client::Gone) {
+			round_.push_back({.exchange = live.exchange, .output = front_.cancelled()});
 			return;
 		}
 		std::visit(Overloaded{
@@ -321,11 +359,16 @@ private:
 		           finished.ending);
 	}
 
-	/** Posts the round's outputs as one batch, and the status when it changed. */
-	[[nodiscard]] auto post() -> Sent {
+	/** Hands the round's outputs to the outbox as one batch. */
+	auto gather() -> void {
 		if (!round_.empty()) {
 			outbox_.add(front_.batch(std::exchange(round_, {})));
 		}
+	}
+
+	/** Posts the round's outputs as one batch, and the status when it changed. */
+	[[nodiscard]] auto post() -> Sent {
+		gather();
 		auto snapshot = this->snapshot();
 		if (snapshot != reported_) {
 			outbox_.report(front_.status(snapshot));
@@ -337,22 +380,23 @@ private:
 	/** Waits on this thread for a step of the cycle, taking the reactor's posts while the cards work. */
 	template<class S>
 	[[nodiscard]] auto await(S step, Inbox<typename F::Submission>& inbox) {
-		auto waited = ex::wait<device::DeviceError>(ex::when_all(std::move(step), ex::just() | ex::then([this, &inbox] {
+		auto waited = ex::wait<typename C::Error>(ex::when_all(std::move(step), ex::just() | ex::then([this, &inbox] {
 			                                                                            take(inbox);
 		                                                                            })));
 		// Nothing asks a wait of the engine's to stop, and the cards' senders are never stopped.
 		core::invariant(waited.has_value());
 		using Value = std::tuple_element_t<0, std::remove_cvref_t<decltype(**waited)>>;
 		if (!*waited) {
-			return core::Result<Value, EngineError>{std::unexpected(EngineError{.cause = std::move(*waited).error()})};
+			return core::Result<Value, Failure>{std::unexpected(Failure{.cause = std::move(*waited).error()})};
 		}
-		return core::Result<Value, EngineError>{std::get<0>(std::move(**waited))};
+		return core::Result<Value, Failure>{std::get<0>(std::move(**waited))};
 	}
 
 	/**
 	 * Each verify row's mask: the request's grammar after its committed tokens, then after each draft in turn. A draft
 	 * the grammar refuses is excluded by the mask before it, so the cards reject it and no row after it commits; those
-	 * rows repeat the last mask. The grammar is rolled back to the committed tokens afterwards.
+	 * rows repeat the last mask, as do the rows past a row's drafts, which read nothing. The grammar is rolled back to
+	 * the committed tokens afterwards.
 	 */
 	auto fill(sched::Batch const& batch, Drafts const& drafts) -> void {
 		auto const depth = model::drafts(batch.depth);
@@ -363,10 +407,13 @@ private:
 			auto& grammar = live_of(row.request).grammar;
 			auto const base = index * (1 + depth);
 			masks_.rows[base] = rows_->rows(grammar.mask());
+			auto const held = drafts.rows[index].view();
+			// The cards hold at most the batch's depth of drafts for a row.
+			core::invariant(held.size() <= depth);
 			auto taken = std::size_t{0};
 			for (auto draft = std::size_t{0}; draft < depth; ++draft) {
 				auto const at = base + 1 + draft;
-				if (taken == draft && grammar.advance(drafts.rows[index][draft]) == Step::Taken) {
+				if (draft < held.size() && taken == draft && grammar.advance(held[draft]) == Step::Taken) {
 					taken += 1;
 					masks_.rows[at] = rows_->rows(grammar.mask());
 				} else {
@@ -377,7 +424,7 @@ private:
 		}
 	}
 
-	[[nodiscard]] auto run_batch(sched::Batch const& batch, Inbox<typename F::Submission>& inbox) -> core::Result<sched::BatchDone, EngineError> {
+	[[nodiscard]] auto run_batch(sched::Batch const& batch, Inbox<typename F::Submission>& inbox) -> core::Result<sched::BatchDone, Failure> {
 		auto drafted = await(cards_.draft(sched::Batch{batch}), inbox);
 		if (!drafted) {
 			return std::unexpected(drafted.error());
@@ -393,7 +440,7 @@ private:
 		return std::move(verified->done);
 	}
 
-	[[nodiscard]] auto run_chunk(sched::Chunk const& chunk, Inbox<typename F::Submission>& inbox) -> core::Result<sched::ChunkDone, EngineError> {
+	[[nodiscard]] auto run_chunk(sched::Chunk const& chunk, Inbox<typename F::Submission>& inbox) -> core::Result<sched::ChunkDone, Failure> {
 		// A chunk that reaches the end of its sequence samples the request's first token, under its grammar's mask.
 		if (chunk.read == sched::Read::Last) {
 			auto const& mask = rows_->rows(live_of(chunk.request).grammar.mask());
@@ -402,7 +449,7 @@ private:
 		return await(cards_.prefill(Prefill{Reading{.chunk = chunk}}), inbox);
 	}
 
-	[[nodiscard]] auto run_cycle(sched::Cycle const& cycle, Inbox<typename F::Submission>& inbox) -> core::Result<sched::Done, EngineError> {
+	[[nodiscard]] auto run_cycle(sched::Cycle const& cycle, Inbox<typename F::Submission>& inbox) -> core::Result<sched::Done, Failure> {
 		return std::visit(Overloaded{
 		                      [&](sched::Batch const& batch) {
 			                      return run_batch(batch, inbox).transform([](sched::BatchDone done) {
@@ -414,7 +461,7 @@ private:
 				                      return sched::Done{done};
 			                      });
 		                      },
-		                      [&](sched::Both const& both) -> core::Result<sched::Done, EngineError> {
+		                      [&](sched::Both const& both) -> core::Result<sched::Done, Failure> {
 			                      auto batch = run_batch(both.batch, inbox);
 			                      if (!batch) {
 				                      return std::unexpected(batch.error());

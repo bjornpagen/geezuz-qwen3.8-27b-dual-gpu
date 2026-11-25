@@ -24,9 +24,10 @@ namespace engine::pipeline {
  * The server whose poster it is must outlive the pipeline: the pipeline stops and joins its thread when it is
  * destroyed or stopped.
  */
-export template<kv::Geometry G, model::RowBudget B, sched::Tuning T, Cards<G> C, Front F>
+export template<kv::Geometry G, model::RowBudget B, sched::Tuning T, Cards<G> C, class F>
+    requires Front<F, typename C::Error>
 class BasicPipeline {
-	using Worker = card_scheduler::Worker<Intake<typename F::Submission>, intake_capacity, core::Result<void, EngineError>>;
+	using Worker = card_scheduler::Worker<Intake<typename F::Submission>, intake_capacity, core::Result<void, EngineError<typename C::Error>>>;
 
 public:
 	[[nodiscard]] static auto start(http::Poster<typename F::Update> poster, tokenizer::Tokenizer tokenizer, C cards, F front)
@@ -51,9 +52,10 @@ public:
 
 	/**
 	 * Stops the engine's thread and returns why it ended: a failure of the cards or of its wait, or nothing when it
-	 * served until now. A failed engine posts nothing more; its owner decides what the process does next.
+	 * served until now. A failed engine has posted the front's `failed` as its last update, unless it was stopped while
+	 * the server's mailbox stayed full; its owner decides what the process does next.
 	 */
-	[[nodiscard]] auto stop() -> core::Result<void, EngineError> {
+	[[nodiscard]] auto stop() -> core::Result<void, EngineError<typename C::Error>> {
 		return worker_->stop();
 	}
 
@@ -69,7 +71,8 @@ private:
 };
 
 /** The engine's pipeline: the model's pool, the shipped row budget and the prefill share. */
-export template<Cards<kv::model_geometry> C, Front F>
+export template<Cards<kv::model_geometry> C, class F>
+    requires Front<F, typename C::Error>
 using Pipeline = BasicPipeline<kv::model_geometry, model::row_budget, sched::tuning, C, F>;
 
 }

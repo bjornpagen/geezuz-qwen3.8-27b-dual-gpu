@@ -34,6 +34,12 @@ public:
 		status_ = std::move(status);
 	}
 
+	/** The last update, posted after everything held: a status not yet posted is dropped, since nothing follows it. */
+	auto close(Update last) -> void {
+		status_.reset();
+		held_.push_back(std::move(last));
+	}
+
 	/** Posts everything held, oldest first, until the mailbox refuses one. */
 	[[nodiscard]] auto flush() -> Sent {
 		while (!held_.empty()) {
