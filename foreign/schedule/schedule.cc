@@ -37,7 +37,6 @@ export using device::Step;
 export using device::Tensors;
 export using device::Traffic;
 
-export using device::attention_chunk_positions;
 export using device::candidates_per_row;
 export using device::decode_roles;
 export using device::epilogue_scratch_bytes;

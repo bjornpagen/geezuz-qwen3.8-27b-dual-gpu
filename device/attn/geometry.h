@@ -25,8 +25,6 @@ inline constexpr Count block_positions = model::kv_block_tokens;
 inline constexpr Count chunk_positions = model::attention::chunk_positions;
 inline constexpr Count max_chunks = model::attention::max_chunks;
 
-static_assert(schedule::attention_chunk_positions == chunk_positions, "the schedule's chunk is the model's");
-
 /** Rows one slot brings into a cycle: its committed token and its deepest drafts. */
 inline constexpr Count max_rows = 1 + model::drafts(model::max_draft_depth);
 

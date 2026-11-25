@@ -194,11 +194,6 @@ inline constexpr Count deltanet_state_bytes_per_layer_per_slot =
 inline constexpr Count kv_bytes_per_position_per_layer =
     model::kv_heads_per_card * 2 * model::head_dim * model::element_bytes(model::Format::Bf16);
 
-/** Attention splits a context into chunks at fixed absolute positions: two per kv block. */
-inline constexpr Count attention_chunk_positions = model::kv_block_tokens / 2;
-
-static_assert(attention_chunk_positions * 2 == model::kv_block_tokens, "a kv block is two whole chunks");
-
 // ---------------------------------------------------------------------------------------------------------------------
 // What each phase reads from the image.
 
