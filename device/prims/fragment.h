@@ -39,8 +39,8 @@ struct Coordinate {
 enum class Transpose : unsigned char { Plain, Transposed };
 
 /**
- * The element of 8 x 8 matrix `reg` that `ldmatrix` puts in `lane`'s register `reg`, half `half`. Lane 8m + r
- * supplies the address of matrix m's row r, sixteen contiguous bytes.
+ * The element of 8 x 8 matrix j that `ldmatrix` puts in half `half` of `lane`'s register j (the same for every j).
+ * Lane 8m + r supplies the address of matrix m's row r, sixteen contiguous bytes.
  */
 [[nodiscard]] constexpr auto ldmatrix(int lane, int half, Transpose transpose) -> Coordinate {
 	Coordinate const plain = {.row = lane / 4, .column = 2 * (lane % 4) + half};

@@ -4,7 +4,8 @@
 // functions, the baker, the cpu reference, the microbenchmark drivers and the tests) computes with the very
 // definitions the kernels compile. Device code cannot import modules, so each definition is a device header;
 // including it inside the purview, under one export, makes its declarations this module's surface without restating
-// a name. Below them, the host-only boundary pieces: the finite e4m3 code as a parsed type and the baker's tiles.
+// a name. Below them, the host-only boundary pieces: the finite e4m3 code as a parsed type, and the host side of the
+// transcendentals' device digest.
 export module engine.prims;
 
 import std;
@@ -13,6 +14,8 @@ export extern "C++" {
 #include "prims/budget.h"
 #include "prims/fragment.h"
 #include "prims/numeric.h"
+#include "prims/stage_ring.h"
+#include "prims/selfcheck.h"
 #include "prims/tile.h"
 #include "prims/transcendental.h"
 }
@@ -91,6 +94,42 @@ export [[nodiscard]] constexpr auto bake_bf16_tile(std::span<std::uint16_t const
 		words.at(static_cast<std::size_t>(word)) = packed;
 	}
 	return words;
+}
+
+/** `function` of `input`, by the host's compilation of the transcendentals header. */
+export [[nodiscard]] constexpr auto evaluate(device::selfcheck::Function function, float input) -> float {
+	switch (function) {
+	case device::selfcheck::Function::Exp:
+		return device::math::exp(input);
+	case device::selfcheck::Function::Log:
+		return device::math::log(input);
+	case device::selfcheck::Function::Rsqrt:
+		return device::math::rsqrt(input);
+	case device::selfcheck::Function::Sigmoid:
+		return device::math::sigmoid(input);
+	case device::selfcheck::Function::Silu:
+		return device::math::silu(input);
+	case device::selfcheck::Function::Softplus:
+		return device::math::softplus(input);
+	}
+	std::unreachable();
+}
+
+/**
+ * The digest `prims_digest_transcendentals` writes for (`function`, `block`), computed on the host: the device
+ * computes the host's bits exactly when the two agree for every function and block.
+ */
+export [[nodiscard]] auto digest(device::selfcheck::Function function, std::uint32_t block) -> std::uint64_t {
+	namespace check = device::selfcheck;
+	auto const first = static_cast<std::uint64_t>(block) * check::digest_budget.threads * check::digest_run;
+	auto const count = static_cast<std::uint64_t>(check::digest_budget.threads) * check::digest_run;
+	auto sum = std::uint64_t{0};
+	for (auto offset = std::uint64_t{0}; offset < count; ++offset) {
+		auto const input = static_cast<std::uint32_t>(first + offset);
+		auto const output = evaluate(function, __builtin_bit_cast(float, input));
+		sum += check::digest_term(input, __builtin_bit_cast(std::uint32_t, output));
+	}
+	return sum;
 }
 
 }

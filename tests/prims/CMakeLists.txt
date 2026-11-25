@@ -2,6 +2,9 @@
 engine_test(prims.budget SOURCES budget.test.cc LINK engine_prims)
 engine_test(prims.tile SOURCES tile.test.cc LINK engine_prims)
 engine_test(prims.numeric SOURCES numeric.test.cc LINK engine_prims)
+engine_test(prims.fragment SOURCES fragment.test.cc LINK engine_prims)
+engine_test(prims.stage_ring SOURCES stage_ring.test.cc LINK engine_prims)
+
 # The transcendentals are proven over all 2^32 inputs, too many for one deadline: one executable, one ctest case per
 # function and eighth of the inputs, run in parallel.
 add_executable(engine_test_prims.transcendental transcendental.test.cc)
