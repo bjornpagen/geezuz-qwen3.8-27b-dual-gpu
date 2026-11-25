@@ -6,6 +6,7 @@ import engine.core;
 import engine.model;
 import engine.prims;
 import engine.sha256;
+import engine.vocabulary;
 
 namespace engine::image {
 
@@ -51,11 +52,13 @@ template<class E>
 
 /**
  * The model description as canonical text: every dimension, layer kind, numeric convention and name pattern of
- * `engine.model`, every inventory tensor with its shape, scope, format and split, the ranges each card holds of it, and
- * every field of the weight tile encoding the device decodes. The ranges come from the split functions, so a change to
- * how a tensor divides changes the text even when no constant does; the tile encoding is in it so an image baked under
- * another encoding is refused rather than decoded wrongly. The text exists to be hashed; a human can read it to see
- * what an image's description digest covers.
+ * `engine.model`, every inventory tensor with its shape, scope, format and split, the ranges each card holds of it,
+ * every field of the weight tile encoding the device decodes, and the digest of the draft vocabulary list. The ranges
+ * come from the split functions, so a change to how a tensor divides changes the text even when no constant does. The
+ * tile encoding is in it so an image baked under another encoding is refused rather than decoded wrongly; the lm_head's
+ * split names the vocabulary permutation and the list's digest fixes the ids it permutes, so the rows each card's
+ * lm_head holds are covered the same way. The text exists to be hashed; a human can read it to see what an image's
+ * description digest covers.
  */
 [[nodiscard]] constexpr auto describe() -> std::string {
 	namespace m = model;
@@ -103,6 +106,8 @@ template<class E>
 	lines.line("tile_encoding", {tile.version, count(tile.bytes), count(tile.unit_bytes), count(tile.e4m3_rows), count(tile.e4m3_columns),
 	                             count(tile.bf16_rows), count(tile.bf16_columns), tile.placed_mask, tile.left_mask, tile.right_mask,
 	                             tile.select_lut, tile.two_to_120, tile.negative_zero});
+	auto const draft = sha256::hex(vocabulary::draft_vocabulary_digest.bytes);
+	lines.word("draft_vocabulary", std::string_view{draft.data(), draft.size()});
 	return std::move(lines.text);
 }
 
