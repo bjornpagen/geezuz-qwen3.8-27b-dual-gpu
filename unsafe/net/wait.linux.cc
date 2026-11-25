@@ -29,6 +29,18 @@ namespace engine::net {
 constexpr std::uint64_t wake_token = token_limit;
 constexpr std::uint64_t stop_token = token_limit + 1;
 
+/** Combines vendor flags the kernel ABI spells as signed ints, as the bit set they are. */
+template<class... Flags>
+[[nodiscard]] constexpr auto flags(Flags... each) -> int {
+	return static_cast<int>((static_cast<unsigned>(each) | ...));
+}
+
+/** Combines epoll event bits into the unsigned mask an epoll_event carries. */
+template<class... Events>
+[[nodiscard]] constexpr auto epoll_mask(Events... each) -> std::uint32_t {
+	return (static_cast<std::uint32_t>(each) | ...);
+}
+
 /** Registers or re-arms `fd` in the epoll set; zero or the errno of the refusal. */
 [[nodiscard]] auto arm(int queue, int fd, std::uint32_t events, std::uint64_t token) -> int {
 	auto event = ::epoll_event{};
@@ -73,12 +85,12 @@ public:
 		if (!queue.valid()) {
 			return std::unexpected(failure(Stage::Queue, errno));
 		}
-		auto waker = Fd{::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)};
+		auto waker = Fd{::eventfd(0, flags(EFD_NONBLOCK, EFD_CLOEXEC))};
 		if (!waker.valid()) {
 			return std::unexpected(failure(Stage::Queue, errno));
 		}
 		// Level-triggered: the counter stays readable until a wait drains it, so no wake between two waits is lost.
-		if (auto const code = arm(queue.get(), waker.get(), EPOLLIN, wake_token); code != 0) {
+		if (auto const code = arm(queue.get(), waker.get(), epoll_mask(EPOLLIN), wake_token); code != 0) {
 			return std::unexpected(failure(Stage::Queue, code));
 		}
 		return Queue{std::move(queue), std::move(waker)};
@@ -98,16 +110,16 @@ public:
 	}
 
 	[[nodiscard]] auto watch(int fd, std::uint64_t token, Interest interest) -> core::Result<void, NetError> {
-		auto events = std::uint32_t{EPOLLONESHOT};
+		auto events = epoll_mask(EPOLLONESHOT);
 		switch (interest) {
 		case Interest::Read:
-			events |= EPOLLIN | EPOLLRDHUP;
+			events |= epoll_mask(EPOLLIN, EPOLLRDHUP);
 			break;
 		case Interest::Write:
-			events |= EPOLLOUT;
+			events |= epoll_mask(EPOLLOUT);
 			break;
 		case Interest::ReadWrite:
-			events |= EPOLLIN | EPOLLRDHUP | EPOLLOUT;
+			events |= epoll_mask(EPOLLIN, EPOLLRDHUP, EPOLLOUT);
 			break;
 		}
 		if (auto const code = arm(queue_.get(), fd, events, token); code != 0) {
@@ -132,13 +144,13 @@ public:
 		if (auto const code = ::pthread_sigmask(SIG_BLOCK, &mask, &saved); code != 0) {
 			return std::unexpected(failure(Stage::Signal, code));
 		}
-		auto signals = Fd{::signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC)};
+		auto signals = Fd{::signalfd(-1, &mask, flags(SFD_NONBLOCK, SFD_CLOEXEC))};
 		if (!signals.valid()) {
 			auto const code = errno;
 			std::ignore = ::pthread_sigmask(SIG_SETMASK, &saved, nullptr);
 			return std::unexpected(failure(Stage::Signal, code));
 		}
-		if (auto const code = arm(queue_.get(), signals.get(), EPOLLIN, stop_token); code != 0) {
+		if (auto const code = arm(queue_.get(), signals.get(), epoll_mask(EPOLLIN), stop_token); code != 0) {
 			std::ignore = ::pthread_sigmask(SIG_SETMASK, &saved, nullptr);
 			return std::unexpected(failure(Stage::Signal, code));
 		}
@@ -173,10 +185,10 @@ public:
 				drain_signals(facts);
 				continue;
 			}
-			if ((event.events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0) {
+			if ((event.events & epoll_mask(EPOLLIN, EPOLLRDHUP, EPOLLHUP, EPOLLERR)) != 0) {
 				push(Ready{.token = token, .direction = Direction::Readable});
 			}
-			if ((event.events & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0) {
+			if ((event.events & epoll_mask(EPOLLOUT, EPOLLHUP, EPOLLERR)) != 0) {
 				push(Ready{.token = token, .direction = Direction::Writable});
 			}
 		}
@@ -211,12 +223,12 @@ private:
 
 /** A new close-on-exec stream socket, or -1 with errno set. */
 [[nodiscard]] auto open_stream_socket() -> int {
-	return ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	return ::socket(AF_INET, flags(SOCK_STREAM, SOCK_CLOEXEC), 0);
 }
 
 /** The next pending connection, already nonblocking and close-on-exec, or -1 with errno set. */
 [[nodiscard]] auto accept_from(int listener) -> int {
-	return ::accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+	return ::accept4(listener, nullptr, nullptr, flags(SOCK_NONBLOCK, SOCK_CLOEXEC));
 }
 
 /** Makes a connected socket nonblocking and free of Nagle's delay; zero or an errno. */
