@@ -24,11 +24,59 @@ inline constexpr Count cards = 2;
 
 inline constexpr Count slots = 8;
 
-/** Verify rows per decode cycle, shared by every slot's committed token and drafts. */
-inline constexpr Count rows_per_cycle = 24;
+/** Verify rows come in tiles of the mma's n operand: tokens are the n8 side, weights the m16 side. */
+inline constexpr Count row_tile = 8;
 
-/** Draft tokens a slot may carry into one cycle. */
-inline constexpr Count max_draft_depth = 4;
+/**
+ * Verify rows per decode cycle, shared by every slot's committed token and drafts. A budget between multiples of the
+ * tile costs the next tile, so only whole tiles exist; past four, compute overtakes the weight stream.
+ */
+enum class RowBudget : unsigned char {
+	ThreeTiles,
+	FourTiles,
+};
+
+[[nodiscard]] constexpr auto rows(RowBudget budget) -> Count {
+	switch (budget) {
+	case RowBudget::ThreeTiles:
+		return 3 * row_tile;
+	case RowBudget::FourTiles:
+		return 4 * row_tile;
+	}
+	__builtin_unreachable();
+}
+
+inline constexpr RowBudget row_budgets[] = {RowBudget::ThreeTiles, RowBudget::FourTiles};
+
+/** The budget the engine ships with; four tiles is the first alternative measured on the cards. */
+inline constexpr RowBudget row_budget = RowBudget::ThreeTiles;
+
+/**
+ * Draft tokens a slot carries into one cycle. The producer stream depends only on this, so each depth is its own
+ * compile-time stream program.
+ */
+enum class DraftDepth : unsigned char {
+	One,
+	Two,
+	Three,
+	Four,
+};
+
+[[nodiscard]] constexpr auto drafts(DraftDepth depth) -> Count {
+	switch (depth) {
+	case DraftDepth::One:
+		return 1;
+	case DraftDepth::Two:
+		return 2;
+	case DraftDepth::Three:
+		return 3;
+	case DraftDepth::Four:
+		return 4;
+	}
+	__builtin_unreachable();
+}
+
+inline constexpr DraftDepth max_draft_depth = DraftDepth::Four;
 
 // GDDR6X on each 3090.
 inline constexpr Count card_memory_bytes = Count{24} * 1024 * 1024 * 1024;
@@ -36,10 +84,12 @@ inline constexpr Count card_memory_bytes = Count{24} * 1024 * 1024 * 1024;
 /** Activations, partial-sum exchange buffers, rings and scratch per card. */
 inline constexpr Count workspace_bytes = 1'000'000'000;
 
-/** Positions of bf16 kv the shared pool holds per card, for all slots and the prefix cache together. */
-inline constexpr Count kv_pool_tokens = 280'000;
+// What the driver keeps of each card before the engine allocates: its context, the jit-compiled module and the
+// resident kernel's local memory. 512 MiB is an assumption, not a measurement; bring-up on the cards measures it and
+// replaces this figure.
+inline constexpr Count driver_reserve_bytes = Count{512} * 1024 * 1024;
 
-/** The part of the kv pool deltanet snapshots may occupy; the rest is kept for kv. */
+/** The part of the block memory left after weights, workspace and slot state that holds deltanet snapshots. */
 inline constexpr Share snapshot_share = {.numerator = 1, .denominator = 4};
 
 inline constexpr Count hidden = 5120;
@@ -492,20 +542,29 @@ inline constexpr Count body_bytes_per_card = stream_bytes(Stream::Body);
 inline constexpr Count head_bytes_per_card = stream_bytes(Stream::Head);
 inline constexpr Count mtp_bytes_per_card = stream_bytes(Stream::Mtp);
 
-/** The draft lm_head: the lm_head rows of the draft vocabulary, packed, half on each card. */
+/**
+ * One draft lm_head step: each card's half of the draft vocabulary. It is a view, not a copy: the baker orders each
+ * card's lm_head rows so those rows are a contiguous prefix, so these bytes are streamed but take no memory of their own.
+ */
 inline constexpr Count draft_head_bytes_per_card = draft_vocab_per_card * hidden * element_bytes(Format::Bf16);
 
 /** Host bytes of the embedding table, gathered by token row each cycle. */
 inline constexpr Count embedding_host_bytes = vocab * hidden * element_bytes(Format::Bf16);
 
-// A cycle runs the mtp head once to catch up on the accepted tokens and once per draft; the draft lm_head once per
-// draft.
-inline constexpr Count mtp_passes_per_cycle = 1 + max_draft_depth;
-inline constexpr Count draft_head_passes_per_cycle = max_draft_depth;
-
 inline constexpr Count main_pass_bytes_per_card = body_bytes_per_card + head_bytes_per_card;
-inline constexpr Count mtp_bytes_per_cycle_per_card = mtp_passes_per_cycle * mtp_bytes_per_card;
-inline constexpr Count draft_head_bytes_per_cycle_per_card = draft_head_passes_per_cycle * draft_head_bytes_per_card;
+
+// d drafts take d mtp passes: the catch-up pass over the accepted tokens already yields the first draft, then d - 1
+// steps follow. Each pass ends in one draft lm_head step.
+[[nodiscard]] constexpr auto mtp_bytes_per_cycle_per_card(DraftDepth depth) -> Count {
+	return drafts(depth) * mtp_bytes_per_card;
+}
+
+[[nodiscard]] constexpr auto draft_head_bytes_per_cycle_per_card(DraftDepth depth) -> Count {
+	return drafts(depth) * draft_head_bytes_per_card;
+}
+
+/** Weight bytes resident on each card: the trunk, the head and the mtp head; the draft lm_head is a view. */
+inline constexpr Count weight_bytes_per_card = body_bytes_per_card + head_bytes_per_card + mtp_bytes_per_card;
 
 /** Parameters of the engine's tensors in each format, whole model; block scales count as bf16 parameters. */
 [[nodiscard]] consteval auto parameters(Format format) -> Count {
@@ -533,8 +592,10 @@ inline constexpr Count gigabyte = 1'000'000'000;
 static_assert(rounds_to(body_bytes_per_card, gigabyte / 100, 1219), "body: 12.19 GB per card per cycle");
 static_assert(rounds_to(head_bytes_per_card, gigabyte / 100, 127), "lm_head: 1.27 GB per card per cycle");
 static_assert(rounds_to(main_pass_bytes_per_card, gigabyte / 100, 1346), "main pass: 13.46 GB per card per cycle");
-static_assert(rounds_to(mtp_bytes_per_cycle_per_card, gigabyte / 10, 12), "mtp head: 1.2 GB per card per cycle");
-static_assert(rounds_to(draft_head_bytes_per_cycle_per_card, gigabyte / 100, 67), "draft lm_head: 0.67 GB per card per cycle");
+static_assert(rounds_to(mtp_bytes_per_card, gigabyte / 100, 24), "mtp head: 0.24 GB per card per pass");
+static_assert(rounds_to(mtp_bytes_per_cycle_per_card(DraftDepth::Four), gigabyte / 100, 95), "mtp head: 0.95 GB at d = 4");
+static_assert(rounds_to(draft_head_bytes_per_card, gigabyte / 100, 17), "draft lm_head: 0.17 GB per card per step");
+static_assert(rounds_to(draft_head_bytes_per_cycle_per_card(DraftDepth::Four), gigabyte / 100, 67), "draft lm_head: 0.67 GB at d = 4");
 static_assert(rounds_to(embedding_host_bytes, gigabyte / 100, 254), "embedding table: 2.54 GB in host memory");
 static_assert(rounds_to(parameters(Format::E4m3), gigabyte / 100, 2470), "24.70b e4m3 parameters");
 static_assert(rounds_to(parameters(Format::Bf16), gigabyte / 100, 262), "2.62b bf16 parameters");
@@ -550,10 +611,7 @@ inline constexpr Count trunk_kv_bytes_per_token_per_card =
 /** Positions per kv block: two of the split-k attention's 32-position tiles. */
 inline constexpr Count kv_block_tokens = 64;
 inline constexpr Count kv_block_bytes = kv_block_tokens * kv_bytes_per_token_per_card;
-inline constexpr Count kv_pool_blocks = kv_pool_tokens / kv_block_tokens;
-inline constexpr Count kv_pool_bytes = kv_pool_blocks * kv_block_bytes;
 
-static_assert(kv_pool_tokens % kv_block_tokens == 0, "the pool is whole blocks");
 static_assert(trunk_kv_bytes_per_token_per_card == Count{32} * 1024, "trunk kv reads: 32 KiB per position per card");
 
 /** fp32 deltanet state of one slot on one card: a key_dim x value_dim matrix per value head per deltanet layer. */
@@ -564,10 +622,63 @@ inline constexpr Count deltanet_state_bytes_per_slot =
 inline constexpr Count conv_window_bytes_per_slot =
     trunk_layers_of(Mixer::LinearAttention) * (conv_kernel - 1) * (conv_channels / cards) * element_bytes(Format::Bf16);
 
-/** A deltanet snapshot (recurrent state and convolution window) occupies whole kv blocks of the pool. */
-inline constexpr Count snapshot_blocks = divide_up(deltanet_state_bytes_per_slot + conv_window_bytes_per_slot, kv_block_bytes);
-inline constexpr Count snapshot_pool_blocks = kv_pool_blocks * snapshot_share.numerator / snapshot_share.denominator;
+inline constexpr Count slot_state_bytes = deltanet_state_bytes_per_slot + conv_window_bytes_per_slot;
+
+/** A deltanet snapshot (recurrent state and convolution window) occupies whole blocks. */
+inline constexpr Count snapshot_blocks = divide_up(slot_state_bytes, kv_block_bytes);
 
 static_assert(rounds_to(deltanet_state_bytes_per_slot, gigabyte / 1000, 75), "deltanet state: 75 MB per slot per card");
+
+/** Each card's memory, outermost first; the kv pool is what remains, so it is derived, never chosen. */
+struct CardMemory {
+	Count driver_reserve;
+	Count weights;
+	Count workspace;
+	Count slot_state;
+	Count snapshot_pool_blocks;
+	Count kv_pool_blocks;
+};
+
+[[nodiscard]] consteval auto plan_card_memory() -> CardMemory {
+	auto const fixed = driver_reserve_bytes + weight_bytes_per_card + workspace_bytes + slots * slot_state_bytes;
+	auto const blocks = (card_memory_bytes - fixed) / kv_block_bytes;
+	auto const snapshots = blocks * snapshot_share.numerator / snapshot_share.denominator / snapshot_blocks;
+	auto const snapshot_pool = snapshots * snapshot_blocks;
+	return {
+	    .driver_reserve = driver_reserve_bytes,
+	    .weights = weight_bytes_per_card,
+	    .workspace = workspace_bytes,
+	    .slot_state = slots * slot_state_bytes,
+	    .snapshot_pool_blocks = snapshot_pool,
+	    .kv_pool_blocks = blocks - snapshot_pool,
+	};
+}
+
+inline constexpr CardMemory card_memory = plan_card_memory();
+
+inline constexpr Count snapshot_pool_blocks = card_memory.snapshot_pool_blocks;
+inline constexpr Count snapshot_capacity = snapshot_pool_blocks / snapshot_blocks;
+inline constexpr Count kv_pool_blocks = card_memory.kv_pool_blocks;
+inline constexpr Count kv_pool_tokens = kv_pool_blocks * kv_block_tokens;
+inline constexpr Count kv_pool_bytes = kv_pool_blocks * kv_block_bytes;
+
+static_assert(card_memory.driver_reserve + card_memory.weights + card_memory.workspace + card_memory.slot_state +
+                      (card_memory.snapshot_pool_blocks + card_memory.kv_pool_blocks) * kv_block_bytes <=
+                  card_memory_bytes,
+              "everything a card holds fits its memory");
+static_assert(snapshot_blocks <= snapshot_pool_blocks, "a snapshot fits the snapshot pool");
+static_assert(snapshot_capacity >= slots, "every slot can park its state in the prefix cache at once");
+static_assert(kv_pool_tokens >= slots * kv_block_tokens, "every slot holds at least one kv block");
+
+[[nodiscard]] consteval auto row_budgets_fit_the_slots() -> bool {
+	for (auto const budget : row_budgets) {
+		if (rows(budget) < slots || rows(budget) > slots * (1 + drafts(max_draft_depth))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static_assert(row_budgets_fit_the_slots(), "every row budget gives each slot its committed row and no slot more than its deepest draft");
 
 }
