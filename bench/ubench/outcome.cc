@@ -155,60 +155,9 @@ export [[nodiscard]] auto on(model::Card card) -> std::string {
 	return std::format("card {}", std::to_underlying(card));
 }
 
-/** The operator's account of one device failure, one overload per kind. */
-struct DescribeDevice {
-	[[nodiscard]] auto operator()(device::DriverUnavailable const& reason) const -> std::string {
-		return std::format("driver unavailable: {} {}", reason.name, reason.stage == device::LoadStage::Open ? "would not open" : "lacks an entry point");
-	}
-
-	[[nodiscard]] auto operator()(device::DriverTooOld const& reason) const -> std::string {
-		return std::format("driver too old: CUDA {} found, {} required", reason.found, reason.required);
-	}
-
-	[[nodiscard]] auto operator()(device::CardCount const& reason) const -> std::string {
-		return std::format("{} cards found, two required", reason.found);
-	}
-
-	[[nodiscard]] auto operator()(device::WrongCard const& reason) const -> std::string {
-		return std::format("card {} is not an RTX 3090 (fact {} reads {})", reason.ordinal, std::to_underlying(reason.fact), reason.found);
-	}
-
-	[[nodiscard]] auto operator()(device::PeerUnreachable const& reason) const -> std::string {
-		return std::format("card {} cannot map card {}'s memory", reason.from, reason.to);
-	}
-
-	[[nodiscard]] auto operator()(device::NotNvlink const& reason) const -> std::string {
-		return std::format("card {} link {} does not join the peer (fault {})", reason.ordinal, reason.link, std::to_underlying(reason.fault));
-	}
-
-	[[nodiscard]] auto operator()(device::Failure const& reason) const -> std::string {
-		return std::format("driver call {} failed with status {}", reason.symbol, std::to_underlying(reason.status));
-	}
-
-	[[nodiscard]] auto operator()(device::ManagementFailure const& reason) const -> std::string {
-		return std::format("nvml call {} failed with status {}", reason.symbol, std::to_underlying(reason.status));
-	}
-
-	[[nodiscard]] auto operator()(device::ModuleRejected const& reason) const -> std::string {
-		return std::format("the jit refused an image: {}", reason.log);
-	}
-
-	[[nodiscard]] auto operator()(device::KernelMissing const& reason) const -> std::string {
-		return std::format("an image lacks kernel {}", reason.entry);
-	}
-
-	[[nodiscard]] auto operator()(device::KernelSignature const& reason) const -> std::string {
-		return std::format("kernel {} does not take one {}-byte parameter struct", reason.entry, reason.expected);
-	}
-
-	[[nodiscard]] auto operator()(device::HugepageError const& reason) const -> std::string {
-		return std::format("pinned host memory unavailable (failure {})", std::to_underlying(reason.failure));
-	}
-};
-
 struct Describe {
 	[[nodiscard]] auto operator()(device::DeviceError const& failure) const -> std::string {
-		return std::visit(DescribeDevice{}, failure.reason);
+		return device::describe(failure);
 	}
 
 	[[nodiscard]] auto operator()(Hung const& hung) const -> std::string {

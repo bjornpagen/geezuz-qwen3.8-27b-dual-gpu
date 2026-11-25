@@ -69,59 +69,9 @@ export [[nodiscard]] auto render(model::Card card, Telemetry const& telemetry) -
 	                   milliseconds(counters.hw_power_brake_slowdown));
 }
 
-struct DescribeDevice {
-	[[nodiscard]] auto operator()(device::DriverUnavailable const& reason) const -> std::string {
-		return std::format("the driver library {} is unavailable", reason.name);
-	}
-
-	[[nodiscard]] auto operator()(device::DriverTooOld const& reason) const -> std::string {
-		return std::format("the driver is too old: CUDA {} found, {} required", reason.found, reason.required);
-	}
-
-	[[nodiscard]] auto operator()(device::CardCount const& reason) const -> std::string {
-		return std::format("{} cards found, two required", reason.found);
-	}
-
-	[[nodiscard]] auto operator()(device::WrongCard const& reason) const -> std::string {
-		return std::format("card {} is not an RTX 3090 (fact {} reads {})", reason.ordinal, std::to_underlying(reason.fact), reason.found);
-	}
-
-	[[nodiscard]] auto operator()(device::PeerUnreachable const& reason) const -> std::string {
-		return std::format("card {} cannot map card {}'s memory", reason.from, reason.to);
-	}
-
-	[[nodiscard]] auto operator()(device::NotNvlink const& reason) const -> std::string {
-		return std::format("card {} link {} does not join the peer (fault {})", reason.ordinal, reason.link, std::to_underlying(reason.fault));
-	}
-
-	[[nodiscard]] auto operator()(device::Failure const& reason) const -> std::string {
-		return std::format("driver call {} failed with status {}", reason.symbol, std::to_underlying(reason.status));
-	}
-
-	[[nodiscard]] auto operator()(device::ManagementFailure const& reason) const -> std::string {
-		return std::format("nvml call {} failed with status {}", reason.symbol, std::to_underlying(reason.status));
-	}
-
-	[[nodiscard]] auto operator()(device::ModuleRejected const& reason) const -> std::string {
-		return std::format("the jit refused the soak's image: {}", reason.log);
-	}
-
-	[[nodiscard]] auto operator()(device::KernelMissing const& reason) const -> std::string {
-		return std::format("the soak's image lacks kernel {}", reason.entry);
-	}
-
-	[[nodiscard]] auto operator()(device::KernelSignature const& reason) const -> std::string {
-		return std::format("kernel {} does not take one {}-byte parameter struct", reason.entry, reason.expected);
-	}
-
-	[[nodiscard]] auto operator()(device::HugepageError const& reason) const -> std::string {
-		return std::format("no hugepages for pinned host memory (failure {}): reserve them on numa node 0", std::to_underlying(reason.failure));
-	}
-};
-
 struct Describe {
 	[[nodiscard]] auto operator()(device::DeviceError const& failure) const -> std::string {
-		return std::visit(DescribeDevice{}, failure.reason);
+		return device::describe(failure);
 	}
 
 	[[nodiscard]] auto operator()(Hung const& hung) const -> std::string {

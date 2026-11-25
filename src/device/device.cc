@@ -4,3 +4,4 @@ export module engine.device;
 export import :vocabulary;
 export import :devices;
 export import :ring;
+export import :describe;
