@@ -456,6 +456,8 @@ struct Refusal {
 	auto const refusals = std::vector<Refusal>{
 	    {.body = R"([])", .error = at(shape(Expected::Object, Kind::Array), {})},
 	    {.body = R"({"messages":[]} {})", .error = at(parse(json::ParseFault::TrailingContent), {})},
+	    {.body = R"({"messages":[]}x)", .error = at(parse(json::ParseFault::TrailingContent), {})},
+	    {.body = R"({"messages":[{"role":"user","content":"]}"}]} x)", .error = at(parse(json::ParseFault::TrailingContent), {})},
 	    {.body = R"({"messages":[)", .error = at(parse(json::ParseFault::Truncated), {})},
 	    {.body = R"({})", .error = at(Violation::MissingField, {P{"messages"}})},
 	    {.body = R"({"messages":[],"best_of":2})", .error = at(Violation::UnknownField, {P{"best_of"}})},

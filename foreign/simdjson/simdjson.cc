@@ -169,6 +169,72 @@ export enum class Kind : std::uint8_t {
 	return std::unexpected(ParseError{.fault = fault_of(code)});
 }
 
+/** The index just past the string starting at `at`, or nothing when the text ends inside it. */
+[[nodiscard]] auto past_string(std::string_view text, std::size_t at) -> std::optional<std::size_t> {
+	for (++at; at < text.size(); ++at) {
+		if (text[at] == '\\') {
+			++at;
+		} else if (text[at] == '"') {
+			return at + 1;
+		}
+	}
+	return std::nullopt;
+}
+
+/** The index just past the root value starting at `at`, by its brackets and strings, or nothing when it is open. */
+[[nodiscard]] auto past_root(std::string_view text, std::size_t at) -> std::optional<std::size_t> {
+	if (text[at] == '"') {
+		return past_string(text, at);
+	}
+	if (text[at] != '{' && text[at] != '[') {
+		auto const end = text.find_first_of(" \t\n\r{}[],:\"", at);
+		return end == std::string_view::npos ? std::nullopt : std::optional<std::size_t>{end};
+	}
+	auto depth = std::size_t{0};
+	while (at < text.size()) {
+		auto const byte = text[at];
+		if (byte == '"') {
+			auto const after = past_string(text, at);
+			if (!after) {
+				return std::nullopt;
+			}
+			at = *after;
+			continue;
+		}
+		if (byte == '{' || byte == '[') {
+			++depth;
+		} else if (byte == '}' || byte == ']') {
+			--depth;
+			if (depth == 0) {
+				return at + 1;
+			}
+		}
+		++at;
+	}
+	return std::nullopt;
+}
+
+/**
+ * Whether the text's root value ends before the text does, with more than whitespace after it. simdjson checks a
+ * root container by its last structural byte, and scans strings before it reads any value, so a complete root
+ * followed by content reads to it as an unclosed container or string; this walk tells the two apart.
+ */
+[[nodiscard]] auto root_closes_early(std::string_view text) -> bool {
+	auto constexpr whitespace = std::string_view{" \t\n\r"};
+	auto const at = text.find_first_not_of(whitespace);
+	if (at == std::string_view::npos) {
+		return false;
+	}
+	auto const end = past_root(text, at);
+	return end && text.find_first_not_of(whitespace, *end) != std::string_view::npos;
+}
+
+/** An unclosed-container or unclosed-string code, told apart from content after a closed root. */
+[[nodiscard]] auto truncated_or_trailing(std::string_view text, ::simdjson::error_code code) -> ::simdjson::error_code {
+	auto const unclosed = code == ::simdjson::INCOMPLETE_ARRAY_OR_OBJECT || code == ::simdjson::UNCLOSED_STRING;
+	return unclosed && root_closes_early(text) ? ::simdjson::TRAILING_CONTENT : code;
+}
+
 /** Whether bytes are well-formed UTF-8, by the same kernel the parser uses. */
 export [[nodiscard]] auto valid_utf8(std::string_view text) -> bool {
 	return ::simdjson::validate_utf8(text.data(), text.size());
@@ -267,9 +333,14 @@ private:
 	friend class ArrayCursor;
 
 	explicit Value(od::value value) : handle_{value} {}
-	explicit Value(od::document_reference root) : handle_{root} {}
+	Value(od::document_reference root, std::string_view text) : handle_{root}, root_text_{text} {}
+
+	/** A container read failed as unclosed: the root's text tells a truncation from content after a closed root. */
+	[[nodiscard]] auto unclosed(::simdjson::error_code code) const -> std::unexpected<ParseError>;
 
 	std::variant<od::value, od::document_reference> handle_;
+	/** The whole text, for the root only. */
+	std::optional<std::string_view> root_text_;
 };
 
 export struct Field {
@@ -384,20 +455,20 @@ auto Value::string() -> core::Result<std::string_view, ParseError> {
 }
 
 auto Value::object() -> core::Result<ObjectCursor, ParseError> {
-	return on_handle(handle_, [](auto& held) -> core::Result<ObjectCursor, ParseError> {
+	return on_handle(handle_, [this](auto& held) -> core::Result<ObjectCursor, ParseError> {
 		auto object = od::object{};
 		if (auto const code = held.get_object().get(object)) {
-			return failure(code);
+			return unclosed(code);
 		}
 		return ObjectCursor{object};
 	});
 }
 
 auto Value::array() -> core::Result<ArrayCursor, ParseError> {
-	return on_handle(handle_, [](auto& held) -> core::Result<ArrayCursor, ParseError> {
+	return on_handle(handle_, [this](auto& held) -> core::Result<ArrayCursor, ParseError> {
 		auto array = od::array{};
 		if (auto const code = held.get_array().get(array)) {
-			return failure(code);
+			return unclosed(code);
 		}
 		return ArrayCursor{array};
 	});
@@ -412,6 +483,10 @@ auto Value::raw() -> core::Result<std::string_view, ParseError> {
 		auto const end = text.find_last_not_of(" \t\n\r");
 		return end == std::string_view::npos ? std::string_view{} : text.substr(0, end + 1);
 	});
+}
+
+auto Value::unclosed(::simdjson::error_code code) const -> std::unexpected<ParseError> {
+	return failure(root_text_ ? truncated_or_trailing(*root_text_, code) : code);
 }
 
 auto Value::offset(std::string_view text) -> core::Result<std::size_t, ParseError> {
@@ -529,9 +604,9 @@ public:
 		auto const view = ::simdjson::padded_string_view{bytes.data(), bytes.size(), bytes.size() + padding};
 		text_ = bytes;
 		if (auto const code = parser_.iterate(view).get(document_)) {
-			return failure(code);
+			return failure(truncated_or_trailing(bytes, code));
 		}
-		return Value{od::document_reference{document_}};
+		return Value{od::document_reference{document_}, bytes};
 	}
 
 	/**

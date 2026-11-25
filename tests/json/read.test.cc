@@ -188,6 +188,26 @@ auto closers_of(model::Model const& value, std::size_t at, std::vector<std::size
 	return true;
 }
 
+/**
+ * Anything but whitespace after a complete root is trailing content, whatever it is: a word, a number, a bracket, a
+ * second document, an unclosed string.
+ */
+[[nodiscard]] auto trailing_content_named(std::uint64_t seed, std::size_t documents) -> bool {
+	auto rng = engine::testing::generator(seed);
+	auto reader = make_reader();
+	auto constexpr junk = std::array<std::string_view, 12>{"x", "1", "]", "}", "[", "{", "{}", "[1]", "\"", "\"s\"", "tru", ","};
+	for (auto count = std::size_t{0}; count < documents; ++count) {
+		auto const value = model::generate(rng, model::random_shape(rng));
+		auto const text = model::serialize(value, random_style(rng), rng) + " " + std::string{junk[rng() % junk.size()]};
+		auto const read = model::read_model(*reader, text);
+		if (read || model::fault_of(read.error()) != ParseFault::TrailingContent) {
+			std::println("not trailing content: {:?}", text);
+			return false;
+		}
+	}
+	return true;
+}
+
 /** The grammar's refusals, each with its named fault: one representative per rule RFC 8259 states. */
 [[nodiscard]] auto strict_grammar() -> bool {
 	struct Refusal {
@@ -213,6 +233,13 @@ auto closers_of(model::Model const& value, std::size_t at, std::vector<std::size
 	    Refusal{.text = "[fals]", .fault = ParseFault::InvalidLiteral},
 	    Refusal{.text = "1 2", .fault = ParseFault::TrailingContent},
 	    Refusal{.text = "{}}", .fault = ParseFault::TrailingContent},
+	    Refusal{.text = R"({"a":[]} x)", .fault = ParseFault::TrailingContent},
+	    Refusal{.text = "[] x", .fault = ParseFault::TrailingContent},
+	    Refusal{.text = "[1] 2", .fault = ParseFault::TrailingContent},
+	    Refusal{.text = R"({} ")", .fault = ParseFault::TrailingContent},
+	    Refusal{.text = R"({"a":"]"} ])", .fault = ParseFault::TrailingContent},
+	    Refusal{.text = R"({"a":"\"}"} [)", .fault = ParseFault::TrailingContent},
+	    Refusal{.text = R"({"a":"}")", .fault = ParseFault::Truncated},
 	    Refusal{.text = "[1", .fault = ParseFault::Truncated},
 	    Refusal{.text = "{\"a\":", .fault = ParseFault::Truncated},
 	    Refusal{.text = "\"abc", .fault = ParseFault::Truncated},
@@ -397,6 +424,7 @@ auto main() -> int {
 	    engine::testing::Case{.name = "a trailing comma before any closer is malformed (seed 6)", .holds = trailing_commas_refused(6, 2000)},
 	    engine::testing::Case{.name = "a repeated member name is refused (seed 7)", .holds = duplicate_names_refused(7, 2000)},
 	    engine::testing::Case{.name = "each grammar rule's refusal names its fault", .holds = strict_grammar()},
+	    engine::testing::Case{.name = "anything after a complete root is trailing content (seed 12)", .holds = trailing_content_named(12, 20000)},
 	    engine::testing::Case{.name = "words that are not JSON fail", .holds = non_json_words_refused()},
 	    engine::testing::Case{.name = "member names compare after unescaping", .holds = names_compare_unescaped()},
 	    engine::testing::Case{.name = "typed accessors succeed exactly on their kind", .holds = accessors_match_kinds()},
