@@ -558,6 +558,44 @@ struct Refusal {
 	       decoded->temperature == 0.0 && decoded->max_tokens == 4096 && decoded->template_options.thinking == json::Thinking::Disabled;
 }
 
+/**
+ * The chat template's defaults, decided once: a turn thinks unless `enable_thinking` is false, a thinking turn's
+ * effort is `xhigh` unless named, and past turns keep their reasoning unless `preserve_thinking` is false; an absent
+ * or `null` option is the default.
+ */
+[[nodiscard]] auto template_defaults_resolve() -> bool {
+	auto decoder = make_decoder();
+	auto constexpr flags = std::array<std::string_view, 4>{"", "null", "true", "false"};
+	auto constexpr efforts = std::array<std::string_view, 5>{"", "null", "\"low\"", "\"medium\"", "\"xhigh\""};
+	for (auto const enable : flags) {
+		for (auto const preserve : flags) {
+			for (auto const effort : efforts) {
+				auto kwargs = std::string{};
+				auto const add = [&kwargs](std::string_view name, std::string_view value) {
+					if (!value.empty()) {
+						kwargs += std::format("{}\"{}\":{}", kwargs.empty() ? "" : ",", name, value);
+					}
+				};
+				add("enable_thinking", enable);
+				add("preserve_thinking", preserve);
+				add("reasoning_effort", effort);
+				auto const decoded = decoder->decode_copy(std::format(R"({{"messages":[],"chat_template_kwargs":{{{}}}}})", kwargs));
+				if (!decoded) {
+					return false;
+				}
+				auto const& options = decoded->template_options;
+				auto const expected_effort = effort == "\"low\"" ? json::ReasoningEffort::Low : effort == "\"medium\"" ? json::ReasoningEffort::Medium : json::ReasoningEffort::XHigh;
+				if (json::thinking(options) != (enable == "false" ? json::Thinking::Disabled : json::Thinking::Enabled) ||
+				    json::past_thinking(options) != (preserve == "false" ? json::PastThinking::Dropped : json::PastThinking::Preserved) ||
+				    json::reasoning_effort(options) != expected_effort) {
+					return false;
+				}
+			}
+		}
+	}
+	return true;
+}
+
 /** Mutated requests never crash the decoder (the sanitizers are the oracle): each decodes or is refused. */
 [[nodiscard]] auto mutated_requests_handled(std::uint64_t seed, std::size_t count) -> bool {
 	auto rng = engine::testing::generator(seed);
@@ -588,6 +626,7 @@ auto main() -> int {
 	    engine::testing::Case{.name = "generated requests in any order and spelling decode to themselves (seed 2)", .holds = requests_round_trip(2, 3000)},
 	    engine::testing::Case{.name = "each refusal names its fault and the member at fault", .holds = refusals_name_the_member()},
 	    engine::testing::Case{.name = "harness resends of tool-call and reasoning-only turns decode", .holds = harness_resends_accepted()},
+	    engine::testing::Case{.name = "the chat template's thinking, effort and past-reasoning defaults resolve once", .holds = template_defaults_resolve()},
 	    engine::testing::Case{.name = "mutated requests decode or are refused, never crash (seed 3)", .holds = mutated_requests_handled(3, 5000)},
 	};
 	return engine::testing::report(cases);

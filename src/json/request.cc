@@ -42,6 +42,21 @@ export struct TemplateOptions {
 	[[nodiscard]] auto operator==(TemplateOptions const&) const -> bool = default;
 };
 
+/** Whether a turn thinks, as the model's chat template decides it: it thinks unless `enable_thinking` is false. */
+export [[nodiscard]] constexpr auto thinking(TemplateOptions const& options) -> Thinking {
+	return options.thinking.value_or(Thinking::Enabled);
+}
+
+/** The effort a thinking turn is asked for, as the chat template decides it: `xhigh` unless the request names one. */
+export [[nodiscard]] constexpr auto reasoning_effort(TemplateOptions const& options) -> ReasoningEffort {
+	return options.reasoning_effort.value_or(ReasoningEffort::XHigh);
+}
+
+/** Whether past turns keep their reasoning, as the chat template decides it: they do unless `preserve_thinking` is false. */
+export [[nodiscard]] constexpr auto past_thinking(TemplateOptions const& options) -> PastThinking {
+	return options.past_thinking.value_or(PastThinking::Preserved);
+}
+
 /**
  * How the response is delivered: `stream` and `stream_options.include_usage` together, as the three states they
  * can be in (usage options exist only on a stream).
