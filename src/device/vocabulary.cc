@@ -34,6 +34,7 @@ using driver::Wire;
 using driver::ClocksEventCounters;
 using driver::ClocksEventReason;
 using driver::ClocksEventReasons;
+using driver::GpuTemperature;
 using driver::L2Persistence;
 using driver::MemoryClock;
 using driver::NvlinkLinkReading;

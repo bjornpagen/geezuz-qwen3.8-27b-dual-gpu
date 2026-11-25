@@ -160,6 +160,11 @@ export enum class ClockType : int {
 	Video = 3,    // NVML_CLOCK_VIDEO
 };
 
+/** `nvmlTemperatureSensors_t` (nvml.h): which sensor `nvmlDeviceGetTemperature` reads, in degrees C. */
+export enum class TemperatureSensor : int {
+	Gpu = 0, // NVML_TEMPERATURE_GPU: the GPU die
+};
+
 /** `nvmlValueType_t` (nvml.h): which member of a field value's `nvmlValue_t` holds its value. */
 export enum class ValueType : int {
 	Double = 0,           // NVML_VALUE_TYPE_DOUBLE
@@ -318,6 +323,7 @@ export struct Management {
 	Entry<"nvmlDeviceGetEnforcedPowerLimit", ManagementStatus(nvmlDevice_t, unsigned int*)> enforced_power_limit;
 	Entry<"nvmlDeviceGetCurrentClocksEventReasons", ManagementStatus(nvmlDevice_t, unsigned long long*)> clocks_event_reasons;
 	Entry<"nvmlDeviceGetFieldValues", ManagementStatus(nvmlDevice_t, int, FieldValue*)> field_values;
+	Entry<"nvmlDeviceGetTemperature", ManagementStatus(nvmlDevice_t, TemperatureSensor, unsigned int*)> temperature;
 	Entry<"nvmlDeviceGetNvLinkVersion", ManagementStatus(nvmlDevice_t, unsigned int, unsigned int*)> nvlink_version;
 };
 

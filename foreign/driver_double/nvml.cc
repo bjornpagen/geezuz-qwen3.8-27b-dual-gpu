@@ -182,6 +182,18 @@ auto fake_nvml_enforced_power_limit(driver::nvmlDevice_t device, unsigned int* m
 	return ManagementStatus::Success;
 }
 
+auto fake_nvml_temperature(driver::nvmlDevice_t device, driver::TemperatureSensor sensor, unsigned int* celsius) -> ManagementStatus {
+	if (injected()) {
+		return ManagementStatus::Unknown;
+	}
+	auto const* const model = session_card(device);
+	if (model == nullptr || sensor != driver::TemperatureSensor::Gpu) {
+		return ManagementStatus::InvalidArgument;
+	}
+	*celsius = model->gpu_celsius;
+	return ManagementStatus::Success;
+}
+
 auto fake_nvml_clocks_event_reasons(driver::nvmlDevice_t device, unsigned long long* reasons) -> ManagementStatus {
 	if (injected()) {
 		return ManagementStatus::Unknown;

@@ -74,6 +74,16 @@ export struct Power {
 	[[nodiscard]] constexpr auto operator==(Power const&) const -> bool = default;
 };
 
+/**
+ * A card's GPU die temperature now, in degrees C (NVML_TEMPERATURE_GPU). The GDDR6X junction temperature, the one a
+ * memory overclock is limited by, is not readable through NVML on a 3090.
+ */
+export struct GpuTemperature {
+	std::uint32_t celsius;
+
+	[[nodiscard]] constexpr auto operator==(GpuTemperature const&) const -> bool = default;
+};
+
 /** The reasons holding a card's clocks down right now. */
 export struct ClocksEventReasons {
 	std::uint64_t bits;
@@ -243,6 +253,17 @@ public:
 		    })
 		    .transform([&] {
 			    return Power{.draw_milliwatts = draw, .limit_milliwatts = limit};
+		    });
+	}
+
+	[[nodiscard]] auto gpu_temperature(PciAddress card) const -> core::Result<GpuTemperature, DeviceError> {
+		auto celsius = 0U;
+		return find(card)
+		    .and_then([&](nvmlDevice_t device) {
+			    return call(api_.temperature, device, TemperatureSensor::Gpu, &celsius);
+		    })
+		    .transform([&] {
+			    return GpuTemperature{.celsius = celsius};
 		    });
 	}
 

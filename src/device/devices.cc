@@ -203,6 +203,11 @@ public:
 		return management_.power(cards_[index(card)].pci);
 	}
 
+	/** The card's GPU die temperature now; the memory junction temperature is not readable through NVML on a 3090. */
+	[[nodiscard]] auto gpu_temperature(model::Card card) const -> core::Result<driver::GpuTemperature, driver::DeviceError> {
+		return management_.gpu_temperature(cards_[index(card)].pci);
+	}
+
 	/** The reasons holding the card's clocks down now. */
 	[[nodiscard]] auto clocks_event_reasons(model::Card card) const -> core::Result<driver::ClocksEventReasons, driver::DeviceError> {
 		return management_.clocks_event_reasons(cards_[index(card)].pci);

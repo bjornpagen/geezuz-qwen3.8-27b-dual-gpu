@@ -99,6 +99,7 @@ public:
 		            .enforced_power_limit = {.function = fake_nvml_enforced_power_limit},
 		            .clocks_event_reasons = {.function = fake_nvml_clocks_event_reasons},
 		            .field_values = {.function = fake_nvml_field_values},
+		            .temperature = {.function = fake_nvml_temperature},
 		            .nvlink_version = {.function = fake_nvml_nvlink_version},
 		        },
 		};
