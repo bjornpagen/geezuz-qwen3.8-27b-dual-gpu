@@ -108,6 +108,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_MODULE_STD ON)
 set(CMAKE_LINKER_TYPE LLD)
 
+# Host and device must round shared arithmetic identically and the cpu reference must be reproducible, so no
+# compiler-chosen fused multiply-add: clang contracts a*b+c by default on both arm64 and x86-64.
+string(APPEND CMAKE_CXX_FLAGS " -ffp-contract=off")
+
 # The production host is one known cpu, an epyc 7v13 (zen 3), so host code targets exactly it and vector paths compile
 # in without runtime dispatch. Every arm64 cpu has the neon the development mac's vector paths need.
 if(ENGINE_PLATFORM STREQUAL "linux")
