@@ -3,6 +3,9 @@
 # and looks for real defects. device/, foreign/ and unsafe/ carry the quarantine profile instead (their .clang-tidy
 # links to cmake/quarantine.clang-tidy). A finding is a build failure; suppressions do not exist in dialect code.
 #
+# PIN(clang-tidy-reserved-identifier-crash): the compiler enforces reserved identifiers (-Wreserved-identifier) on
+# every build, so the tidy check that crashes intermittently on module reads is off. See PINS.md.
+#
 # PIN(stdexec-analyzer-stack-escape): the static analyzer reads stdexec's operation states, which hold their own
 # receivers by design, as stack addresses escaping; every translation unit that composes senders trips it. See
 # PINS.md.
@@ -10,6 +13,7 @@ InheritParentConfig: false
 Checks: >
   -*,
   bugprone-*,
+  -bugprone-reserved-identifier,
   -bugprone-easily-swappable-parameters,
   -bugprone-exception-escape,
   cert-dcl58-cpp,

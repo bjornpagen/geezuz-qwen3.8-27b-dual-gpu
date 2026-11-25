@@ -175,6 +175,7 @@ set(ENGINE_WARNINGS
 	-Werror
 	-Wall
 	-Wextra
+	-Wreserved-identifier
 	-Wpedantic
 	-Wconversion
 	-Wsign-conversion

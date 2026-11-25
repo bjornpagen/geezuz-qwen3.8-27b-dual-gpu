@@ -216,3 +216,14 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
   only A.
 - retire: when clang-tidy no longer crashes on the reproducer (the parse-once shape stays; the rule for other units
   goes)
+
+## clang-tidy-reserved-identifier-crash
+
+- symptom: clang-tidy 23.1.5 crashes intermittently, only in parallel lint builds, inside `bugprone-reserved-identifier`
+  while deserializing a concept specialization from a module file (`StmtProfiler::VisitConceptSpecializationExpr`).
+  seen on `src/pipeline/pipeline.cc`, `facade.cc` and `seams.cc`; re-running the same command passes, so it cannot be
+  reproduced on demand.
+- decision: the compiler enforces the same rule deterministically on every build (`-Wreserved-identifier` in
+  `ENGINE_WARNINGS`, clean over the whole tree when added), so the dialect profile turns the tidy check off
+  (`.clang-tidy`). nothing is lost and the lint gate stays trustworthy.
+- retire: when clang-tidy no longer crashes there; the compiler warning stays either way.
