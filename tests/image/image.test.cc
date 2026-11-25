@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.image;
 import engine.image_synthetic;
+import engine.model;
 import engine.sha256;
 import engine.testing;
 
@@ -13,22 +14,18 @@ namespace sha256 = engine::sha256;
 namespace synthetic = engine::image_synthetic;
 
 using image::Failure;
-using image::Key;
-using synthetic::SyntheticCatalog;
+using image::Target;
 
-using Expect = image::Expect<SyntheticCatalog>;
-using Order = image::Order<SyntheticCatalog>;
+using CardZero = synthetic::SyntheticCatalog<Target::CardZero>;
+using CardOne = synthetic::SyntheticCatalog<Target::CardOne>;
+using Host = synthetic::SyntheticCatalog<Target::Host>;
 
 [[nodiscard]] auto random_byte(std::mt19937_64& random) -> std::byte {
 	return std::byte{static_cast<std::uint8_t>(random() & 0xffU)};
 }
 
-[[nodiscard]] auto random_card(std::mt19937_64& random) -> image::Card {
-	return (random() & 1U) == 0 ? image::Card::Zero : image::Card::One;
-}
-
-[[nodiscard]] auto other_card(image::Card card) -> image::Card {
-	return card == image::Card::Zero ? image::Card::One : image::Card::Zero;
+[[nodiscard]] auto nonzero_byte(std::mt19937_64& random) -> std::byte {
+	return std::byte{static_cast<std::uint8_t>(std::uniform_int_distribution<int>{1, 255}(random))};
 }
 
 [[nodiscard]] auto random_checkpoint(std::mt19937_64& random) -> image::Checkpoint {
@@ -38,30 +35,28 @@ using Order = image::Order<SyntheticCatalog>;
 	return checkpoint;
 }
 
-[[nodiscard]] auto refused_with(engine::core::Result<std::vector<image::Section>, image::Rejection> const& result, Failure failure) -> bool {
+[[nodiscard]] auto refused_with(engine::core::Result<void, image::Rejection> const& result, Failure failure) -> bool {
 	return !result.has_value() && result.error().failure == failure;
 }
 
-/** Whatever was written reads back: the stamp is accepted, the layout is the order's, and every extent holds its bytes. */
+/** Whatever was written reads back: the stamp is accepted and every extent holds its bytes where the layout says. */
+template<image::Catalog C>
 [[nodiscard]] auto images_round_trip(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
-	for (auto trial = 0; trial < 150; ++trial) {
-		auto const keys = synthetic::random_order<SyntheticCatalog>(random);
-		auto const stamp = image::Stamp{.card = random_card(random), .checkpoint = random_checkpoint(random)};
+	for (auto trial = 0; trial < 60; ++trial) {
+		auto const checkpoint = random_checkpoint(random);
 		auto const content_seed = random();
-		auto const baked = synthetic::bake<SyntheticCatalog>(stamp, keys, content_seed, random);
-		auto const order = Order{keys};
-		auto const sections = image::parse(baked.file, Expect{.card = stamp.card, .checkpoint = stamp.checkpoint, .order = order});
-		if (!sections || *sections != image::place(order) || baked.file.size() != baked.finished.file_bytes) {
+		auto const baked = synthetic::bake<C>(checkpoint, content_seed, random);
+		if (!image::parse<C>(baked.file, checkpoint) || baked.file.size() != image::file_bytes<C>) {
 			return false;
 		}
-		auto const payload = std::span{baked.file}.subspan(image::payload_offset(keys.size()));
+		auto const payload = std::span{baked.file}.subspan(image::payload_start<C>);
 		if (sha256::digest(payload) != baked.finished.payload) {
 			return false;
 		}
-		for (auto const& section : *sections) {
-			auto const stored = payload.subspan(section.placement.offset, section.placement.bytes);
-			if (!std::ranges::equal(stored, synthetic::content<SyntheticCatalog>(section.key, content_seed))) {
+		for (auto index = std::size_t{0}; index < std::size(C::extents); ++index) {
+			auto const placement = image::layout<C>[index];
+			if (!std::ranges::equal(payload.subspan(placement.offset, placement.bytes), synthetic::content<C>(index, content_seed))) {
 				return false;
 			}
 		}
@@ -70,68 +65,58 @@ using Order = image::Order<SyntheticCatalog>;
 }
 
 /**
- * The layout laws, for any order of catalog `C`: each extent starts on its encoding's boundary and is a whole number of
- * its unit; e4m3 runs are whole 16 KiB tiles on 256-byte boundaries; extents follow the order without overlap, packed
- * tight (padding shorter than the boundary); the payload starts on a page boundary after the table.
+ * The layout laws, for the extents of `C` in any order and any subset: each starts on its part's boundary (whole
+ * tiles on a tile, side data on a 256-byte chunk; so all on 16 bytes); they follow the order without overlap, packed
+ * tight (padding shorter than the boundary); and the payload starts on a page after the table.
  */
 template<image::Catalog C>
 [[nodiscard]] auto layout_laws_hold(std::uint64_t seed, int trials) -> bool {
 	auto random = engine::testing::generator(seed);
 	for (auto trial = 0; trial < trials; ++trial) {
-		auto const keys = synthetic::random_order<C>(random);
-		auto const sections = image::place(image::Order<C>{keys});
-		auto const start = image::payload_offset(keys.size());
-		if (sections.size() != keys.size() || start % image::payload_alignment != 0 || start < image::fixed_header_bytes + (2 * keys.size())) {
+		auto extents = std::vector<image::Extent>{std::begin(C::extents), std::end(C::extents)};
+		std::ranges::shuffle(extents, random);
+		extents.resize(std::uniform_int_distribution<std::size_t>{0, extents.size()}(random));
+		auto const placements = image::place(extents);
+		auto const start = image::payload_offset(extents.size());
+		if (placements.size() != extents.size() || start % image::payload_alignment != 0 ||
+		    start < image::fixed_header_bytes + (image::entry_bytes * extents.size())) {
 			return false;
 		}
 		auto end = std::uint64_t{0};
-		for (auto index = std::size_t{0}; index < sections.size(); ++index) {
-			auto const& [key, placement] = sections[index];
-			auto const stored = image::extent<C>(key);
-			auto const boundary = image::alignment(stored.encoding);
-			auto const tiles_hold = stored.encoding != image::Encoding::E4m3Tiles ||
-			                        (placement.offset % 256 == 0 && placement.bytes % image::tile_bytes == 0);
-			auto const in_place = key == keys[index] && placement.bytes == stored.bytes && placement.offset % 16 == 0 &&
-			                      placement.offset % boundary == 0 && placement.offset >= end && placement.offset - end < boundary;
-			if (!tiles_hold || !in_place) {
+		for (auto index = std::size_t{0}; index < placements.size(); ++index) {
+			auto const& placement = placements[index];
+			auto const& extent = extents[index];
+			auto const boundary = image::alignment(extent.part);
+			auto const tiles = extent.part != image::Part::Tiles || (placement.offset % 256 == 0 && placement.bytes % (std::uint64_t{16} * 1024) == 0);
+			auto const in_place = placement.bytes == extent.bytes && placement.offset % 16 == 0 && placement.offset % boundary == 0 &&
+			                      placement.offset >= end && placement.offset - end < boundary;
+			if (!tiles || !in_place) {
 				return false;
 			}
 			end = placement.end();
-		}
-		if (image::payload_bytes(sections) != end) {
-			return false;
 		}
 	}
 	return true;
 }
 
-/** A fixed image of every synthetic extent, for the corruption searches. */
+/** A fixed image of the card-zero test catalog, for the corruption searches. */
 struct Specimen {
-	std::vector<Key> keys;
-	image::Stamp stamp;
+	image::Checkpoint checkpoint;
 	synthetic::Baked baked;
-
-	[[nodiscard]] auto expect() const -> Expect {
-		return {.card = stamp.card, .checkpoint = stamp.checkpoint, .order = Order{keys}};
-	}
 };
 
 [[nodiscard]] auto specimen(std::mt19937_64& random) -> Specimen {
-	auto keys = synthetic::all_keys<SyntheticCatalog>();
-	std::ranges::shuffle(keys, random);
-	auto const stamp = image::Stamp{.card = random_card(random), .checkpoint = random_checkpoint(random)};
-	auto baked = synthetic::bake<SyntheticCatalog>(stamp, keys, random(), random);
-	return {.keys = std::move(keys), .stamp = stamp, .baked = std::move(baked)};
+	auto const checkpoint = random_checkpoint(random);
+	return {.checkpoint = checkpoint, .baked = synthetic::bake<CardZero>(checkpoint, random(), random)};
 }
 
 /** Every proper prefix of an image is refused as truncated, from the empty file to one byte short. */
 [[nodiscard]] auto every_prefix_is_truncated(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto const sample = specimen(random);
-	auto const expect = sample.expect();
 	auto const file = std::span<std::byte const>{sample.baked.file};
 	for (auto length = std::size_t{0}; length < file.size(); ++length) {
-		if (!refused_with(image::parse(file.first(length), expect), Failure::Truncated)) {
+		if (!refused_with(image::parse<CardZero>(file.first(length), sample.checkpoint), Failure::Truncated)) {
 			return false;
 		}
 	}
@@ -146,7 +131,7 @@ struct Specimen {
 		for (auto index = std::size_t{0}; index < extra; ++index) {
 			file.push_back(random_byte(random));
 		}
-		if (!refused_with(image::parse(file, sample.expect()), Failure::Overlong)) {
+		if (!refused_with(image::parse<CardZero>(file, sample.checkpoint), Failure::Overlong)) {
 			return false;
 		}
 	}
@@ -162,47 +147,44 @@ struct Specimen {
 	auto const regions = std::array{
 	    Region{.end = 8, .failure = Failure::BadMagic},
 	    Region{.end = 12, .failure = Failure::UnsupportedVersion},
-	    Region{.end = 16, .failure = Failure::WrongCard},
+	    Region{.end = 16, .failure = Failure::WrongTarget},
 	    Region{.end = 48, .failure = Failure::ModelMismatch},
 	    Region{.end = 100, .failure = Failure::CheckpointMismatch},
 	    Region{.end = 132, .failure = Failure::PayloadMismatch},
-	    Region{.end = 136 + (2 * extents), .failure = Failure::ScheduleMismatch},
+	    Region{.end = 136 + (24 * extents), .failure = Failure::ScheduleMismatch},
 	};
 	auto const found = std::ranges::find_if(regions, [position](Region const& region) { return position < region.end; });
 	return found == regions.end() ? Failure::DirtyPadding : found->failure;
 }
 
-/** A change to any one header byte, to any other value, is refused, and with the failure of the field it lies in. */
+/** A change to any one header byte, to any other value, is refused, with the failure of the field it lies in. */
 [[nodiscard]] auto every_header_byte_is_checked(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto const sample = specimen(random);
-	auto const expect = sample.expect();
 	auto file = sample.baked.file;
-	for (auto position = std::size_t{0}; position < image::payload_offset(sample.keys.size()); ++position) {
+	for (auto position = std::size_t{0}; position < image::payload_start<CardZero>; ++position) {
 		auto const original = file[position];
-		file[position] = original ^ std::byte{static_cast<std::uint8_t>(std::uniform_int_distribution<int>{1, 255}(random))};
-		auto const refused = refused_with(image::parse(file, expect), failure_at(position, sample.keys.size()));
+		file[position] = original ^ nonzero_byte(random);
+		auto const refused = refused_with(image::parse<CardZero>(file, sample.checkpoint), failure_at(position, std::size(CardZero::extents)));
 		file[position] = original;
 		if (!refused) {
 			return false;
 		}
 	}
-	return image::parse(file, expect).has_value();
+	return image::parse<CardZero>(file, sample.checkpoint).has_value();
 }
 
 /** A change to any payload byte, extent or padding between extents, is refused as a payload mismatch. */
 [[nodiscard]] auto payload_bytes_are_checked(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto const sample = specimen(random);
-	auto const expect = sample.expect();
 	auto file = sample.baked.file;
-	auto const start = image::payload_offset(sample.keys.size());
-	auto pick = std::uniform_int_distribution<std::size_t>{start, file.size() - 1};
+	auto pick = std::uniform_int_distribution<std::size_t>{image::payload_start<CardZero>, file.size() - 1};
 	for (auto trial = 0; trial < 600; ++trial) {
 		auto const position = pick(random);
 		auto const original = file[position];
-		file[position] = original ^ std::byte{static_cast<std::uint8_t>(std::uniform_int_distribution<int>{1, 255}(random))};
-		auto const refused = refused_with(image::parse(file, expect), Failure::PayloadMismatch);
+		file[position] = original ^ nonzero_byte(random);
+		auto const refused = refused_with(image::parse<CardZero>(file, sample.checkpoint), Failure::PayloadMismatch);
 		file[position] = original;
 		if (!refused) {
 			return false;
@@ -211,62 +193,48 @@ struct Specimen {
 	return true;
 }
 
-/** Whole, well-formed images baked for something else: the other card, checkpoint, model or order. */
+/** Whole, well-formed images baked for something else: another memory, checkpoint, model or schedule. */
 [[nodiscard]] auto mismatched_images_are_refused(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
-	for (auto trial = 0; trial < 100; ++trial) {
+	for (auto trial = 0; trial < 60; ++trial) {
 		auto const sample = specimen(random);
-		auto const expect = sample.expect();
 		auto const& file = sample.baked.file;
-
-		auto const wrong_card = Expect{.card = other_card(expect.card), .checkpoint = expect.checkpoint, .order = expect.order};
-		auto other_commit = expect.checkpoint;
-		other_commit.commit.bytes.at(random() % image::commit_bytes) ^= std::byte{1};
-		auto other_manifest = expect.checkpoint;
-		other_manifest.manifest.bytes.at(random() % sha256::digest_bytes) ^= std::byte{0x80};
-		auto const wrong_commit = Expect{.card = expect.card, .checkpoint = other_commit, .order = expect.order};
-		auto const wrong_manifest = Expect{.card = expect.card, .checkpoint = other_manifest, .order = expect.order};
-
-		auto other_keys = synthetic::random_order<SyntheticCatalog>(random);
-		if (other_keys == sample.keys) {
-			other_keys.pop_back();
-		}
-		auto const wrong_order = Expect{.card = expect.card, .checkpoint = expect.checkpoint, .order = Order{other_keys}};
-
-		auto const other_model = synthetic::bake<synthetic::OtherCatalog>(sample.stamp, sample.keys, random(), random);
-
-		if (!refused_with(image::parse(file, wrong_card), Failure::WrongCard) ||
-		    !refused_with(image::parse(file, wrong_commit), Failure::CheckpointMismatch) ||
-		    !refused_with(image::parse(file, wrong_manifest), Failure::CheckpointMismatch) ||
-		    !refused_with(image::parse(file, wrong_order), Failure::ScheduleMismatch) ||
-		    !refused_with(image::parse(other_model.file, expect), Failure::ModelMismatch)) {
+		auto other_commit = sample.checkpoint;
+		other_commit.commit.bytes.at(random() % image::commit_bytes) ^= nonzero_byte(random);
+		auto other_manifest = sample.checkpoint;
+		other_manifest.manifest.bytes.at(random() % sha256::digest_bytes) ^= nonzero_byte(random);
+		auto const other_model = synthetic::bake<synthetic::OtherModelCatalog>(sample.checkpoint, random(), random);
+		auto const other_schedule = synthetic::bake<synthetic::OtherScheduleCatalog>(sample.checkpoint, random(), random);
+		if (!refused_with(image::parse<CardOne>(file, sample.checkpoint), Failure::WrongTarget) ||
+		    !refused_with(image::parse<Host>(file, sample.checkpoint), Failure::WrongTarget) ||
+		    !refused_with(image::parse<CardZero>(file, other_commit), Failure::CheckpointMismatch) ||
+		    !refused_with(image::parse<CardZero>(file, other_manifest), Failure::CheckpointMismatch) ||
+		    !refused_with(image::parse<CardZero>(other_model.file, sample.checkpoint), Failure::ModelMismatch) ||
+		    !refused_with(image::parse<CardZero>(other_schedule.file, sample.checkpoint), Failure::ScheduleMismatch)) {
 			return false;
 		}
 	}
 	return true;
 }
 
-/** Version and card fields holding any other value: a future format, or a card that does not exist. */
+/** Version and target fields holding any other value: a future format, or a memory that does not exist. */
 [[nodiscard]] auto foreign_field_values_are_refused(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto const sample = specimen(random);
-	auto const expect = sample.expect();
 	auto const store = [](std::vector<std::byte>& file, std::size_t offset, std::uint32_t value) {
 		for (auto index = std::size_t{0}; index < 4; ++index) {
 			file.at(offset + index) = std::byte{static_cast<std::uint8_t>((value >> (8 * index)) & 0xffU)};
 		}
 	};
 	for (auto trial = 0; trial < 500; ++trial) {
-		auto version = static_cast<std::uint32_t>(random());
-		version = version == image::format_version ? 0 : version;
-		auto card = static_cast<std::uint32_t>(random() % 8);
-		card = card == std::to_underlying(expect.card) ? 1 - card : card;
+		auto const version = static_cast<std::uint32_t>(std::uniform_int_distribution<std::uint64_t>{2, 0xffffffffU}(random));
+		auto const target = static_cast<std::uint32_t>(std::uniform_int_distribution<std::uint64_t>{1, 0xffffffffU}(random));
 		auto with_version = sample.baked.file;
-		store(with_version, 8, version);
-		auto with_card = sample.baked.file;
-		store(with_card, 12, card);
-		if (!refused_with(image::parse(with_version, expect), Failure::UnsupportedVersion) ||
-		    !refused_with(image::parse(with_card, expect), Failure::WrongCard)) {
+		store(with_version, 8, trial % 2 == 0 ? 0 : version);
+		auto with_target = sample.baked.file;
+		store(with_target, 12, trial % 2 == 0 ? std::to_underlying(Target::Host) : target);
+		if (!refused_with(image::parse<CardZero>(with_version, sample.checkpoint), Failure::UnsupportedVersion) ||
+		    !refused_with(image::parse<CardZero>(with_target, sample.checkpoint), Failure::WrongTarget)) {
 			return false;
 		}
 	}
@@ -280,8 +248,6 @@ struct Specimen {
 [[nodiscard]] auto garbage_is_refused(std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
 	auto const sample = specimen(random);
-	auto const expect = sample.expect();
-	auto const start = image::payload_offset(sample.keys.size());
 	for (auto trial = 0; trial < 2000; ++trial) {
 		auto file = std::vector<std::byte>{};
 		switch (trial % 3) {
@@ -290,7 +256,7 @@ struct Specimen {
 			std::ranges::generate(file, [&random] { return random_byte(random); });
 			break;
 		case 1: {
-			file.assign(sample.baked.file.begin(), sample.baked.file.begin() + std::uniform_int_distribution<std::ptrdiff_t>{0, 200}(random));
+			file.assign(sample.baked.file.begin(), sample.baked.file.begin() + std::uniform_int_distribution<std::ptrdiff_t>{0, 400}(random));
 			auto const tail = std::uniform_int_distribution<std::size_t>{0, 9000}(random);
 			for (auto index = std::size_t{0}; index < tail; ++index) {
 				file.push_back(random_byte(random));
@@ -301,8 +267,7 @@ struct Specimen {
 			file = sample.baked.file;
 			auto const changes = std::uniform_int_distribution<int>{1, 32}(random);
 			for (auto change = 0; change < changes; ++change) {
-				auto const position = std::uniform_int_distribution<std::size_t>{0, start - 1}(random);
-				file[position] ^= std::byte{static_cast<std::uint8_t>(std::uniform_int_distribution<int>{1, 255}(random))};
+				file[std::uniform_int_distribution<std::size_t>{0, image::payload_start<CardZero> - 1}(random)] ^= nonzero_byte(random);
 			}
 			if (file == sample.baked.file) {
 				continue;
@@ -310,7 +275,7 @@ struct Specimen {
 			break;
 		}
 		}
-		if (image::parse(file, expect).has_value()) {
+		if (image::parse<CardZero>(file, sample.checkpoint).has_value()) {
 			return false;
 		}
 	}
@@ -320,20 +285,24 @@ struct Specimen {
 }
 
 auto main() -> int {
+	using engine::testing::Case;
 	auto const cases = std::array{
-	    engine::testing::Case{.name = "written images read back whole (seed 1)", .holds = images_round_trip(1)},
-	    engine::testing::Case{.name = "written images read back whole (seed 2)", .holds = images_round_trip(2)},
-	    engine::testing::Case{.name = "layout laws hold for random synthetic orders (seed 3)", .holds = layout_laws_hold<SyntheticCatalog>(3, 2000)},
-	    engine::testing::Case{.name = "layout laws hold for random model orders (seed 4)", .holds = layout_laws_hold<image::ModelCatalog>(4, 200)},
-	    engine::testing::Case{.name = "every proper prefix is truncated (seed 5)", .holds = every_prefix_is_truncated(5)},
-	    engine::testing::Case{.name = "appended bytes are refused (seed 6)", .holds = appended_bytes_are_refused(6)},
-	    engine::testing::Case{.name = "every header byte is checked by its field (seed 7)", .holds = every_header_byte_is_checked(7)},
-	    engine::testing::Case{.name = "every header byte is checked by its field (seed 8)", .holds = every_header_byte_is_checked(8)},
-	    engine::testing::Case{.name = "payload bytes are checked (seed 9)", .holds = payload_bytes_are_checked(9)},
-	    engine::testing::Case{.name = "images for another card, checkpoint, model or order are refused (seed 10)",
-	                          .holds = mismatched_images_are_refused(10)},
-	    engine::testing::Case{.name = "foreign version and card values are refused (seed 11)", .holds = foreign_field_values_are_refused(11)},
-	    engine::testing::Case{.name = "garbage is refused without a crash (seed 12)", .holds = garbage_is_refused(12)},
+	    Case{.name = "card-zero images read back whole (seed 1)", .holds = images_round_trip<CardZero>(1)},
+	    Case{.name = "card-one images read back whole (seed 2)", .holds = images_round_trip<CardOne>(2)},
+	    Case{.name = "host images read back whole (seed 3)", .holds = images_round_trip<Host>(3)},
+	    Case{.name = "an image of no extents reads back (seed 4)", .holds = images_round_trip<synthetic::EmptyCatalog>(4)},
+	    Case{.name = "layout laws hold for the test catalog in any order (seed 5)", .holds = layout_laws_hold<CardZero>(5, 2000)},
+	    Case{.name = "layout laws hold for the card catalog in any order (seed 6)",
+	         .holds = layout_laws_hold<image::CardCatalog<engine::model::Card::Zero>>(6, 100)},
+	    Case{.name = "every proper prefix is truncated (seed 7)", .holds = every_prefix_is_truncated(7)},
+	    Case{.name = "appended bytes are refused (seed 8)", .holds = appended_bytes_are_refused(8)},
+	    Case{.name = "every header byte is checked by its field (seed 9)", .holds = every_header_byte_is_checked(9)},
+	    Case{.name = "every header byte is checked by its field (seed 10)", .holds = every_header_byte_is_checked(10)},
+	    Case{.name = "payload bytes are checked (seed 11)", .holds = payload_bytes_are_checked(11)},
+	    Case{.name = "images for another memory, checkpoint, model or schedule are refused (seed 12)",
+	         .holds = mismatched_images_are_refused(12)},
+	    Case{.name = "foreign version and target values are refused (seed 13)", .holds = foreign_field_values_are_refused(13)},
+	    Case{.name = "garbage is refused without a crash (seed 14)", .holds = garbage_is_refused(14)},
 	};
 	return engine::testing::report(cases);
 }

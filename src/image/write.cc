@@ -10,42 +10,32 @@ import :layout;
 
 namespace engine::image {
 
-/** What the baker stamps on an image besides its order: the card it is for and the checkpoint it comes from. */
-export struct Stamp {
-	Card card;
-	Checkpoint checkpoint;
-};
-
-/** A complete image's header and length. */
+/** A complete image's header and digest. */
 export struct Finished {
 	/** The bytes from offset 0 to the payload: fields, section table and zero padding. */
 	std::vector<std::byte> header;
-	/** The file's length: the payload's end. */
-	std::uint64_t file_bytes;
 	/** The digest the header records for the payload. */
 	sha256::Digest payload;
 };
 
 /**
- * Lays out and hashes an image as the baker produces its extents, without touching a file: it says where each piece
- * of bytes goes, and the caller writes it there. Extents arrive in the order's sequence, each in pieces of any size;
- * the zero padding between extents is hashed here and must read back as zeros, which a file created empty and written
- * only at the given offsets does. When every extent is complete, `finish` returns the header for offset 0.
+ * Lays out and hashes an image of catalog `C` as the baker produces its extents, without touching a file: it says
+ * where each piece of bytes goes, and the caller writes it there. Extents arrive in catalog order, each in pieces of
+ * any size; the zero padding between extents is hashed here and must read back as zeros, which a file created empty
+ * and written only at the given offsets does. Once every extent is complete, `finish` returns the header for offset 0;
+ * the file is then `file_bytes<C>` long.
  *
- * Feeding the wrong extent, or more bytes than an extent holds, is a baker bug and aborts.
+ * Feeding an extent out of order, or more bytes than it holds, is a baker bug and aborts.
  */
 export template<Catalog C>
 class Writer {
 public:
-	Writer(Stamp stamp, Order<C> order)
-	    : stamp_{stamp},
-	      sections_{place(order)},
-	      payload_offset_{payload_offset(sections_.size())} {}
+	explicit Writer(Checkpoint checkpoint) : checkpoint_{checkpoint} {}
 
-	/** Hashes the next `bytes` of extent `key` and returns the file offset they belong at. */
-	[[nodiscard]] auto write(Key key, std::span<std::byte const> bytes) -> std::uint64_t {
-		core::invariant(current_ < sections_.size() && sections_[current_].key == key);
-		auto const placement = sections_[current_].placement;
+	/** Hashes the next `bytes` of extent `index` and returns the file offset they belong at. */
+	[[nodiscard]] auto write(std::size_t index, std::span<std::byte const> bytes) -> std::uint64_t {
+		core::invariant(current_ < std::size(C::extents) && index == current_);
+		auto const placement = layout<C>[current_];
 		core::invariant(bytes.size() <= placement.bytes - filled_);
 		auto const at = placement.offset + filled_;
 		hash_zeros_to(at);
@@ -56,15 +46,14 @@ public:
 			++current_;
 			filled_ = 0;
 		}
-		return payload_offset_ + at;
+		return payload_start<C> + at;
 	}
 
 	/** The header of the complete image, every extent having been written. */
 	[[nodiscard]] auto finish() && -> Finished {
-		core::invariant(current_ == sections_.size());
+		core::invariant(current_ == std::size(C::extents));
 		auto const payload = std::move(hasher_).finish();
-		auto const stamped = Stamped{.card = stamp_.card, .checkpoint = stamp_.checkpoint, .description = C::description, .payload = payload};
-		return {.header = encode_header(stamped, sections_), .file_bytes = payload_offset_ + payload_bytes(sections_), .payload = payload};
+		return {.header = encode_header<C>(checkpoint_, payload), .payload = payload};
 	}
 
 private:
@@ -77,11 +66,9 @@ private:
 		}
 	}
 
-	Stamp stamp_;
-	std::vector<Section> sections_;
-	std::uint64_t payload_offset_;
+	Checkpoint checkpoint_;
 	sha256::Hasher hasher_;
-	/** The section being filled, and how many of its bytes have arrived. */
+	/** The extent being filled, and how many of its bytes have arrived. */
 	std::size_t current_ = 0;
 	std::uint64_t filled_ = 0;
 	/** Payload bytes hashed so far, padding included. */

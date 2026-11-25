@@ -24,9 +24,9 @@ export enum class Failure : std::uint8_t {
 	ModelMismatch,
 	/** Baked from another checkpoint than the one expected. */
 	CheckpointMismatch,
-	/** Baked for the other card. */
-	WrongCard,
-	/** The section table is not the order this engine's schedule streams. */
+	/** Baked for another memory: the other card, or a card where the host was expected, or the reverse. */
+	WrongTarget,
+	/** The section table is not this engine's catalog: another schedule's layout, or a corrupted entry. */
 	ScheduleMismatch,
 	/** The bytes between the section table and the payload are not all zero. */
 	DirtyPadding,
@@ -45,7 +45,7 @@ export struct [[nodiscard]] Rejection {
 		case Failure::UnsupportedVersion:
 		case Failure::ModelMismatch:
 		case Failure::CheckpointMismatch:
-		case Failure::WrongCard:
+		case Failure::WrongTarget:
 		case Failure::ScheduleMismatch:
 		case Failure::DirtyPadding:
 		case Failure::PayloadMismatch:

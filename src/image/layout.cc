@@ -1,50 +1,41 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The file layout of a baked image. All integers are little-endian.
+// The file layout of an image. All integers are little-endian.
 //
 //   offset  bytes        field
 //   0       8            magic
 //   8       4            format version
-//   12      4            card
+//   12      4            target: 0 card zero, 1 card one, 2 host
 //   16      32           model description digest
 //   48      20           checkpoint commit
 //   68      32           checkpoint manifest digest
 //   100     32           payload digest: SHA-256 of every payload byte, padding included
 //   132     4            extent count n
-//   136     2 n          section table: the catalog key of each extent, in stream order
+//   136     24 n         section table: each extent's identity, payload offset and length, in payload order
 //   ...     zeros        to the payload, which starts on a 4 KiB boundary
-//   p       ...          payload: the extents in table order, each on its encoding's boundary, zeros between
+//   p       ...          payload: the extents in table order, zeros between; the file ends where the last one ends
 //
-// Nothing else is stored: every extent's length is a fact of the catalog, so its offset follows from the table, and an
-// image cannot describe a misaligned or overlapping extent. The file ends where the last extent ends.
+// The section table restates the catalog the baker was built with; the reader requires it to equal its own, entry
+// for entry, so an image laid out by another schedule is refused before any extent is read.
 export module engine.image:layout;
 
 import std;
 import engine.core;
-import engine.model;
 import engine.sha256;
 import :catalog;
 import :checkpoint;
 
 namespace engine::image {
 
-/** The card an image is baked for: its tensor-parallel rank. */
-export enum class Card : std::uint8_t {
-	Zero,
-	One,
-};
-
-static_assert(model::cards == 2, "one card value per tensor-parallel rank");
-
-/** A file that does not begin with these bytes is not a baked image; the CR LF and SUB catch text-mode mangling. */
+/** A file that does not begin with these bytes is not an image; the CR LF and SUB catch text-mode mangling. */
 export inline constexpr std::array<std::byte, 8> magic = {
     std::byte{0x89}, std::byte{'G'}, std::byte{'Z'}, std::byte{'I'}, std::byte{'M'}, std::byte{'\r'}, std::byte{'\n'}, std::byte{0x1a},
 };
 
-/** The format this engine reads and writes. Any change to the layout or to how an extent's bytes are encoded bumps it. */
+/** The format this engine reads and writes. Any change to this layout bumps it. */
 export inline constexpr std::uint32_t format_version = 1;
 
-/** The payload starts on a page boundary, so the payload can be registered with the driver for direct copies. */
+/** The payload starts on a page boundary, so it can be registered with the driver for direct copies. */
 export inline constexpr std::uint64_t payload_alignment = 4096;
 
 struct Field {
@@ -62,8 +53,8 @@ struct Field {
 
 inline constexpr Field magic_field = {.offset = 0, .bytes = magic.size()};
 inline constexpr Field version_field = magic_field.next(4);
-inline constexpr Field card_field = version_field.next(4);
-inline constexpr Field description_field = card_field.next(sha256::digest_bytes);
+inline constexpr Field target_field = version_field.next(4);
+inline constexpr Field description_field = target_field.next(sha256::digest_bytes);
 inline constexpr Field commit_field = description_field.next(commit_bytes);
 inline constexpr Field manifest_field = commit_field.next(sha256::digest_bytes);
 inline constexpr Field payload_digest_field = manifest_field.next(sha256::digest_bytes);
@@ -74,19 +65,16 @@ export inline constexpr std::size_t fixed_header_bytes = count_field.end();
 
 static_assert(fixed_header_bytes == 136);
 
-inline constexpr std::size_t key_bytes = sizeof(std::uint16_t);
+/** One section table entry: identity, offset and length, eight bytes each. */
+export inline constexpr std::size_t entry_bytes = 3 * sizeof(std::uint64_t);
 
-[[nodiscard]] constexpr auto table_entry(std::size_t index) -> Field {
-	return {.offset = fixed_header_bytes + (key_bytes * index), .bytes = key_bytes};
-}
-
-export [[nodiscard]] constexpr auto align_up(std::uint64_t value, std::uint64_t boundary) -> std::uint64_t {
-	return (value + boundary - 1) / boundary * boundary;
+[[nodiscard]] constexpr auto entry_field(std::size_t index, std::size_t word) -> Field {
+	return {.offset = fixed_header_bytes + (entry_bytes * index) + (sizeof(std::uint64_t) * word), .bytes = sizeof(std::uint64_t)};
 }
 
 /** Where the section table of an image of `extents` extents ends. */
 [[nodiscard]] constexpr auto table_end(std::uint64_t extents) -> std::uint64_t {
-	return fixed_header_bytes + (key_bytes * extents);
+	return fixed_header_bytes + (entry_bytes * extents);
 }
 
 /** The file offset of the payload of an image of `extents` extents. */
@@ -94,48 +82,12 @@ export [[nodiscard]] constexpr auto payload_offset(std::uint64_t extents) -> std
 	return align_up(table_end(extents), payload_alignment);
 }
 
-/** Where one extent's bytes lie, from the payload's start. */
-export struct Placement {
-	std::uint64_t offset;
-	std::uint64_t bytes;
-
-	[[nodiscard]] constexpr auto end() const -> std::uint64_t {
-		return offset + bytes;
-	}
-
-	[[nodiscard]] constexpr auto operator==(Placement const&) const -> bool = default;
-};
-
-/** One entry of an image: the extent, and where its bytes lie in the payload. */
-export struct Section {
-	Key key;
-	Placement placement;
-
-	[[nodiscard]] constexpr auto operator==(Section const&) const -> bool = default;
-};
-
-/**
- * The payload layout of `order`: each extent at the first boundary of its encoding after the extent before it, so
- * every extent is aligned, they lie in order without overlap, and only padding shorter than a boundary separates them.
- */
+/** The file offset where the payload of an image of catalog `C` starts, and the file's length. */
 export template<Catalog C>
-[[nodiscard]] constexpr auto place(Order<C> const& order) -> std::vector<Section> {
-	auto sections = std::vector<Section>{};
-	sections.reserve(order.keys().size());
-	auto end = std::uint64_t{0};
-	for (auto const key : order.keys()) {
-		auto const stored = extent<C>(key);
-		auto const offset = align_up(end, alignment(stored.encoding));
-		sections.push_back({.key = key, .placement = {.offset = offset, .bytes = stored.bytes}});
-		end = offset + stored.bytes;
-	}
-	return sections;
-}
+inline constexpr std::uint64_t payload_start = payload_offset(std::size(C::extents));
 
-/** Bytes of the payload of `sections`: up to the end of the last extent. */
-export [[nodiscard]] constexpr auto payload_bytes(std::span<Section const> sections) -> std::uint64_t {
-	return sections.empty() ? 0 : sections.back().placement.end();
-}
+export template<Catalog C>
+inline constexpr std::uint64_t file_bytes = payload_start<C> + payload_bytes<C>;
 
 /** Writes `value` little-endian into all of `to`. */
 constexpr auto store(std::span<std::byte> to, std::uint64_t value) -> void {
@@ -162,28 +114,23 @@ constexpr auto store(std::span<std::byte> to, std::uint64_t value) -> void {
 	return header.subspan(field.offset, field.bytes);
 }
 
-/** What a header records besides the table. */
-struct Stamped {
-	Card card;
-	Checkpoint checkpoint;
-	sha256::Digest description;
-	sha256::Digest payload;
-};
-
-/** The header of an image of `sections`, through the zero padding before the payload. */
-[[nodiscard]] constexpr auto encode_header(Stamped const& stamped, std::span<Section const> sections) -> std::vector<std::byte> {
-	auto header = std::vector<std::byte>(payload_offset(sections.size()), std::byte{0});
+/** The header of an image of catalog `C`, through the zero padding before the payload. */
+template<Catalog C>
+[[nodiscard]] constexpr auto encode_header(Checkpoint const& checkpoint, sha256::Digest const& payload) -> std::vector<std::byte> {
+	auto header = std::vector<std::byte>(payload_start<C>, std::byte{0});
 	auto const bytes = std::span{header};
 	std::ranges::copy(magic, in(bytes, magic_field).begin());
 	store(in(bytes, version_field), format_version);
-	store(in(bytes, card_field), std::to_underlying(stamped.card));
-	std::ranges::copy(stamped.description.bytes, in(bytes, description_field).begin());
-	std::ranges::copy(stamped.checkpoint.commit.bytes, in(bytes, commit_field).begin());
-	std::ranges::copy(stamped.checkpoint.manifest.bytes, in(bytes, manifest_field).begin());
-	std::ranges::copy(stamped.payload.bytes, in(bytes, payload_digest_field).begin());
-	store(in(bytes, count_field), sections.size());
-	for (auto index = std::size_t{0}; index < sections.size(); ++index) {
-		store(in(bytes, table_entry(index)), sections[index].key.index);
+	store(in(bytes, target_field), std::to_underlying(C::target));
+	std::ranges::copy(C::description.bytes, in(bytes, description_field).begin());
+	std::ranges::copy(checkpoint.commit.bytes, in(bytes, commit_field).begin());
+	std::ranges::copy(checkpoint.manifest.bytes, in(bytes, manifest_field).begin());
+	std::ranges::copy(payload.bytes, in(bytes, payload_digest_field).begin());
+	store(in(bytes, count_field), std::size(C::extents));
+	for (auto index = std::size_t{0}; index < std::size(C::extents); ++index) {
+		store(in(bytes, entry_field(index, 0)), C::extents[index].identity);
+		store(in(bytes, entry_field(index, 1)), layout<C>[index].offset);
+		store(in(bytes, entry_field(index, 2)), layout<C>[index].bytes);
 	}
 	return header;
 }

@@ -3,12 +3,11 @@
 # Small test-double catalogs and a baker double, shared by the image tests.
 add_library(engine_image_synthetic)
 target_sources(engine_image_synthetic PUBLIC FILE_SET CXX_MODULES FILES synthetic.cc)
-target_link_libraries(engine_image_synthetic PUBLIC engine_language_profile engine_core engine_image engine_sha256 engine_testing)
+target_link_libraries(engine_image_synthetic PUBLIC engine_language_profile engine_image engine_sha256 engine_testing)
 
-engine_test(image SOURCES image.test.cc LINK engine_image engine_image_synthetic)
-engine_test(image.model SOURCES model.test.cc LINK engine_image)
+engine_test(image SOURCES image.test.cc LINK engine_image engine_image_synthetic engine_model)
+engine_test(image.identity SOURCES identity.test.cc LINK engine_image engine_model)
 
-engine_death_test(image.duplicate_key SOURCES duplicate_key.death.cc LINK engine_image engine_image_synthetic)
 engine_death_test(image.wrong_extent SOURCES wrong_extent.death.cc LINK engine_image engine_image_synthetic)
 
 # The mapped path needs a real file: `image.emit` writes the specimen image where `image.file` runs, because a dialect

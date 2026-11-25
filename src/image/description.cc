@@ -2,7 +2,9 @@
 export module engine.image:description;
 
 import std;
+import engine.core;
 import engine.model;
+import engine.prims;
 import engine.sha256;
 
 namespace engine::image {
@@ -49,9 +51,11 @@ template<class E>
 
 /**
  * The model description as canonical text: every dimension, layer kind, numeric convention and name pattern of
- * `engine.model`, every inventory tensor with its shape, scope, format and split, and the ranges each card holds of it.
- * The ranges come from the split functions, so a change to how a tensor divides changes the text even when no constant
- * does. The text exists to be hashed; a human can read it to see what an image's description digest covers.
+ * `engine.model`, every inventory tensor with its shape, scope, format and split, the ranges each card holds of it, and
+ * every field of the weight tile encoding the device decodes. The ranges come from the split functions, so a change to
+ * how a tensor divides changes the text even when no constant does; the tile encoding is in it so an image baked under
+ * another encoding is refused rather than decoded wrongly. The text exists to be hashed; a human can read it to see
+ * what an image's description digest covers.
  */
 [[nodiscard]] constexpr auto describe() -> std::string {
 	namespace m = model;
@@ -94,6 +98,11 @@ template<class E>
 			}
 		}
 	}
+	auto const& tile = engine::device::prims::tile::encoding;
+	auto const count = [](int value) { return core::narrow<std::uint64_t>(value); };
+	lines.line("tile_encoding", {tile.version, count(tile.bytes), count(tile.unit_bytes), count(tile.e4m3_rows), count(tile.e4m3_columns),
+	                             count(tile.bf16_rows), count(tile.bf16_columns), tile.placed_mask, tile.left_mask, tile.right_mask,
+	                             tile.select_lut, tile.two_to_120, tile.negative_zero});
 	return std::move(lines.text);
 }
 
