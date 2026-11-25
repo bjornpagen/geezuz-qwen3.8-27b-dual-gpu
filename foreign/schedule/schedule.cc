@@ -37,6 +37,7 @@ export using device::Tensors;
 export using device::Traffic;
 
 export using device::attention_chunk_positions;
+export using device::candidates_per_row;
 export using device::decode_roles;
 export using device::epilogue_scratch_bytes;
 export using device::exchange_depth;
@@ -70,6 +71,7 @@ export using device::verify_phases;
 
 export using device::activation_bytes;
 export using device::blocks;
+export using device::candidate_slot_bytes;
 export using device::decode_budget;
 export using device::decode_shared_bytes;
 export using device::extent;

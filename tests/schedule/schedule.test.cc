@@ -595,6 +595,7 @@ struct Flow {
 		auto const buffers = std::array{
 		    std::pair{space.partials, schedule::exchange_depth * schedule::exchange_tiles * schedule::partial_tile_bytes(budget)},
 		    std::pair{space.partial_flags, schedule::exchange_depth * schedule::exchange_tiles * flag},
+		    std::pair{space.candidates, schedule::exchange_depth * schedule::candidate_slot_bytes(budget)},
 		    std::pair{space.candidate_flags, schedule::exchange_depth * flag},
 		    std::pair{space.fixups, schedule::sms * schedule::fixup_slot_bytes(budget)},
 		    std::pair{space.fixup_flags, schedule::sms * flag},

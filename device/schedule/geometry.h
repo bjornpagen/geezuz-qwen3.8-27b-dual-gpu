@@ -7,6 +7,7 @@
 
 #include "model.h"
 #include "prims/budget.h"
+#include "sampling/draw.h"
 #include "schedule/program.h"
 
 namespace engine::device::schedule {
@@ -223,10 +224,27 @@ static_assert(model::hidden % tile_rows == 0, "the residual is whole output tile
 	return 2 * partial_tile_bytes(budget);
 }
 
+/** Candidates each card keeps per lm_head row and pushes to the other, which merges both lists in rank order. */
+inline constexpr Count candidates_per_row = static_cast<Count>(sampling::top_k_bound);
+
+static_assert(sizeof(sampling::Candidate) == 2 * sizeof(float), "a candidate crosses the bridge as its logit and id, unpadded");
+
+/**
+ * One receive slot of a candidate exchange: the card's ranked candidates for every row it computes, written whole
+ * and released once. The verify pass computes every verify row and the catch-up pass as many, so the row budget
+ * bounds both; a draft step computes fewer.
+ */
+[[nodiscard]] constexpr auto candidate_slot_bytes(RowBudget budget) -> Count {
+	return model::rows(budget) * candidates_per_row * sizeof(sampling::Candidate);
+}
+
+static_assert(step_row_tiles <= row_tiles(RowBudget::ThreeTiles), "a draft step's rows fit the smallest candidate slot");
+
 /** Where each workspace buffer of the schedule starts, and the bytes they take together. */
 struct Workspace {
 	Count partials;
 	Count partial_flags;
+	Count candidates;
 	Count candidate_flags;
 	Count fixups;
 	Count fixup_flags;
@@ -241,7 +259,8 @@ inline constexpr Count workspace_alignment = 256;
 	auto layout = Workspace{};
 	layout.partials = 0;
 	layout.partial_flags = align_up(layout.partials + exchange_depth * exchange_tiles * partial_tile_bytes(budget), workspace_alignment);
-	layout.candidate_flags = align_up(layout.partial_flags + exchange_depth * exchange_tiles * flag_bytes, workspace_alignment);
+	layout.candidates = align_up(layout.partial_flags + exchange_depth * exchange_tiles * flag_bytes, workspace_alignment);
+	layout.candidate_flags = align_up(layout.candidates + exchange_depth * candidate_slot_bytes(budget), workspace_alignment);
 	layout.fixups = align_up(layout.candidate_flags + exchange_depth * flag_bytes, workspace_alignment);
 	layout.fixup_flags = align_up(layout.fixups + sms * fixup_slot_bytes(budget), workspace_alignment);
 	// One completion counter per phase of the deepest cycle: a consumer waits for every SM to arrive at its
