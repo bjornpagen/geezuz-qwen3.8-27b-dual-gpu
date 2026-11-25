@@ -15,38 +15,68 @@
 
 namespace engine::device::ubench::link {
 
+/** Publishes `round` on a flag in the other card's memory, ordered as `flavor` orders it. */
+template<Flavor flavor>
+__attribute__((device)) inline void publish_flag(unsigned long long* flag, unsigned long long round) {
+	using namespace engine::device::prims;
+	if constexpr (flavor == Flavor::ReleaseAcquire) {
+		store_release<Scope::System>(flag, round);
+	} else if constexpr (flavor == Flavor::Relaxed) {
+		store_relaxed<Scope::System>(flag, round);
+	} else {
+		fence_sc<Scope::System>();
+		store_relaxed<Scope::System>(flag, round);
+	}
+}
+
+/** Waits for `round` on a flag in this card's memory, observed as `flavor` observes it. */
+template<Flavor flavor, Wait wait>
+__attribute__((device)) inline void await_flag(unsigned long long const* flag, unsigned long long round) {
+	using namespace engine::device::prims;
+	constexpr Backoff backoff = backoff_for<wait>(remote_backoff);
+	unsigned sleep = backoff.first_ns;
+	auto const seen = [&] {
+		if constexpr (flavor == Flavor::ReleaseAcquire) {
+			return load_acquire<Scope::System>(flag);
+		} else {
+			return load_relaxed<Scope::System>(flag);
+		}
+	};
+	while (seen() < round) {
+		nanosleep(sleep);
+		sleep = sleep * 2U < backoff.ceiling_ns ? sleep * 2U : backoff.ceiling_ns;
+	}
+	if constexpr (flavor == Flavor::Fenced) {
+		fence_sc<Scope::System>();
+	}
+}
+
 /** The initiating card: publishes round r on the peer's flag, then waits for the peer to publish r on its own. */
-template<Wait wait>
+template<Flavor flavor, Wait wait>
 __attribute__((device)) inline void flag_ping(FlagParams params) {
 	using namespace engine::device::prims;
 	if (lane() != 0) {
 		return;
 	}
-	constexpr Backoff backoff = backoff_for<wait>(remote_backoff);
-	EpochWriter<Scope::System> const writer = {.flag = at<unsigned long long>(params.peer_flag)};
-	EpochReader<Scope::System> const reader = {.flag = at<unsigned long long const>(params.own_flag)};
 	unsigned long long const start = nanoseconds();
 	for (unsigned long long round = 1; round <= static_cast<unsigned long long>(flag_iterations); ++round) {
-		writer.publish(round);
-		reader.await(round, backoff);
+		publish_flag<flavor>(at<unsigned long long>(params.peer_flag), round);
+		await_flag<flavor, wait>(at<unsigned long long const>(params.own_flag), round);
 	}
 	*at<unsigned long long>(params.nanoseconds) = nanoseconds() - start;
 }
 
 /** The answering card: waits for round r on its own flag and publishes r on the initiator's. */
-template<Wait wait>
+template<Flavor flavor, Wait wait>
 __attribute__((device)) inline void flag_pong(FlagParams params) {
 	using namespace engine::device::prims;
 	if (lane() != 0) {
 		return;
 	}
-	constexpr Backoff backoff = backoff_for<wait>(remote_backoff);
-	EpochWriter<Scope::System> const writer = {.flag = at<unsigned long long>(params.peer_flag)};
-	EpochReader<Scope::System> const reader = {.flag = at<unsigned long long const>(params.own_flag)};
 	unsigned long long const start = nanoseconds();
 	for (unsigned long long round = 1; round <= static_cast<unsigned long long>(flag_iterations); ++round) {
-		reader.await(round, backoff);
-		writer.publish(round);
+		await_flag<flavor, wait>(at<unsigned long long const>(params.own_flag), round);
+		publish_flag<flavor>(at<unsigned long long>(params.peer_flag), round);
 	}
 	*at<unsigned long long>(params.nanoseconds) = nanoseconds() - start;
 }
@@ -221,24 +251,44 @@ __attribute__((device)) inline void mailbox(MailboxParams params) {
 namespace ub = engine::device::ubench;
 namespace link = engine::device::ubench::link;
 
-extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_ping_backoff = link::flag_budget;
-extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_ping_backoff(link::FlagParams params) {
-	link::flag_ping<ub::Wait::Backoff>(params);
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_ping_release_backoff = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_ping_release_backoff(link::FlagParams params) {
+	link::flag_ping<link::Flavor::ReleaseAcquire, ub::Wait::Backoff>(params);
 }
 
-extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_pong_backoff = link::flag_budget;
-extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_pong_backoff(link::FlagParams params) {
-	link::flag_pong<ub::Wait::Backoff>(params);
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_pong_release_backoff = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_pong_release_backoff(link::FlagParams params) {
+	link::flag_pong<link::Flavor::ReleaseAcquire, ub::Wait::Backoff>(params);
 }
 
-extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_ping_spin = link::flag_budget;
-extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_ping_spin(link::FlagParams params) {
-	link::flag_ping<ub::Wait::Spin>(params);
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_ping_release_spin = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_ping_release_spin(link::FlagParams params) {
+	link::flag_ping<link::Flavor::ReleaseAcquire, ub::Wait::Spin>(params);
 }
 
-extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_pong_spin = link::flag_budget;
-extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_pong_spin(link::FlagParams params) {
-	link::flag_pong<ub::Wait::Spin>(params);
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_pong_release_spin = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_pong_release_spin(link::FlagParams params) {
+	link::flag_pong<link::Flavor::ReleaseAcquire, ub::Wait::Spin>(params);
+}
+
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_ping_relaxed_spin = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_ping_relaxed_spin(link::FlagParams params) {
+	link::flag_ping<link::Flavor::Relaxed, ub::Wait::Spin>(params);
+}
+
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_pong_relaxed_spin = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_pong_relaxed_spin(link::FlagParams params) {
+	link::flag_pong<link::Flavor::Relaxed, ub::Wait::Spin>(params);
+}
+
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_ping_fenced_spin = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_ping_fenced_spin(link::FlagParams params) {
+	link::flag_ping<link::Flavor::Fenced, ub::Wait::Spin>(params);
+}
+
+extern "C" __attribute__((device, used)) constexpr ub::Budget engine_budget_ubench_flag_pong_fenced_spin = link::flag_budget;
+extern "C" __attribute__((global, launch_bounds(link::flag_budget.threads, link::flag_budget.blocks_per_sm))) void ubench_flag_pong_fenced_spin(link::FlagParams params) {
+	link::flag_pong<link::Flavor::Fenced, ub::Wait::Spin>(params);
 }
 
 // Pushes and pulls: rows per item by sending blocks.

@@ -15,8 +15,6 @@
 
 namespace engine::device::ubench::stream {
 
-static_assert(sizeof(Word4) == sizeof(prims::Chunk) && alignof(Word4) == alignof(prims::Chunk));
-
 /** Where chunk `index` of a block's run lies, in chunks from the run's start, for each tile order. */
 template<TileOrder order>
 [[nodiscard]] __attribute__((device)) inline auto placed(unsigned long long index) -> unsigned long long {

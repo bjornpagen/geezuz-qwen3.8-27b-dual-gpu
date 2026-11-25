@@ -8,6 +8,7 @@
 #pragma once
 
 #include "prims/budget.h"
+#include "prims/chunk.h"
 #include "prims/selfcheck.h"
 
 namespace engine::device::ubench {
@@ -15,10 +16,7 @@ namespace engine::device::ubench {
 using Address = unsigned long long;
 using prims::Budget;
 
-/** Sixteen bytes as the host types them: the layout of the device's `prims::Chunk`. */
-struct alignas(16) Word4 {
-	unsigned word[4];
-};
+using prims::Chunk;
 
 inline constexpr int sms = prims::sm86.sms;
 inline constexpr int warp_threads = prims::sm86.warp_threads;
@@ -119,7 +117,6 @@ struct Stall {
 struct Sustain {
 	static constexpr int stages = 4;
 	static constexpr int consumer_warps = 4;
-	static constexpr int launches = 4000;
 	static constexpr Budget budget = one_block_per_sm(1 + consumer_warps, stages * tile_bytes + 128);
 	static_assert(prims::fits(budget));
 };
@@ -309,6 +306,12 @@ enum class Reduction : unsigned char { FloatButterfly, IntegerRedux };
 namespace link {
 
 inline constexpr int flag_iterations = 100'000;
+
+/**
+ * How a flag orders what was stored before it: the engine's release store and acquire load; relaxed stores and loads
+ * that order nothing (the floor); or relaxed ones behind `fence.sc.sys` on both ends, the fence-then-flag protocol.
+ */
+enum class Flavor : unsigned char { ReleaseAcquire, Relaxed, Fenced };
 inline constexpr Budget flag_budget = {.threads = 32, .registers_per_thread = 64, .shared_bytes = 0, .blocks_per_sm = 1};
 
 /** One end of the flag ping-pong: its own flag (written by the peer) and the peer's (written by this end). */
