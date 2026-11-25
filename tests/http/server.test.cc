@@ -706,6 +706,154 @@ constexpr std::size_t delta_bytes = 4096;
 	return decoded == *accepted && h->service.flows.back() == http::Flow::Accepted;
 }
 
+/** The bytes that end a stream on the wire: the end of the last event's chunk, then the last chunk. */
+constexpr std::string_view stream_ended = "\r\n0\r\n\r\n";
+
+[[nodiscard]] auto ended(client::Client const& peer) {
+	return [&peer] {
+		return peer.received.ends_with(stream_ended);
+	};
+}
+
+enum class Breaks : std::uint8_t {
+	None,
+	/** CRLF, CR and LF scattered through the data, each splitting it into another `data:` field. */
+	Scattered,
+};
+
+/** Data of exactly max_event_bytes, as long as the longest whole response a terminal event carries. */
+[[nodiscard]] auto longest_event(std::mt19937_64& rng, Breaks breaks) -> std::string {
+	constexpr std::string_view alphabet = R"(abcdefghijklmnopqrstuvwxyz0123456789 {}":,[])";
+	auto data = std::string(http::max_event_bytes, ' ');
+	std::ranges::generate(data, [&rng, alphabet] {
+		return alphabet[rng() % alphabet.size()];
+	});
+	if (breaks == Breaks::Scattered) {
+		constexpr auto kinds = std::array<std::string_view, 3>{"\r\n", "\r", "\n"};
+		for (auto at = rng() % 4096; at + 2 <= data.size(); at += 1 + (rng() % 8192)) {
+			auto const kind = kinds[rng() % kinds.size()];
+			data.replace(at, kind.size(), kind);
+		}
+	}
+	return data;
+}
+
+/** Sends one event as a service must: refused (Flow::Full), it waits for `drained` and sends the same event again. */
+[[nodiscard]] auto send_through(Harness& h, client::Client& peer, http::Exchange exchange, std::string const& data) -> bool {
+	for (;;) {
+		auto const flows = h.service.flows.size();
+		auto const resumed = h.service.resumed.size();
+		if (!h.post(Emit{.exchange = exchange, .data = data}) || !h.pump(
+		                                                             peer,
+		                                                             [&] {
+			                                                             return h.service.flows.size() > flows;
+		                                                             },
+		                                                             5000ms)) {
+			return false;
+		}
+		if (h.service.flows.back() == http::Flow::Accepted) {
+			return true;
+		}
+		if (h.service.flows.back() != http::Flow::Full || !h.pump(
+		                                                      peer,
+		                                                      [&] {
+			                                                      return h.service.resumed.size() > resumed;
+		                                                      },
+		                                                      20000ms)) {
+			return false;
+		}
+	}
+}
+
+/**
+ * Events of max_event_bytes (a terminal event carrying the longest whole response), with and without line breaks,
+ * between ordinary ones, reach a reading client whole and in order.
+ */
+[[nodiscard]] auto an_event_as_long_as_a_whole_response_arrives_whole(std::uint64_t seed) -> bool {
+	auto rng = engine::testing::generator(seed);
+	auto h = harness(Mode::Stream, Timeouts{.read = 2000ms, .write = 5000ms});
+	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
+	if (!peer || !h->push(*peer, create("{}", "")) ||
+	    !h->pump(
+	        *peer,
+	        [&] {
+		        return !h->service.exchanges.empty();
+	        },
+	        2000ms)) {
+		return false;
+	}
+	auto const exchange = h->service.exchanges.front();
+	auto const sent =
+	    std::vector<std::string>{"first", longest_event(rng, Breaks::None), "between", longest_event(rng, Breaks::Scattered), "last"};
+	for (auto const& data : sent) {
+		if (!send_through(*h, *peer, exchange, data)) {
+			return false;
+		}
+	}
+	if (!h->post(End{.exchange = exchange}) || !h->pump(*peer, ended(*peer), 20000ms)) {
+		return false;
+	}
+	auto const parsed = responses(*peer);
+	if (parsed.complete.size() != 1 || parsed.complete[0].status != 200) {
+		return false;
+	}
+	auto const decoded = client::decode_events(parsed.complete[0].body);
+	return std::ranges::equal(decoded, sent | std::views::transform([](std::string const& data) {
+		                                   return client::normalized(data);
+	                                   }));
+}
+
+/**
+ * A client that does not read: once the buffer is full, one event too long for it is still taken and held after
+ * it, and nothing more is until the client has read the held event; then every accepted event arrives in order.
+ */
+[[nodiscard]] auto one_long_event_is_held_beside_a_full_buffer() -> bool {
+	auto rng = engine::testing::generator(4);
+	auto h = harness(Mode::Stream, Timeouts{.read = 2000ms, .write = 5000ms});
+	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
+	if (!peer || !h->push(*peer, create("{}", "")) ||
+	    !h->pump(
+	        *peer,
+	        [&] {
+		        return !h->service.exchanges.empty();
+	        },
+	        2000ms)) {
+		return false;
+	}
+	auto const exchange = h->service.exchanges.front();
+	auto accepted = fill_until_stuck(*h, exchange);
+	if (!accepted) {
+		return false;
+	}
+	auto const held = longest_event(rng, Breaks::None);
+	auto const flows = h->service.flows.size();
+	if (!h->post(Emit{.exchange = exchange, .data = held}) || !h->post(Emit{.exchange = exchange, .data = "small"}) ||
+	    !h->post(Emit{.exchange = exchange, .data = longest_event(rng, Breaks::Scattered)})) {
+		return false;
+	}
+	h->idle(50ms);
+	if (h->service.flows.size() != flows + 3 || !std::ranges::equal(std::span{h->service.flows}.subspan(flows),
+	                                                                std::array{http::Flow::Accepted, http::Flow::Full, http::Flow::Full})) {
+		return false;
+	}
+	auto const resumed = h->service.resumed.size();
+	if (!h->pump(
+	        *peer,
+	        [&] {
+		        return h->service.resumed.size() > resumed;
+	        },
+	        20000ms) ||
+	    !h->post(Emit{.exchange = exchange, .data = "after"}) || !h->post(End{.exchange = exchange}) ||
+	    !h->pump(*peer, ended(*peer), 20000ms)) {
+		return false;
+	}
+	accepted->push_back(held);
+	accepted->emplace_back("after");
+	auto const parsed = responses(*peer);
+	return parsed.complete.size() == 1 && client::decode_events(parsed.complete[0].body) == *accepted &&
+	       h->service.flows.back() == http::Flow::Accepted;
+}
+
 [[nodiscard]] auto a_stalled_client_is_abandoned_at_the_write_deadline() -> bool {
 	auto h = harness(Mode::Stream, Timeouts{.read = 2000ms, .write = 300ms});
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
@@ -933,6 +1081,11 @@ auto main() -> int {
 		                      .holds = events_round_trip(2)},
 	    engine::testing::Case{.name = "a client that does not read is held to the window, then drained in order",
 		                      .holds = a_slow_client_is_held_to_the_window()},
+	    engine::testing::Case{.name = "events of max_event_bytes, with and without line breaks, reach a reading client whole (seed 3)",
+		                      .holds = an_event_as_long_as_a_whole_response_arrives_whole(3)},
+	    engine::testing::Case{.name =
+		                          "one long event is held beside a full buffer, nothing more until it is read, then all arrive in order",
+		                      .holds = one_long_event_is_held_beside_a_full_buffer()},
 	    engine::testing::Case{.name = "a stalled client is abandoned at the write deadline",
 		                      .holds = a_stalled_client_is_abandoned_at_the_write_deadline()},
 	    engine::testing::Case{.name = "a client closing mid-stream abandons the stream",

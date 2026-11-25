@@ -9,13 +9,15 @@ namespace engine::http {
 
 /**
  * The response side of one connection: a fixed buffer for small framed pieces (an interim response, a stream head,
- * events, a stream's end), bounded by max_stream_buffer_bytes, and an owned whole response sent after them. The
- * buffer is the backpressure window: what does not fit is refused, never grown.
+ * ordinary events, a stream's end), bounded by max_stream_buffer_bytes, and at most one owned piece held after them
+ * (a whole response, or an event too long for the buffer). The two are the backpressure window: what does not fit is
+ * refused, never grown. Only the buffer is allocated with the connection; a held piece owns storage of its own size
+ * and gives it back once sent, so a connection's memory follows what it has queued.
  */
 class Outbound {
 public:
 	[[nodiscard]] auto empty() const -> bool {
-		return begin_ == end_ && whole_sent_ == whole_.size();
+		return begin_ == end_ && !holding();
 	}
 
 	/** Framed bytes held in the bounded buffer. */
@@ -27,9 +29,16 @@ public:
 		return buffer_.size() - queued();
 	}
 
+	/** A piece is held after the buffer and not yet sent; the buffer takes nothing until it is. */
+	[[nodiscard]] auto holding() const -> bool {
+		return held_sent_ != held_.size();
+	}
+
 	/** Reserves `count` bytes at the buffer's end and lets `write` fill exactly them. */
 	template<std::invocable<std::span<char>> F>
 	auto emplace(std::size_t count, F write) -> void {
+		// Bytes go out buffer first, then the held piece: buffering behind a held piece would send them before it.
+		core::invariant(!holding());
 		core::invariant(count <= room());
 		if (buffer_.size() - end_ < count) {
 			std::ranges::copy(std::span{buffer_}.subspan(begin_, queued()), buffer_.begin());
@@ -46,11 +55,20 @@ public:
 		});
 	}
 
-	/** Takes a whole response to send after the buffered bytes. */
-	auto adopt(std::string whole) -> void {
-		core::invariant(whole_sent_ == whole_.size());
-		whole_ = std::move(whole);
-		whole_sent_ = 0;
+	/** Takes a piece to send after the buffered bytes: a whole response, or an event too long for the buffer. */
+	auto hold(std::string piece) -> void {
+		core::invariant(!holding());
+		held_ = std::move(piece);
+		held_sent_ = 0;
+	}
+
+	/** Appends `bytes` after everything queued: to the held piece while there is one, else to the buffer. */
+	auto append_last(std::string_view bytes) -> void {
+		if (holding()) {
+			held_ += bytes;
+			return;
+		}
+		append(bytes);
 	}
 
 	/** The next bytes to send; empty only when `empty()`. */
@@ -58,7 +76,7 @@ public:
 		if (begin_ != end_) {
 			return std::span{buffer_}.subspan(begin_, queued());
 		}
-		return std::span{whole_}.subspan(whole_sent_);
+		return std::span{held_}.subspan(held_sent_);
 	}
 
 	/** `count` bytes of `front()` were sent. */
@@ -72,12 +90,12 @@ public:
 			}
 			return;
 		}
-		core::invariant(count <= whole_.size() - whole_sent_);
-		whole_sent_ += count;
-		if (whole_sent_ == whole_.size()) {
-			// A whole response can be megabytes; its storage goes with it rather than staying with the connection.
-			whole_ = std::string{};
-			whole_sent_ = 0;
+		core::invariant(count <= held_.size() - held_sent_);
+		held_sent_ += count;
+		if (held_sent_ == held_.size()) {
+			// A held piece can be megabytes; its storage goes with it rather than staying with the connection.
+			held_ = std::string{};
+			held_sent_ = 0;
 		}
 	}
 
@@ -85,8 +103,8 @@ private:
 	std::array<char, max_stream_buffer_bytes> buffer_{};
 	std::size_t begin_ = 0;
 	std::size_t end_ = 0;
-	std::string whole_;
-	std::size_t whole_sent_ = 0;
+	std::string held_;
+	std::size_t held_sent_ = 0;
 };
 
 }

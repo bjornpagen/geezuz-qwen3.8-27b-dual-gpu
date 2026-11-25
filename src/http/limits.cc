@@ -21,13 +21,13 @@ export inline constexpr std::size_t max_resource_id_bytes = 64;
 export inline constexpr std::size_t max_response_body_bytes = std::size_t{16} << 20U;
 
 /**
- * Framed stream bytes a connection holds for a client that has not read them: the per-connection backpressure
- * window. A slow client costs at most this much server memory, plus what the kernel buffers.
+ * Framed stream bytes a connection buffers for a client that has not read them, besides the one event it may hold
+ * alone: the bound on a stream's ordinary events, so a client that stops reading is refused deltas early.
  */
 export inline constexpr std::size_t max_stream_buffer_bytes = std::size_t{64} << 10U;
 
-/** One server-sent event's data; a longer delta is split by the service before it is sent. */
-export inline constexpr std::size_t max_event_bytes = std::size_t{4} << 10U;
+/** One server-sent event's data: a terminal event carries a whole response, so it is as long as a whole body. */
+export inline constexpr std::size_t max_event_bytes = max_response_body_bytes;
 
 /** Connections open at once, each with its buffers allocated when the server opens. */
 export inline constexpr std::size_t max_connections = 128;

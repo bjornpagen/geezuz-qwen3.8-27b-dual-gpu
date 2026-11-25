@@ -40,7 +40,10 @@ public:
 		return connections_.open_stream(exchange);
 	}
 
-	/** Queues one event on an open stream, or refuses it when the client is behind by a full buffer. */
+	/**
+	 * Queues one event on an open stream, or refuses it when it does not fit beside what the client has not read: an
+	 * event up to max_event_bytes, so the terminal one can carry a whole response.
+	 */
 	[[nodiscard]] auto send(Exchange exchange, Event const& event) -> Flow {
 		return connections_.send(exchange, event);
 	}

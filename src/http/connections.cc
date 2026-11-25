@@ -117,8 +117,8 @@ constexpr std::uint64_t listener_token = 0;
 constexpr std::uint8_t generation_bits = 40;
 constexpr auto accept_backoff = std::chrono::milliseconds{100};
 
-/** A refused stream is told to resume once the buffer has room for the longest event and the stream's end. */
-constexpr std::size_t drain_mark = max_stream_buffer_bytes - max_encoded_event_bytes - stream_end.size();
+/** A refused stream is told to resume once nothing is held and the buffer has room for any buffered event and the end. */
+constexpr std::size_t drain_mark = max_stream_buffer_bytes - max_buffered_event_bytes - stream_end.size();
 
 template<BodyBounds B>
 using Table = handle::Table<Connection<B>, ConnectionHandle, max_connections, generation_bits>;
@@ -310,8 +310,8 @@ public:
 		// A service answers each exchange once: a second answer is a bug in the service, not a client's doing.
 		core::invariant(awaiting.has_value());
 		auto const persistence = awaiting->persistence;
-		connection.outbound.adopt(response.body.size() <= max_response_body_bytes ? encode_response(response, persistence, awaiting->id)
-		                                                                          : encode_oversized(persistence, awaiting->id));
+		connection.outbound.hold(response.body.size() <= max_response_body_bytes ? encode_response(response, persistence, awaiting->id)
+		                                                                         : encode_oversized(persistence, awaiting->id));
 		connection.phase = Flushing{.persistence = persistence};
 		enqueue(exchange.connection);
 		return Delivery::Accepted;
@@ -343,13 +343,21 @@ public:
 		core::invariant(streaming.has_value());
 		core::invariant(event.data.size() <= max_event_bytes);
 		auto const size = encoded_size(event);
-		if (connection.outbound.queued() + size + stream_end.size() > max_stream_buffer_bytes) {
+		// Up to max_buffered_event_bytes an event joins the buffer; a longer one (a terminal event carrying a whole
+		// response) is held alone after it. Nothing joins while a piece is held: it would overtake the held one.
+		auto& outbound = connection.outbound;
+		auto const buffered = size <= max_buffered_event_bytes;
+		if (outbound.holding() || (buffered && outbound.queued() + size + stream_end.size() > max_stream_buffer_bytes)) {
 			streaming->backpressure = Backpressure::Owed;
 			return Flow::Full;
 		}
-		connection.outbound.emplace(size, [&event](std::span<char> into) {
-			encode_event(event, into);
-		});
+		if (buffered) {
+			outbound.emplace(size, [&event](std::span<char> into) {
+				encode_event(event, into);
+			});
+		} else {
+			outbound.hold(encode_alone(event, size));
+		}
 		enqueue(exchange.connection);
 		return Flow::Accepted;
 	}
@@ -362,7 +370,7 @@ public:
 		auto& connection = *found;
 		auto const streaming = core::alternative<Streaming>(connection.phase);
 		core::invariant(streaming.has_value());
-		connection.outbound.append(stream_end);
+		connection.outbound.append_last(stream_end);
 		connection.phase = Flushing{.persistence = streaming->persistence};
 		enqueue(exchange.connection);
 		return Delivery::Accepted;
@@ -501,7 +509,8 @@ private:
 				return closed(handle);
 			}
 			if (auto const streaming = core::alternative<Streaming>(connection.phase);
-			    streaming.has_value() && streaming->backpressure == Backpressure::Owed && connection.outbound.queued() <= drain_mark) {
+			    streaming.has_value() && streaming->backpressure == Backpressure::Owed && !connection.outbound.holding() &&
+			    connection.outbound.queued() <= drain_mark) {
 				streaming->backpressure = Backpressure::Clear;
 				enqueue(handle);
 				return Drained{.exchange = Exchange{.connection = handle, .sequence = streaming->sequence}};
@@ -538,7 +547,7 @@ private:
 					continue;
 				}
 				if (auto const refused = core::alternative<Refused>(assembly)) {
-					connection.outbound.adopt(encode_refusal(refused->error, ids_.issue()));
+					connection.outbound.hold(encode_refusal(refused->error, ids_.issue()));
 					connection.phase = Flushing{.persistence = Persistence::Close};
 					continue;
 				}

@@ -130,8 +130,18 @@ constexpr std::size_t max_encoded_event_bytes = [] {
 	return hex_width(payload) + 2 + payload + 2;
 }();
 
-// The longest event fits beside the stream's end in an empty buffer, so a send always proceeds once the client reads.
-static_assert(max_encoded_event_bytes + stream_end.size() <= max_stream_buffer_bytes);
+/**
+ * The framed size up to which an event joins the buffer; a longer one is held alone after it. Half the buffer, so
+ * a stream refused for room resumes once half of it has drained, not only once it is empty.
+ */
+constexpr std::size_t max_buffered_event_bytes = max_stream_buffer_bytes / 2;
+
+// The terminal events carry a whole response, so the longest event is as long as the longest whole body; it is held
+// alone, never buffered, and the stream's end is appended to it.
+static_assert(max_event_bytes >= max_response_body_bytes);
+static_assert(max_encoded_event_bytes > max_buffered_event_bytes);
+// A buffered event fits beside the stream's end in an emptied buffer, so a send always proceeds once the client reads.
+static_assert(max_buffered_event_bytes + stream_end.size() <= max_stream_buffer_bytes);
 
 /** Writes the framed event into `into`, which is exactly `encoded_size(event)` bytes. */
 auto encode_event(Event const& event, std::span<char> into) -> void {
@@ -146,6 +156,15 @@ auto encode_event(Event const& event, std::span<char> into) -> void {
 	*cursor++ = '\r';
 	*cursor++ = '\n';
 	core::invariant(cursor == into.end());
+}
+
+/** The framed event as a piece of its own, `size` bytes, with room after it for the stream's end. */
+[[nodiscard]] auto encode_alone(Event const& event, std::size_t size) -> std::string {
+	auto framed = std::string{};
+	framed.reserve(size + stream_end.size());
+	framed.resize(size);
+	encode_event(event, framed);
+	return framed;
 }
 
 }
