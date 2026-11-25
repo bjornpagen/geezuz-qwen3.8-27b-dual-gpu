@@ -51,6 +51,12 @@ export struct Row {
 	Count position;
 	Token token;
 	sampling::Rule rule;
+	/**
+	 * Tokens the row may commit, 1 to `1 + drafts(depth)`: what is left of the request's limit. Acceptance also stops
+	 * at an end-of-turn token, which is then the row's last. So a row never commits past its request's end, and the
+	 * state of a finished request has read exactly its sequence but the last token.
+	 */
+	Count most;
 };
 
 /**
@@ -97,7 +103,8 @@ export using Cycle = std::variant<Batch, Chunk, Both>;
 
 /**
  * What one row committed: the token after its committed one, then the token after each accepted draft, in order;
- * `count` is the accepted drafts plus one.
+ * `count` is the accepted drafts plus one, at most the row's `most`, and only the last may end the turn. The slot's
+ * state then holds the row and its accepted drafts: every committed token but the last.
  */
 export struct Accepted {
 	std::array<Token, max_row_tokens> tokens;

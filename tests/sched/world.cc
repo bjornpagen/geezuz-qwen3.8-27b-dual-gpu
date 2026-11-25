@@ -252,7 +252,7 @@ public:
 		for (auto const& [bits, tracked] : tracked_) {
 			expect(tracked.finished.has_value(), "every request finishes or is cancelled");
 			if (tracked.fate == Fate::Running) {
-				expect(!tracked.finished || tracked.finished->ending != sched::Ending::Cancelled, "only a cancelled request ends cancelled");
+				expect(!tracked.finished || !std::holds_alternative<sched::Cancelled>(tracked.finished->ending), "only a cancelled request ends cancelled");
 			}
 		}
 		expect(scheduler_->facts().queued == 0, "nothing is left queued");
@@ -317,7 +317,7 @@ private:
 			               },
 			               [&](sched::Generated const& generated_tokens) {
 				               auto& entry = tracked(generated_tokens.request);
-				               expect(!entry.finished && entry.fate == Fate::Running, "only a running request reports tokens");
+				               expect(!entry.finished, "only an unfinished request reports tokens");
 				               expect(!generated_tokens.tokens.empty(), "a report carries tokens");
 				               for (auto const token : generated_tokens.tokens) {
 					               expect(token == generated(entry.script, entry.delivered.size()), "a request reports exactly its stream, nothing lost or repeated");
@@ -354,27 +354,38 @@ private:
 				               }
 				               auto const delivered = entry.delivered.size();
 				               expect(finished.usage.prompt_tokens == entry.prompt_tokens, "usage counts the prompt as run");
-				               switch (finished.ending) {
-				               case sched::Ending::Stop:
-					               reached_.stops += 1;
-					               expect(finished.usage.generated_tokens == delivered + 1 && generated(entry.script, delivered) == end_of_turn &&
-					                          finished.usage.generated_tokens <= entry.limit,
-					                      "a request stops exactly at its stream's end of turn, within its limit");
-					               break;
-				               case sched::Ending::Length:
-					               reached_.lengths += 1;
-					               expect(finished.usage.generated_tokens == delivered, "a request cut short reports every token it counts");
-					               if (delivered < entry.limit) {
-						               reached_.out_of_pool += 1;
-						               expect(alone, "a request ends short of its limit only when the pool cannot hold it alone");
-					               }
-					               break;
-				               case sched::Ending::Cancelled:
-					               reached_.cancels += 1;
-					               expect(entry.fate == Fate::Cancelled, "only a cancelled request ends cancelled");
-					               expect(finished.usage.generated_tokens == delivered, "a cancelled request counts what it reported");
-					               break;
-				               }
+				               auto expected_sequence = entry.script.prompt;
+				               expected_sequence.append_range(entry.delivered);
+				               std::visit(Overloaded{
+				                              [&](sched::Stopped const& stopped) {
+					                              reached_.stops += 1;
+					                              expect(finished.usage.generated_tokens == delivered + 1 && generated(entry.script, delivered) == end_of_turn &&
+					                                         finished.usage.generated_tokens <= entry.limit,
+					                                     "a request stops exactly at its stream's end of turn, within its limit");
+					                              expected_sequence.push_back(end_of_turn);
+					                              expect(stopped.sequence == expected_sequence, "a stopped request leaves its prompt, its tokens and its end of turn");
+				                              },
+				                              [&](sched::Truncated const& truncated) {
+					                              reached_.lengths += 1;
+					                              expect(finished.usage.generated_tokens == delivered, "a request cut short reports every token it counts");
+					                              expect(truncated.sequence == expected_sequence, "a truncated request leaves its prompt and its tokens");
+					                              if (delivered < entry.limit) {
+						                              reached_.out_of_pool += 1;
+						                              expect(alone, "a request ends short of its limit only when the pool cannot hold it alone");
+					                              }
+				                              },
+				                              [&](sched::Cancelled const& cancelled) {
+					                              reached_.cancels += 1;
+					                              expect(entry.fate == Fate::Cancelled, "only a cancelled request ends cancelled");
+					                              expect(finished.usage.generated_tokens == delivered, "a cancelled request counts what it reported");
+					                              if (auto const kept = core::alternative<sched::Kept>(cancelled.state)) {
+						                              expect(!kept->sequence.empty() && kept->sequence.size() < expected_sequence.size() &&
+						                                         std::ranges::starts_with(expected_sequence, kept->sequence),
+						                                     "a cancelled request keeps a prefix of what it read, short of its last token");
+					                              }
+				                              },
+				                          },
+				                          finished.ending);
 			               },
 			           },
 			           event);
@@ -489,18 +500,24 @@ private:
 		for (auto const& row : batch.rows) {
 			auto const& entry = tracked(row.request);
 			expect(device_->state(row.slot) == expected_chain(row.request, row.position), "a decoding slot's state is its sequence's");
-			auto const accepted = 1 + core::narrow<Count>(rng_() % (1 + model::drafts(batch.depth)));
-			auto result = sched::Accepted{.tokens = {}, .count = accepted};
+			expect(row.most >= 1 && row.most <= 1 + model::drafts(batch.depth), "a row may commit at least one token and at most its rows");
+			expect(row.most == std::min(1 + model::drafts(batch.depth), entry.limit - (row.position + 1 - entry.prompt_tokens)),
+			       "a row may commit what is left of its request's limit");
+			// The cards accept some drafts, never past the row's most nor past an end-of-turn token.
+			auto const drawn = 1 + core::narrow<Count>(rng_() % (1 + model::drafts(batch.depth)));
+			auto result = sched::Accepted{.tokens = {}, .count = 0};
 			auto read = std::vector<Token>{row.token};
-			for (auto index = Count{0}; index < accepted; ++index) {
-				auto const token = generated(entry.script, row.position + 1 + index - entry.prompt_tokens);
-				result.tokens[index] = token;
-				if (index + 1 < accepted) {
-					read.push_back(token);
+			while (result.count < std::min(drawn, row.most)) {
+				auto const token = generated(entry.script, row.position + 1 + result.count - entry.prompt_tokens);
+				result.tokens[result.count] = token;
+				result.count += 1;
+				if (sched::ends_turn(token)) {
+					break;
 				}
 			}
+			read.append_range(std::span{result.tokens}.first(result.count - 1));
 			auto const chain = write(row.slot, row.position, read, device_->state(row.slot));
-			scribble(row.slot, row.position + accepted, row.position + sched::lookahead, chain);
+			scribble(row.slot, row.position + result.count, row.position + sched::lookahead, chain);
 			device_->set_state(row.slot, chain);
 			done.rows.push_back(result);
 		}

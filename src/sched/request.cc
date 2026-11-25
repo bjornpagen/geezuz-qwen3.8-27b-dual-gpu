@@ -90,15 +90,50 @@ export struct [[nodiscard]] SubmitError {
 	[[nodiscard]] constexpr auto operator==(SubmitError const&) const -> bool = default;
 };
 
-/** Why a request ended. */
-export enum class Ending : std::uint8_t {
-	/** The model ended its turn with an end-of-generation token. */
-	Stop,
-	/** The limit, the context or the pool ran out. */
-	Length,
-	/** Its caller ended it: the client left, or the content reached a stop sequence. */
-	Cancelled,
+/**
+ * The model ended its turn. `sequence` is the request's whole sequence: the prompt as it ran (after turn replay),
+ * then every generated token, the end-of-turn token last. The cache closed it without that last token: the state after
+ * every token but the last is cached at a sequence-end point (unless the pool refused the snapshot or later evicts it),
+ * so a request whose prompt continues this sequence resumes there and reads the last token first, as for a prompt's
+ * end. A stored response keeps exactly these tokens.
+ */
+export struct Stopped {
+	std::vector<Token> sequence;
+
+	[[nodiscard]] auto operator==(Stopped const&) const -> bool = default;
 };
+
+/**
+ * The limit, the context or the pool ran out. `sequence` and what the cache holds are as for `Stopped`, without an
+ * end-of-turn token; a request the pool ended while still reading its prompt has only what it read cached.
+ */
+export struct Truncated {
+	std::vector<Token> sequence;
+
+	[[nodiscard]] auto operator==(Truncated const&) const -> bool = default;
+};
+
+/** The cache holds the state after every token of `sequence`, which a request continuing it resumes from. */
+export struct Kept {
+	std::vector<Token> sequence;
+
+	[[nodiscard]] auto operator==(Kept const&) const -> bool = default;
+};
+
+/** Nothing of the request was cached: it had read nothing, or the pool refused the snapshot. */
+export struct Dropped {
+	[[nodiscard]] constexpr auto operator==(Dropped const&) const -> bool = default;
+};
+
+/** Its caller ended it (the client left); its state was kept if it had any and the pool took it. */
+export struct Cancelled {
+	std::variant<Kept, Dropped> state;
+
+	[[nodiscard]] auto operator==(Cancelled const&) const -> bool = default;
+};
+
+/** Why a request ended, with the sequence it leaves. */
+export using Ending = std::variant<Stopped, Truncated, Cancelled>;
 
 /** Counts for a finished request: the generated tokens include the token that ended the turn. */
 export struct Usage {
@@ -139,7 +174,7 @@ export struct Finished {
 	Ending ending;
 	Usage usage;
 
-	[[nodiscard]] constexpr auto operator==(Finished const&) const -> bool = default;
+	[[nodiscard]] auto operator==(Finished const&) const -> bool = default;
 };
 
 export using Event = std::variant<Admitted, Generated, Paused, Finished>;

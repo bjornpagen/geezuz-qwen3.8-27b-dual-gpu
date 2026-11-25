@@ -132,13 +132,22 @@ template<Geometry G, RowBudget B>
 	auto const submit = [&](Count index) -> std::optional<std::string> {
 		auto& plan = plans[index];
 		if (plan.follows && handles[*plan.follows]) {
-			// A follow-up resends the earlier prompt and its turn as generated, then a new message.
-			auto const earlier = *handles[*plan.follows];
-			auto const ended = run.finished(earlier);
-			if (ended && ended->ending == sched::Ending::Stop) {
-				auto prompt = plans[*plan.follows].script.prompt;
-				prompt.append_range(run.delivered(earlier));
-				prompt.push_back(tokenizer::id(tokenizer::Added::im_end));
+			// A follow-up continues the earlier response's sequence exactly, as a stored response is continued, then adds
+			// a new message.
+			auto const ended = run.finished(*handles[*plan.follows]);
+			auto const stored = ended.and_then([](sched::Finished const& finished) {
+				return std::visit(
+				    [](auto const& ending) -> std::optional<std::vector<Token>> {
+					    if constexpr (requires { ending.sequence; }) {
+						    return ending.sequence;
+					    } else {
+						    return std::nullopt;
+					    }
+				    },
+				    finished.ending);
+			});
+			if (stored) {
+				auto prompt = *stored;
 				prompt.append_range(tokens(rng, 1 + below(rng, 20)));
 				auto const length = prompt.size();
 				plan.script.prompt = std::move(prompt);

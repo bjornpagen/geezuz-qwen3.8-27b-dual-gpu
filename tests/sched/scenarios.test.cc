@@ -73,11 +73,11 @@ template<class W>
 	}));
 }
 
-/** Positions below `limit` each chunk of the run read, summed. */
+/** Positions below `limit` each chunk of the run read from its `first` cycle on, summed. */
 template<class W>
-[[nodiscard]] auto prefilled_below(W const& run, Count limit) -> Count {
+[[nodiscard]] auto prefilled_below(W const& run, Count limit, Count first) -> Count {
 	auto total = Count{0};
-	for (auto const& cycle : run.cycles()) {
+	for (auto const& cycle : run.cycles().subspan(first)) {
 		auto const chunk = std::visit(
 		    [](auto const& each) -> std::optional<sched::Chunk> {
 			    if constexpr (requires { each.chunk; }) {
@@ -113,7 +113,7 @@ template<class W>
 	}
 	auto const admitted = admissions(run);
 	return admitted.size() == 3 && admitted[0].cached == 0 && admitted[1].cached == 40 && admitted[2].cached == 40 &&
-	       prefilled_below(run, 40) == 40;
+	       prefilled_below(run, 40, 0) == 40;
 }
 
 /** The same, without the dedup wait, reads the block three times: the check above can fail. */
@@ -126,7 +126,7 @@ template<class W>
 			return false;
 		}
 	}
-	return drain(run) && !run.failure() && prefilled_below(run, 40) == 120;
+	return drain(run) && !run.failure() && prefilled_below(run, 40, 0) == 120;
 }
 
 /**
@@ -195,12 +195,12 @@ template<class W>
 	auto const admitted = std::ranges::any_of(admissions(run), [&](sched::Admitted const& each) {
 		return each.request == last;
 	});
-	return ended && ended->ending == sched::Ending::Cancelled && !admitted && drain(run) && !run.failure();
+	return ended && std::holds_alternative<sched::Cancelled>(ended->ending) && !admitted && drain(run) && !run.failure();
 }
 
 /**
  * A request cancelled while its cycle runs keeps its slot until that cycle settles, then leaves with its state cached:
- * everything it reported is in the cache.
+ * the cycle's tokens are reported, and the state after every token but the last is in the cache.
  */
 [[nodiscard]] auto running_cancel_releases_at_boundary(tokenizer::Tokenizer const& tokens) -> bool {
 	auto run = World<roomy>{6, world::Waits::Possible};
@@ -229,11 +229,80 @@ template<class W>
 	});
 	auto reported = prompt;
 	reported.append_range(run.delivered(submitted->request));
-	auto const cached = std::ranges::any_of(run.scheduler().cache().entries(), [&](auto const& entry) {
-		return entry.tokens.size() >= reported.size() && std::ranges::starts_with(entry.tokens, reported);
+	// The cycle it was cancelled in reported its tokens too, and the state after all of them but the last is cached.
+	reported.pop_back();
+	auto const kept = ended.and_then([](sched::Finished const& finished) -> std::optional<sched::Kept> {
+		auto const cancelled = engine::core::alternative<sched::Cancelled>(finished.ending);
+		return cancelled.and_then([](sched::Cancelled const& each) {
+			return engine::core::alternative<sched::Kept>(each.state).transform([](sched::Kept const& state) {
+				return state;
+			});
+		});
 	});
-	return finishing && !before && ended && ended->ending == sched::Ending::Cancelled && vacant && cached && !run.delivered(submitted->request).empty() &&
-	       !run.failure();
+	auto const cached = std::ranges::any_of(run.scheduler().cache().entries(), [&](auto const& entry) {
+		return entry.tokens == reported;
+	});
+	return finishing && !before && kept && kept->sequence == reported && vacant && cached && !run.failure();
+}
+
+/**
+ * Forks of one stored response: a finished request leaves its sequence, the cache holds the state after all of it but
+ * its last token, and many requests whose prompts continue that sequence all resume there, sharing its kv blocks
+ * (one table reference per fork, beside the cache's own) and reading none of the shared part again.
+ */
+[[nodiscard]] auto forks_share_a_stored_response(tokenizer::Tokenizer const& tokens) -> bool {
+	auto run = World<roomy>{10, world::Waits::Possible};
+	if (!run.submit(tokens, script(distinct(40, 30), {}, 7, 99)) || !drain(run)) {
+		return false;
+	}
+	auto const ended = run.events().back();
+	if (!std::holds_alternative<sched::Finished>(ended) || !std::holds_alternative<sched::Truncated>(std::get<sched::Finished>(ended).ending)) {
+		return false;
+	}
+	auto const stored = std::get<sched::Truncated>(std::get<sched::Finished>(ended).ending).sequence;
+	auto const closed = std::vector<Token>{stored.begin(), stored.end() - 1};
+	auto const exact = std::ranges::any_of(run.scheduler().cache().entries(), [&](auto const& entry) {
+		return entry.tokens == closed;
+	});
+	constexpr auto forks = model::slots - 2;
+	auto const first = run.cycles().size();
+	auto const before = admissions(run).size();
+	for (auto index = Count{0}; index < forks; ++index) {
+		auto prompt = stored;
+		prompt.append_range(distinct(700 + (index * 11), 5));
+		if (!run.submit(tokens, script(std::move(prompt), {}, 3, 200 + index))) {
+			return false;
+		}
+	}
+	if (!run.plan()) {
+		return false;
+	}
+	// Every fork holds the stored sequence's whole blocks in its table: the same blocks, referenced once per fork.
+	auto const& pool = run.scheduler().pool();
+	auto const whole = closed.size() / roomy.block_tokens;
+	auto slots = std::vector<kv::Slot>{};
+	for (auto index = Count{0}; index < model::slots; ++index) {
+		if (pool.table_size(kv::Slot::at(index)) > 0) {
+			slots.push_back(kv::Slot::at(index));
+		}
+	}
+	auto shared = slots.size() == forks;
+	for (auto entry = Count{0}; shared && entry < whole; ++entry) {
+		auto const block = pool.entry(slots.front(), entry);
+		shared = std::ranges::all_of(slots, [&](kv::Slot slot) {
+			         return pool.entry(slot, entry) == block;
+		         }) &&
+		         pool.references(block) == kv::References{.tables = forks, .held = 1};
+	}
+	run.settle();
+	if (!drain(run) || run.failure()) {
+		return false;
+	}
+	auto const resumed = admissions(run);
+	auto const all_resumed = resumed.size() == before + forks && std::ranges::all_of(resumed | std::views::drop(before), [&](sched::Admitted const& each) {
+		return each.cached == closed.size();
+	});
+	return exact && shared && all_resumed && prefilled_below(run, closed.size(), first) == 0;
 }
 
 /** A request that ends its turn leaves the turn for replay; one cut off by its limit does not. */
@@ -292,6 +361,8 @@ auto main() -> int {
 	    engine::testing::Case{.name = "a queued request cancelled before it runs leaves unadmitted", .holds = queued_cancel_leaves(tokens)},
 	    engine::testing::Case{.name = "a running request cancelled mid-cycle leaves at the boundary with its state cached",
 	                          .holds = running_cancel_releases_at_boundary(tokens)},
+	    engine::testing::Case{.name = "forks of a stored response share its blocks and resume from its end without prefilling it",
+	                          .holds = forks_share_a_stored_response(tokens)},
 	    engine::testing::Case{.name = "a turn that ends is kept for replay; one cut off is not", .holds = stopped_turn_kept_for_replay(tokens)},
 	    engine::testing::Case{.name = "prompts past the context and a full table are refused with their kinds", .holds = refusals(tokens)},
 	};

@@ -38,6 +38,13 @@ enum class Wanted : std::uint8_t {
 	End,
 };
 
+/** Why a request ends; the `Ending` it reports carries what it leaves. */
+enum class Reason : std::uint8_t {
+	Stop,
+	Length,
+	Cancelled,
+};
+
 /** A request the scheduler holds, queued or in a slot. */
 struct Request {
 	/** The prompt, then every token the slot committed after it. */
@@ -47,8 +54,8 @@ struct Request {
 	sampling::Rule rule;
 	/** Tokens it may generate. */
 	Count limit;
-	/** Tokens it generated so far, the one that ended its turn included; the context may hold a cycle's more. */
-	Count generated;
+	/** Positions its state was cached through when it was last paused, if the pool took the snapshot. */
+	std::optional<Count> parked;
 	/** Positions its first admission resumed from the cache; absent until then. */
 	std::optional<Count> cached;
 	/** Its place in arrival order. */
@@ -81,6 +88,11 @@ struct Leaving {
 };
 
 using Occupancy = std::variant<Idle, Reading, Writing, Leaving>;
+
+/** Tokens the request generated, the one that ended its turn included: a row never commits past the end. */
+[[nodiscard]] auto generated(Request const& request) -> Count {
+	return request.context.size() - request.prompt_tokens;
+}
 
 template<class... F>
 struct Overloaded : F... {
@@ -156,7 +168,7 @@ public:
 		    .points = prefix::Points::of(length, marked),
 		    .rule = sampling::rule(submission.sampling, 0),
 		    .limit = limit,
-		    .generated = 0,
+		    .parked = std::nullopt,
 		    .cached = std::nullopt,
 		    .arrival = arrivals_,
 		    .admitted = std::nullopt,
@@ -172,8 +184,8 @@ public:
 
 	/**
 	 * Ends a request by its caller's decision. A queued one leaves at the next `plan`; a running one keeps its slot
-	 * until the next cycle boundary, its state cached for the conversation's next request. Either reports `Finished`
-	 * with `Ending::Cancelled` and nothing else after this call. A stale handle (the request already finished) is a
+	 * until the next cycle boundary, its state cached for the conversation's next request, and reports what that
+	 * cycle committed. Either then reports `Finished`, `Cancelled` unless that cycle ended the request anyway. A stale handle (the request already finished) is a
 	 * no-op: a cancellation races the request's own end.
 	 */
 	auto cancel(RequestHandle handle) -> void {
@@ -272,7 +284,7 @@ public:
 				            .request = writing.request,
 				            .prompt_tokens = request.prompt_tokens,
 				            .cached_tokens = request.cached.value_or(0),
-				            .generated_tokens = request.generated,
+				            .generated_tokens = generated(request),
 				        };
 			        },
 			        [](Leaving const& ending) -> SlotFacts {
@@ -363,38 +375,62 @@ private:
 
 	/**
 	 * The slot leaves its request: everything its state has read is cached at its end, so the conversation's next
-	 * request (or this one, resumed) starts there.
+	 * request (or this one, resumed) starts there. The positions cached, if the pool took them.
 	 */
 	template<kv::Device<G> D>
-	auto vacate(D& device, kv::Slot slot) -> void {
+	[[nodiscard]] auto vacate(D& device, kv::Slot slot) -> std::optional<Count> {
 		auto const read = read_of(slot);
 		auto const handle = occupant(slot);
 		core::invariant(handle.has_value());
 		auto const& request = look(*handle);
+		slots_[slot.index()] = Idle{};
 		if (read == 0) {
 			cache_->abandon(*pool_, slot);
-		} else if (auto const kept = cache_->close(device, *pool_, slot, std::span{request.context}.first(read)); !kept) {
-			counters_.snapshots_refused += 1;
+			return std::nullopt;
 		}
-		slots_[slot.index()] = Idle{};
+		if (auto const kept = cache_->close(device, *pool_, slot, std::span{request.context}.first(read)); !kept) {
+			counters_.snapshots_refused += 1;
+			return std::nullopt;
+		}
+		return read;
 	}
 
-	/** Ends a request in a slot: its slot is vacated, a turn it ended is kept for replay, and it reports `Finished`. */
+	[[nodiscard]] static auto usage(Request const& request) -> Usage {
+		return {.prompt_tokens = request.prompt_tokens, .cached_tokens = request.cached.value_or(0), .generated_tokens = generated(request)};
+	}
+
+	/** What a cancelled request leaves: the sequence whose state was cached through `cached` positions, if any. */
+	[[nodiscard]] static auto cancelled(Request const& request, std::optional<Count> cached) -> Ending {
+		if (!cached) {
+			return Cancelled{.state = Dropped{}};
+		}
+		return Cancelled{.state = Kept{.sequence = {request.context.begin(), request.context.begin() + core::narrow<std::ptrdiff_t>(*cached)}}};
+	}
+
+	/**
+	 * Ends a request in a slot: its slot is vacated, a turn it ended is kept for replay, and it reports `Finished`
+	 * with the sequence it leaves.
+	 */
 	template<kv::Device<G> D>
-	auto finish(D& device, kv::Slot slot, Ending ending, std::vector<Event>& events) -> void {
+	auto finish(D& device, kv::Slot slot, Reason reason, std::vector<Event>& events) -> void {
 		auto const handle = occupant(slot);
 		core::invariant(handle.has_value());
-		vacate(device, slot);
-		auto const& request = look(*handle);
-		if (ending == Ending::Stop) {
-			replay_.finished(std::span{request.context}.first(request.prompt_tokens),
-			                 std::span{request.context}.subspan(request.prompt_tokens, request.generated));
-		}
-		events.emplace_back(Finished{
-		    .request = *handle,
-		    .ending = ending,
-		    .usage = {.prompt_tokens = request.prompt_tokens, .cached_tokens = request.cached.value_or(0), .generated_tokens = request.generated},
-		});
+		auto const cached = vacate(device, slot);
+		auto& request = look(*handle);
+		auto const counts = usage(request);
+		auto ending = [&] -> Ending {
+			switch (reason) {
+			case Reason::Stop:
+				replay_.finished(std::span{request.context}.first(request.prompt_tokens), std::span{request.context}.subspan(request.prompt_tokens));
+				return Stopped{.sequence = std::move(request.context)};
+			case Reason::Length:
+				return Truncated{.sequence = std::move(request.context)};
+			case Reason::Cancelled:
+				return cancelled(request, cached);
+			}
+			std::unreachable();
+		}();
+		events.emplace_back(Finished{.request = *handle, .ending = std::move(ending), .usage = counts});
 		requests_.release(*handle);
 	}
 
@@ -403,7 +439,7 @@ private:
 	auto release_ended(D& device, std::vector<Event>& events) -> void {
 		for (auto index = Count{0}; index < model::slots; ++index) {
 			if (std::holds_alternative<Leaving>(slots_[index])) {
-				finish(device, kv::Slot::at(index), Ending::Cancelled, events);
+				finish(device, kv::Slot::at(index), Reason::Cancelled, events);
 			}
 		}
 		std::erase_if(queue_, [&](RequestHandle handle) {
@@ -411,11 +447,8 @@ private:
 			if (request.wanted == Wanted::Run) {
 				return false;
 			}
-			events.emplace_back(Finished{
-			    .request = handle,
-			    .ending = Ending::Cancelled,
-			    .usage = {.prompt_tokens = request.prompt_tokens, .cached_tokens = request.cached.value_or(0), .generated_tokens = request.generated},
-			});
+			// A paused request's state was cached when it left its slot.
+			events.emplace_back(Finished{.request = handle, .ending = cancelled(request, request.parked), .usage = usage(request)});
 			requests_.release(handle);
 			return true;
 		});
@@ -497,8 +530,9 @@ private:
 		auto const handle = occupant(slot);
 		core::invariant(handle.has_value());
 		auto const held = pool_->table_size(slot);
-		vacate(device, slot);
-		look(*handle).held = held;
+		auto& request = look(*handle);
+		request.parked = vacate(device, slot);
+		request.held = held;
 		queue_.push_front(*handle);
 		counters_.preemptions += 1;
 		events.emplace_back(Paused{.request = *handle});
@@ -585,7 +619,15 @@ private:
 				auto const handle = std::get<Writing>(slots_[index]).request;
 				auto const& request = look(handle);
 				auto const position = request.context.size() - 1;
-				rows.push_back({.slot = kv::Slot::at(index), .request = handle, .position = position, .token = request.context.back(), .rule = request.rule});
+				rows.push_back({
+				    .slot = kv::Slot::at(index),
+				    .request = handle,
+				    .position = position,
+				    .token = request.context.back(),
+				    .rule = request.rule,
+				    // Capped at the batch's depth once it is known.
+				    .most = request.limit - generated(request),
+				});
 				extends.push_back({.slot = kv::Slot::at(index), .length = position, .until = position + lookahead});
 			}
 			auto chunk = select_chunk(rows.size());
@@ -600,13 +642,16 @@ private:
 					return Cycle{std::move(*chunk)};
 				}
 				auto batch = Batch{.depth = schedule::shape(rows.size(), B), .rows = std::move(rows)};
+				for (auto& row : batch.rows) {
+					row.most = std::min(row.most, 1 + model::drafts(batch.depth));
+				}
 				if (!chunk) {
 					return Cycle{std::move(batch)};
 				}
 				return Cycle{Both{.batch = std::move(batch), .chunk = std::move(*chunk)}};
 			}
 			if (live() == 1) {
-				finish(device, newest(), Ending::Length, events);
+				finish(device, newest(), Reason::Length, events);
 				continue;
 			}
 			pause(device, newest(), events);
@@ -614,31 +659,35 @@ private:
 	}
 
 	/**
-	 * Hands the request its committed tokens: up to its limit, and up to and including a token that ends its turn,
-	 * which is counted but not reported. The ending, if these tokens reached one.
+	 * Hands the request the tokens just appended to its context: an end-of-turn token, only ever the last, is counted
+	 * but not reported. Why the request ends, if these tokens ended it.
 	 */
-	[[nodiscard]] auto deliver(RequestHandle handle, std::span<Token const> tokens, std::vector<Event>& events) -> std::optional<Ending> {
-		auto& request = look(handle);
-		auto reported = std::vector<Token>{};
-		auto ending = std::optional<Ending>{};
-		for (auto const token : tokens) {
-			if (request.generated == request.limit) {
-				break;
-			}
-			request.generated += 1;
-			if (ends_turn(token)) {
-				ending = Ending::Stop;
-				break;
-			}
-			reported.push_back(token);
-		}
-		if (!ending && request.generated == request.limit) {
-			ending = Ending::Length;
-		}
+	[[nodiscard]] auto deliver(RequestHandle handle, std::span<Token const> tokens, std::vector<Event>& events) -> std::optional<Reason> {
+		auto const& request = look(handle);
+		core::invariant(generated(request) <= request.limit && std::ranges::none_of(tokens.first(tokens.size() - 1), ends_turn));
+		auto const stops = ends_turn(tokens.back());
+		auto reported = std::vector<Token>{tokens.begin(), tokens.end() - (stops ? 1 : 0)};
 		if (!reported.empty()) {
 			events.emplace_back(Generated{.request = handle, .tokens = std::move(reported)});
 		}
-		return ending;
+		if (stops) {
+			return Reason::Stop;
+		}
+		return generated(request) == request.limit ? std::optional{Reason::Length} : std::nullopt;
+	}
+
+	/**
+	 * The slot committed `tokens`: they are reported, and the request ends if they ended it, or if it was cancelled
+	 * while they were being made.
+	 */
+	template<kv::Device<G> D>
+	auto commit(D& device, kv::Slot slot, RequestHandle handle, std::span<Token const> tokens, std::vector<Event>& events) -> void {
+		auto const reason = deliver(handle, tokens, events);
+		if (std::holds_alternative<Leaving>(slots_[slot.index()])) {
+			finish(device, slot, reason.value_or(Reason::Cancelled), events);
+		} else if (reason) {
+			finish(device, slot, *reason, events);
+		}
 	}
 
 	template<kv::Device<G> D>
@@ -647,20 +696,15 @@ private:
 		counters_.cycles += 1;
 		counters_.drafted_tokens += batch.rows.size() * model::drafts(batch.depth);
 		for (auto const [row, accepted] : std::views::zip(batch.rows, done.rows)) {
-			core::invariant(accepted.count >= 1 && accepted.count <= 1 + model::drafts(batch.depth));
+			core::invariant(accepted.count >= 1 && accepted.count <= row.most);
 			counters_.accepted_tokens += accepted.count - 1;
 			auto& request = look(row.request);
 			core::invariant(request.context.size() == row.position + 1);
 			request.context.append_range(accepted.view());
-			auto const read = row.position + accepted.count;
 			if (auto leaving = core::alternative<Leaving>(slots_[row.slot.index()])) {
-				leaving->read = read;
-				finish(device, row.slot, Ending::Cancelled, events);
-				continue;
+				leaving->read = request.context.size() - 1;
 			}
-			if (auto const ending = deliver(row.request, accepted.view(), events)) {
-				finish(device, row.slot, *ending, events);
-			}
+			commit(device, row.slot, row.request, accepted.view(), events);
 		}
 	}
 
@@ -671,25 +715,29 @@ private:
 		counters_.prefill_tokens += chunk.tokens.size();
 		auto const read = chunk.from + chunk.tokens.size();
 		auto& request = look(chunk.request);
-		if (std::holds_alternative<Leaving>(slots_[chunk.slot.index()])) {
-			std::get<Leaving>(slots_[chunk.slot.index()]).read = read;
-			finish(device, chunk.slot, Ending::Cancelled, events);
-			return;
-		}
-		auto const ahead = request.points.after(chunk.from);
-		if (!ahead.empty() && ahead.front().position == read) {
-			auto const saved = cache_->insert(device, *pool_, chunk.slot, std::span{request.context}.first(read), prefix::Mark{ahead.front().kind});
-			counters_.snapshots_refused += saved ? 0 : 1;
+		auto leaving = core::alternative<Leaving>(slots_[chunk.slot.index()]);
+		if (leaving) {
+			leaving->read = read;
+		} else {
+			auto const ahead = request.points.after(chunk.from);
+			if (!ahead.empty() && ahead.front().position == read) {
+				auto const saved = cache_->insert(device, *pool_, chunk.slot, std::span{request.context}.first(read), prefix::Mark{ahead.front().kind});
+				counters_.snapshots_refused += saved ? 0 : 1;
+			}
 		}
 		if (chunk.read == Read::Part) {
-			slots_[chunk.slot.index()] = Reading{.request = chunk.request, .read = read};
+			if (leaving) {
+				finish(device, chunk.slot, Reason::Cancelled, events);
+			} else {
+				slots_[chunk.slot.index()] = Reading{.request = chunk.request, .read = read};
+			}
 			return;
 		}
 		request.context.push_back(*done.sampled);
-		slots_[chunk.slot.index()] = Writing{.request = chunk.request};
-		if (auto const ending = deliver(chunk.request, std::span{request.context}.last(1), events)) {
-			finish(device, chunk.slot, *ending, events);
+		if (!leaving) {
+			slots_[chunk.slot.index()] = Writing{.request = chunk.request};
 		}
+		commit(device, chunk.slot, chunk.request, std::span{request.context}.last(1), events);
 	}
 
 	std::unique_ptr<kv::BasicPool<G>> pool_;
