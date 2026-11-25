@@ -305,9 +305,9 @@ private:
 		Count size;
 	};
 
-	// The table encodes a handle as its generation above its index; the index is the block's place on the cards.
+	/** A block's place on the cards is its slot in the block table, which every occupant of the slot shares. */
 	[[nodiscard]] static auto index_of(BlockHandle block) -> BlockIndex {
-		return core::narrow<BlockIndex>(block.bits & ((std::uint64_t{1} << Blocks::index_bits) - 1));
+		return core::narrow<BlockIndex>(Blocks::index(block));
 	}
 
 	[[nodiscard]] static auto indices(std::array<BlockHandle, G.snapshot_blocks> const& parts) -> SnapshotBlocks {

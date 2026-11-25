@@ -33,10 +33,14 @@ template<class Table>
 		listed.push_back(handle.bits);
 	}
 	auto const index = [](std::uint64_t bits) {
-		return bits & ((std::uint64_t{1} << Table::index_bits) - 1);
+		return Table::index(ProbeHandle{bits});
 	};
 	auto const live = model.live | std::views::keys | std::ranges::to<std::set>();
-	return listed.size() == live.size() && std::ranges::to<std::set>(listed) == live && std::ranges::is_sorted(listed, std::less{}, index);
+	auto const indices = listed | std::views::transform(index) | std::ranges::to<std::vector>();
+	auto const own_slots = std::ranges::all_of(indices, [&](std::size_t slot) {
+		return slot < model.capacity;
+	}) && std::ranges::adjacent_find(indices) == indices.end();
+	return listed.size() == live.size() && std::ranges::to<std::set>(listed) == live && std::ranges::is_sorted(indices) && own_slots;
 }
 
 template<std::size_t Capacity, std::uint8_t GenerationBits>
@@ -92,6 +96,24 @@ template<std::size_t Capacity, std::uint8_t GenerationBits>
 	return handles.size() == 3 && none_valid && table.retired_count() == 1 && !table.insert(8).has_value();
 }
 
+/** In a full table, the one slot a release frees is the one the next insert fills: a new handle, the same index. */
+[[nodiscard]] auto a_refilled_slot_keeps_its_index() -> bool {
+	using Table = engine::handle::Table<int, ProbeHandle, 4, 8>;
+	auto holds = true;
+	for (auto victim = std::size_t{0}; victim < 4; ++victim) {
+		auto table = Table{};
+		auto handles = std::vector<ProbeHandle>{};
+		while (auto const handle = table.insert(0)) {
+			handles.push_back(*handle);
+		}
+		table.release(handles[victim]);
+		auto const refilled = table.insert(1);
+		holds = holds && refilled.has_value() && *refilled != handles[victim] &&
+		        Table::index(*refilled) == Table::index(handles[victim]);
+	}
+	return holds;
+}
+
 [[nodiscard]] auto forged_index_past_capacity_is_rejected() -> bool {
 	auto table = engine::handle::Table<int, ProbeHandle, 3, 8>{};
 	std::ignore = table.insert(1);
@@ -123,6 +145,10 @@ auto main() -> int {
 	    engine::testing::Case{
 	        .name = "an exhausted slot retires and never validates any of its handles",
 	        .holds = exhausted_slot_retires(),
+	    },
+	    engine::testing::Case{
+	        .name = "a refilled slot gives a new handle with the index of the one released",
+	        .holds = a_refilled_slot_keeps_its_index(),
 	    },
 	    engine::testing::Case{
 	        .name = "a handle naming an index past the capacity finds nothing",

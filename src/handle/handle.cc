@@ -38,6 +38,14 @@ public:
 		}
 	}
 
+	/**
+	 * The slot a handle names, below `Capacity` for every handle the table issued. It stays the same across the
+	 * slot's occupants, so an owner can key storage outside the table (a block's place on a device) by it.
+	 */
+	[[nodiscard]] static constexpr auto index(H handle) -> std::size_t {
+		return core::narrow<std::size_t>(handle.bits & ((std::uint64_t{1} << index_bits) - 1));
+	}
+
 	/** Stores `value` in a free slot; nullopt when every slot is live or retired. */
 	[[nodiscard]] auto insert(T value) -> std::optional<H> {
 		if (free_count_ == 0) {
@@ -47,7 +55,7 @@ public:
 		auto const index = free_[free_count_];
 		auto& slot = slots_[index];
 		slot.value.emplace(std::move(value));
-		return H{.bits = (slot.generation << index_bits) | core::narrow<std::uint64_t>(index)};
+		return handle_of(index);
 	}
 
 	[[nodiscard]] auto try_get(H handle) -> std::optional<T&> {
@@ -95,7 +103,7 @@ public:
 			       return slots_[index].value.has_value();
 		       }) |
 		       std::views::transform([this](std::size_t index) {
-			       return H{.bits = (slots_[index].generation << index_bits) | core::narrow<std::uint64_t>(index)};
+			       return handle_of(index);
 		       });
 	}
 
@@ -117,8 +125,12 @@ private:
 		std::uint64_t generation = 1;
 	};
 
+	[[nodiscard]] auto handle_of(std::size_t index) const -> H {
+		return H{.bits = (slots_[index].generation << index_bits) | core::narrow<std::uint64_t>(index)};
+	}
+
 	[[nodiscard]] auto index_of(H handle) const -> std::optional<std::size_t> {
-		auto const index = core::narrow<std::size_t>(handle.bits & ((std::uint64_t{1} << index_bits) - 1));
+		auto const index = Table::index(handle);
 		if (index >= Capacity) {
 			return std::nullopt;
 		}
