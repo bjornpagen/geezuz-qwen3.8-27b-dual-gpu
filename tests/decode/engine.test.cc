@@ -50,7 +50,7 @@ template<class Poll>
 			return std::move(*outcome);
 		}
 		if (std::chrono::steady_clock::now() >= deadline) {
-			return std::unexpected(decode::DecodeError{.reason = decode::Abandoned{.ticket = std::nullopt}});
+			return std::unexpected(decode::DecodeError{.reason = decode::Abandoned{.ticket = std::nullopt, .kernels = decode::Kernels::MayRun}});
 		}
 		std::this_thread::yield();
 	}
@@ -64,11 +64,51 @@ template<image::Catalog C>
 	return output && output->write(0, baked.file).has_value() && std::move(*output).commit().has_value();
 }
 
-/** The three images, written once into a directory of the test's own. */
-[[nodiscard]] auto images() -> std::optional<decode::Paths> {
-	auto const directory = std::filesystem::current_path() / "decode_engine.scratch";
-	std::filesystem::remove_all(directory);
-	std::filesystem::create_directories(directory);
+/** A directory of this run's own under the system's temporary directory, removed with everything in it when it dies. */
+class Scratch {
+public:
+	[[nodiscard]] static auto create() -> std::optional<Scratch> {
+		auto failed = std::error_code{};
+		auto const base = std::filesystem::temp_directory_path(failed);
+		if (failed) {
+			return std::nullopt;
+		}
+		auto random = std::random_device{};
+		for (auto attempt = 0; attempt < 16; ++attempt) {
+			auto directory = base / std::format("decode_engine.{:08x}{:08x}", random(), random());
+			// A directory that already exists belongs to someone else: draw another name.
+			if (std::filesystem::create_directory(directory, failed) && !failed) {
+				return Scratch{std::move(directory)};
+			}
+		}
+		return std::nullopt;
+	}
+
+	Scratch(Scratch&& other) noexcept : directory_{std::exchange(other.directory_, {})} {}
+	auto operator=(Scratch&&) -> Scratch& = delete;
+	Scratch(Scratch const&) = delete;
+	auto operator=(Scratch const&) -> Scratch& = delete;
+
+	~Scratch() {
+		if (!directory_.empty()) {
+			auto failed = std::error_code{};
+			std::filesystem::remove_all(directory_, failed);
+		}
+	}
+
+	[[nodiscard]] auto directory() const -> std::filesystem::path const& {
+		return directory_;
+	}
+
+private:
+	explicit Scratch(std::filesystem::path directory) : directory_{std::move(directory)} {}
+
+	std::filesystem::path directory_;
+};
+
+/** The three images, written once into the run's scratch directory. */
+[[nodiscard]] auto images(Scratch const& scratch) -> std::optional<decode::Paths> {
+	auto const& directory = scratch.directory();
 	auto const paths = decode::Paths{.card_zero = directory / "card0.image", .card_one = directory / "card1.image", .host = directory / "host.image"};
 	auto const written = write_image<SyntheticCatalogs::CardZero>(paths.card_zero, 1) && write_image<SyntheticCatalogs::CardOne>(paths.card_one, 2) &&
 	                     write_image<SyntheticCatalogs::Host>(paths.host, 3);
@@ -184,6 +224,31 @@ using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, Exit
 	return held && driver.violations().empty() && driver.nothing_live();
 }
 
+/**
+ * Fail closed: loops abandoned while a kernel may still run keep every allocation the kernels could write. The engine
+ * dies without a single driver call (no free, no context destroyed), and its memory stays live on the cards.
+ */
+[[nodiscard]] auto abandoned_engines_free_nothing(decode::Paths const& paths) -> bool {
+	// Every recorded event answers "not ready" this many times: the launched loops still run at the deadline.
+	auto const driver = fake::Fake{fake::Machine{.pending_queries = 64}};
+	auto calls = std::size_t{0};
+	auto live = std::size_t{0};
+	auto abandoned = false;
+	{
+		auto engine = open(driver, paths);
+		if (!engine || !engine->start()) {
+			return false;
+		}
+		auto const ended = engine->try_shutdown(std::chrono::steady_clock::now());
+		abandoned = ended && !*ended &&
+		            ended->error() == decode::DecodeError{.reason = decode::Abandoned{.ticket = 1, .kernels = decode::Kernels::MayRun}} &&
+		            decode::describe(ended->error()).contains("never freed");
+		calls = driver.calls();
+		live = driver.live(fake::Kind::DeviceMemory);
+	}
+	return abandoned && live > 0 && driver.calls() == calls && driver.live(fake::Kind::DeviceMemory) == live && driver.violations().empty();
+}
+
 /** An image for the wrong memory is refused at open, before anything reaches a card. */
 [[nodiscard]] auto wrong_image_is_refused(decode::Paths const& paths) -> bool {
 	auto const driver = fake::Fake{fake::Machine{}};
@@ -234,7 +299,8 @@ using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, Exit
 
 auto main() -> int {
 	using engine::testing::Case;
-	auto const paths = images();
+	auto const scratch = Scratch::create();
+	auto const paths = scratch ? images(*scratch) : std::nullopt;
 	if (!paths) {
 		std::println("FAIL: the synthetic images could not be written");
 		return 1;
@@ -242,6 +308,7 @@ auto main() -> int {
 	auto const cases = std::array{
 	    Case{.name = "the engine launches each card's loop with its cross-wired parameters and stops", .holds = brings_up_and_stops(*paths)},
 	    Case{.name = "a shutdown ends the loops from every state, and keeps a failure", .holds = shuts_down_from_every_state(*paths)},
+	    Case{.name = "an abandoned engine dies without a driver call, its memory kept", .holds = abandoned_engines_free_nothing(*paths)},
 	    Case{.name = "an image for the wrong memory is refused at open", .holds = wrong_image_is_refused(*paths)},
 	    Case{.name = "every driver failure during bring-up fails cleanly", .holds = every_failure_is_clean(*paths)},
 	};

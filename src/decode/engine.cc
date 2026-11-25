@@ -225,9 +225,22 @@ template<image::Catalog Host>
 using HostImage = device::MappedArray<std::byte, image::payload_bytes<Host>>;
 
 /**
+ * Keeps `owner` from its destructor for the rest of the process: what it owns may still be written by a kernel no one
+ * can stop, and freed memory would be handed to whatever allocates next. Never freed, by design; the process is
+ * expected to exit.
+ */
+template<class Owner>
+auto lose(Owner owner) -> void {
+	[[clang::no_destroy]] static auto lost = std::pair<std::mutex, std::vector<std::shared_ptr<void>>>{};
+	auto const held = std::scoped_lock{lost.first};
+	lost.second.push_back(std::make_shared<Owner>(std::move(owner)));
+}
+
+/**
  * Where the resident loops stand. Halted loops used up their rings (each carried an exit ticket), so the next start
  * takes fresh ones; unlaunched loops still have theirs. Failed loops ended on an error and their kernels have finished;
- * abandoned loops were given up on at a deadline, and may still run. Nothing restarts either.
+ * abandoned loops were given up on at a deadline, and may still run, so the engine never frees what they could write.
+ * Nothing restarts either.
  */
 enum class Loops : std::uint8_t {
 	Unlaunched,
@@ -309,9 +322,18 @@ public:
 	auto operator=(Engine const&) -> Engine& = delete;
 
 	~Engine() {
-		// A running loop reads every allocation here: it must have been shut down first. Abandoned loops may still run;
-		// the deadline that gave up on them is the caller's word that the cards are lost anyway.
+		// A running loop reads every allocation here: it must have been shut down first.
 		core::invariant(loops_ != Loops::Running);
+		if (loops_ == Loops::Abandoned) {
+			// Abandoned loops may still write any of it, the rings and mask buffers in host memory included: fail closed,
+			// keeping every owner (the contexts too, whose destruction frees what they hold) unfreed. What is left of the
+			// members below is moved-from, and frees nothing.
+			lose(Remains{.devices = std::move(devices_),
+			             .host = std::move(host_),
+			             .zero = std::move(zero_),
+			             .one = std::move(one_),
+			             .session = std::move(session_)});
+		}
 	}
 
 	/** The parameters card `card`'s loop starts with: its memories, and the peer's workspace and control block. */
@@ -478,16 +500,21 @@ public:
 				loops_ = Loops::Halted;
 				return ended;
 			}
-			return end(Loops::Failed, ended->error());
+			// The kernels have finished, so a ticket the session gave up on can no longer be written to.
+			auto error = ended->error();
+			if (auto const abandoned = core::alternative<Abandoned>(error.reason)) {
+				abandoned->kernels = Kernels::Finished;
+			}
+			return end(Loops::Failed, std::move(error));
 		}
-		if (done) {
-			return end(Loops::Abandoned, done->error());
-		}
-		if (std::chrono::steady_clock::now() < give_up) {
+		if (!done && std::chrono::steady_clock::now() < give_up) {
 			return std::nullopt;
 		}
-		// The loops answered their exits (or broke) but a kernel never finished: past the deadline it is given up on.
-		return end(Loops::Abandoned, *ended ? DecodeError{.reason = Abandoned{.ticket = std::nullopt}} : ended->error());
+		// A kernel never finished past the deadline, or whether it has cannot be told: it may still run, and the engine
+		// keeps everything it could write. The ticket the session gave up on, if it did, is named.
+		auto const gave_up = *ended ? std::nullopt : core::alternative<Abandoned>(ended->error().reason);
+		return end(Loops::Abandoned,
+		           DecodeError{.reason = Abandoned{.ticket = gave_up ? gave_up->ticket : std::nullopt, .kernels = Kernels::MayRun}});
 	}
 
 	[[nodiscard]] auto session() const -> Session const& {
@@ -526,6 +553,15 @@ private:
 		}
 		return core::Result<void, DecodeError>{};
 	}
+
+	/** Everything the engine owns on the cards and in pinned memory: what an abandoned engine keeps unfreed. */
+	struct Remains {
+		device::Devices devices;
+		HostImage<typename C::Host> host;
+		Card<typename C::CardZero> zero;
+		Card<typename C::CardOne> one;
+		Session session;
+	};
 
 	// Declared first, so it dies last: every member below lives in its contexts.
 	device::Devices devices_;

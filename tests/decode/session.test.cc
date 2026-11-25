@@ -47,7 +47,7 @@ template<class Poll>
 			return std::move(*outcome);
 		}
 		if (std::chrono::steady_clock::now() >= deadline) {
-			return std::unexpected(decode::DecodeError{.reason = decode::Abandoned{.ticket = 0}});
+			return std::unexpected(decode::DecodeError{.reason = decode::Abandoned{.ticket = 0, .kernels = decode::Kernels::MayRun}});
 		}
 		std::this_thread::yield();
 	}
@@ -646,7 +646,7 @@ struct CycleMasks {
 		return false;
 	}
 	auto const ended = session->try_shutdown(std::chrono::steady_clock::now());
-	if (!ended || *ended || ended->error() != decode::DecodeError{.reason = decode::Abandoned{.ticket = pending->ticket}}) {
+	if (!ended || *ended || ended->error() != decode::DecodeError{.reason = decode::Abandoned{.ticket = pending->ticket, .kernels = decode::Kernels::MayRun}}) {
 		return false;
 	}
 	// Abandoned loops take nothing more: a later batch fails with the same failure.

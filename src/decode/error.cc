@@ -92,6 +92,17 @@ export struct [[nodiscard]] Unloadable {
 	[[nodiscard]] constexpr auto operator==(Unloadable const&) const -> bool = default;
 };
 
+/** Whether the kernels of loops given up on may still be running. */
+export enum class Kernels : std::uint8_t {
+	/**
+	 * They may: the engine keeps all its device and pinned memory, never freed, because a kernel may still write it.
+	 * The process is expected to exit.
+	 */
+	MayRun,
+	/** They have finished since, so nothing writes the engine's memory any more. */
+	Finished,
+};
+
 /**
  * A shutdown gave up on the loops at its deadline: `ticket` (the begun one or an exit) was never answered, or, with
  * none, every ticket was answered but a kernel never finished. The cards are in no known state, and nothing more is sent
@@ -99,6 +110,7 @@ export struct [[nodiscard]] Unloadable {
  */
 export struct [[nodiscard]] Abandoned {
 	std::optional<std::uint64_t> ticket;
+	Kernels kernels;
 
 	[[nodiscard]] constexpr auto retry() const -> core::Retry {
 		return core::Retry::Permanent;
@@ -246,10 +258,12 @@ struct Describe {
 	}
 
 	[[nodiscard]] auto operator()(Abandoned const& abandoned) const -> std::string {
-		if (abandoned.ticket) {
-			return std::format("the decode loops were abandoned at the shutdown's deadline: ticket {} was never answered", *abandoned.ticket);
-		}
-		return "the decode loops were abandoned at the shutdown's deadline: every ticket was answered but a kernel never finished";
+		auto const what = abandoned.ticket ? std::format("ticket {} was never answered", *abandoned.ticket)
+		                                   : std::string{"every ticket was answered but a kernel never finished"};
+		auto const kernels = abandoned.kernels == Kernels::MayRun
+		                         ? "the kernels may still be running, so the engine keeps all its device and pinned memory, never freed, and the process must exit"
+		                         : "the kernels have finished since";
+		return std::format("the decode loops were abandoned at the shutdown's deadline: {}; {}", what, kernels);
 	}
 
 	[[nodiscard]] auto operator()(CardsDisagree const& disagree) const -> std::string {

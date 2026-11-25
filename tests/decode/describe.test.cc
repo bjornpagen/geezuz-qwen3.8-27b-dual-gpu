@@ -60,7 +60,7 @@ template<class E, E last>
 	case 5:
 		return {.reason = decode::TimedOut{.card = card(), .waiting = any_of<decode::Waiting, decode::Waiting::Rotations>(random)}};
 	case 6:
-		return {.reason = decode::Abandoned{.ticket = maybe()}};
+		return {.reason = decode::Abandoned{.ticket = maybe(), .kernels = any_of<decode::Kernels, decode::Kernels::Finished>(random)}};
 	case 7:
 		return {.reason = decode::LoopGone{.ticket = small()}};
 	default:

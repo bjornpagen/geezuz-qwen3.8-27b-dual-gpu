@@ -491,7 +491,7 @@ private:
 		if (std::chrono::steady_clock::now() < give_up) {
 			return std::nullopt;
 		}
-		return broke(DecodeError{.reason = Abandoned{.ticket = ticket}});
+		return broke(DecodeError{.reason = Abandoned{.ticket = ticket, .kernels = Kernels::MayRun}});
 	}
 
 	/** Queues the exits, behind every queued command when the cards are healthy, and none otherwise. */
