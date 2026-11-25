@@ -298,7 +298,8 @@ baseline keeps geezuz's algorithm, but its building blocks are these primitives 
 - dp4a and any int8 or fp16-accumulate math path;
 - cooperative-groups `grid.sync` and atomic-counter grid barriers in the dataflow core (allowed only in the step-1
   baseline, deleted at step 2);
-- per-phase kernel launches in the decode cycle (prefill may run a short fixed sequence of kernels per chunk);
+- per-phase kernel launches in the decode cycle (prefill launches ~800 kernels per 2048-token chunk: ~4 ms of launch
+  overhead against ~1 s or more of compute);
 - weight-stream loads without a cache policy;
 - unswizzled shared tiles with bank conflicts;
 - texture / surface paths, `printf`, dynamic shared allocation decided at runtime.
