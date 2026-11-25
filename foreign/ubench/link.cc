@@ -26,10 +26,23 @@ export using Nanoseconds = driver::DeviceArray<unsigned long long, 1>;
 /** Which end of the flag ping-pong a kernel is: the one that starts each round, or the one that answers it. */
 export enum class FlagEnd : std::uint8_t { Ping, Pong };
 
-export template<FlagEnd end, ub::Wait wait>
+[[nodiscard]] consteval auto flavor_name(link::Flavor flavor) -> std::string_view {
+	switch (flavor) {
+	case link::Flavor::ReleaseAcquire:
+		return "release";
+	case link::Flavor::Relaxed:
+		return "relaxed";
+	case link::Flavor::Fenced:
+		return "fenced";
+	}
+	std::unreachable();
+}
+
+export template<FlagEnd end, link::Flavor flavor, ub::Wait wait>
 struct FlagKernel {
 	static constexpr ptx::Image image = link_image;
-	static constexpr EntryName name = entry_name("ubench_flag_", end == FlagEnd::Ping ? "ping" : "pong", "_", wait == ub::Wait::Backoff ? "backoff" : "spin");
+	static constexpr EntryName name = entry_name("ubench_flag_", end == FlagEnd::Ping ? "ping" : "pong", "_", flavor_name(flavor), "_",
+	                                             wait == ub::Wait::Backoff ? "backoff" : "spin");
 	static constexpr std::string_view entry = name.view();
 	static constexpr driver::Dim grid = one_block;
 	static constexpr device::prims::Budget budget = link::flag_budget;
@@ -42,7 +55,7 @@ struct FlagKernel {
 	}
 };
 
-export using ReceiveSlots = driver::DeviceArray<ub::Word4, link::receive_chunks>;
+export using ReceiveSlots = driver::DeviceArray<ub::Chunk, link::receive_chunks>;
 export using SenderFlags = driver::DeviceArray<unsigned long long, link::max_senders>;
 export using PullSinks = driver::DeviceArray<unsigned, link::max_senders>;
 
@@ -102,9 +115,9 @@ export template<int rows>
 using PushRow = std::tuple<link::Push<rows, 4>, link::Push<rows, 16>, link::Push<rows, 64>>;
 export using PushSweep = std::tuple<PushRow<1>, PushRow<8>, PushRow<24>, PushRow<32>>;
 
-export using ReleaseScratch = driver::DeviceArray<ub::Word4, ub::sms>;
-export using BackgroundSlots = driver::DeviceArray<ub::Word4, static_cast<std::size_t>(ub::sms) * link::background_chunks>;
-export using BackgroundHost = driver::MappedArray<ub::Word4, static_cast<std::size_t>(ub::sms) * link::background_chunks>;
+export using ReleaseScratch = driver::DeviceArray<ub::Chunk, ub::sms>;
+export using BackgroundSlots = driver::DeviceArray<ub::Chunk, static_cast<std::size_t>(ub::sms) * link::background_chunks>;
+export using BackgroundHost = driver::MappedArray<ub::Chunk, static_cast<std::size_t>(ub::sms) * link::background_chunks>;
 
 /** The timed block waits for nothing, but the background blocks wait for its stop, so every block must be resident. */
 export template<link::Background background>
@@ -132,7 +145,7 @@ struct ReleaseKernel {
 	}
 };
 
-export using Table = driver::MappedArray<ub::Word4, link::table_chunks>;
+export using Table = driver::MappedArray<ub::Chunk, link::table_chunks>;
 export using FetchReading = driver::DeviceArray<link::FetchReading, 1>;
 
 export template<int rows>

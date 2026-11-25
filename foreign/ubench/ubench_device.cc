@@ -10,4 +10,5 @@ export import :sync;
 export import :compute;
 export import :link;
 export import :checks;
+export import :gemv;
 export import :adversarial;

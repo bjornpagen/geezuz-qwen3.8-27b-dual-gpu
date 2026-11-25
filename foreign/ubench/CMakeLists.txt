@@ -4,9 +4,9 @@
 # the adversarial review whose microbenchmark table the drivers answer.
 add_library(engine_ubench_device)
 target_sources(engine_ubench_device PUBLIC FILE_SET CXX_MODULES FILES
-	ubench_device.cc shapes.cc images.cc names.cc launch.cc stream.cc sync.cc compute.cc link.cc checks.cc adversarial.cc
+	ubench_device.cc shapes.cc images.cc names.cc launch.cc stream.cc sync.cc compute.cc link.cc checks.cc gemv.cc adversarial.cc
 )
-target_link_libraries(engine_ubench_device PUBLIC engine_language_profile engine_core engine_ptx engine_prims engine_driver)
+target_link_libraries(engine_ubench_device PUBLIC engine_language_profile engine_core engine_ptx engine_prims engine_driver engine_gemv)
 # The shapes are a device header; this unit is its one host includer.
 target_include_directories(engine_ubench_device PRIVATE "${PROJECT_SOURCE_DIR}/device")
 engine_embed_ptx(engine_ubench_device SOURCE images.cc IMAGES ubench_stream ubench_sync ubench_compute ubench_link prims_check)

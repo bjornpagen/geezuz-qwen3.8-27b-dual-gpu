@@ -59,7 +59,7 @@ export struct NamedBarrierKernel {
 	}
 };
 
-export using CopySource = driver::DeviceArray<ub::Word4, 32>;
+export using CopySource = driver::DeviceArray<ub::Chunk, 32>;
 
 export struct CopyCompletionKernel {
 	static constexpr ptx::Image image = sync_image;

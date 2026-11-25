@@ -17,7 +17,7 @@ namespace ub = engine::device::ubench;
 namespace stream = engine::device::ubench::stream;
 
 /** The stream every weight-stream kernel reads: each SM's run of whole tiles, one card's worth. */
-export using StreamSource = driver::DeviceArray<ub::Word4, stream::chunks>;
+export using StreamSource = driver::DeviceArray<ub::Chunk, stream::chunks>;
 export using BlockClocks = driver::DeviceArray<ub::Clocks, ub::sms>;
 export using BlockRates = driver::DeviceArray<ub::Rate, ub::sms>;
 
@@ -89,7 +89,7 @@ export struct SustainKernel {
 	}
 };
 
-export using Activations = driver::DeviceArray<ub::Word4, stream::Reuse<stream::Priorities::Split>::activation_chunks>;
+export using Activations = driver::DeviceArray<ub::Chunk, stream::Reuse<stream::Priorities::Split>::activation_chunks>;
 
 export template<stream::Priorities priorities>
 struct ReuseKernel {
@@ -106,7 +106,7 @@ struct ReuseKernel {
 	}
 };
 
-export using L2Region = driver::DeviceArray<ub::Word4, ub::l2::region_chunks>;
+export using L2Region = driver::DeviceArray<ub::Chunk, ub::l2::region_chunks>;
 export using SegmentRates = driver::DeviceArray<ub::Rate, ub::l2::segments>;
 inline constexpr driver::Dim every_segment = {.x = static_cast<std::uint32_t>(ub::l2::segments), .y = 1, .z = 1};
 
