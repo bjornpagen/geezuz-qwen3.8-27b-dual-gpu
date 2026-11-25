@@ -2,4 +2,7 @@
 export module engine.sched;
 
 export import :request;
+export import :cycle;
+export import :status;
 export import :replay;
+export import :scheduler;
