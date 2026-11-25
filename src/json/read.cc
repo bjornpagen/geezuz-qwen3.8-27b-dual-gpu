@@ -31,7 +31,44 @@ class Reader;
 
 export template<Bounds B>
     requires Enforceable<B>
+class Value;
+
+/**
+ * One complete JSON value as text, exactly as it was written, checked whole: a tool's definition, its parameter
+ * schema, a tool-call argument. Holding it as text keeps every byte the client sent; holding it as this type keeps
+ * the proof that the text is one valid value within the bounds it was read under, so a writer embeds it without
+ * looking again. Only a reader makes one.
+ */
+export class JsonText {
+public:
+	/** Reads `text` whole with `reader`, checking every part; keeps it without surrounding whitespace. */
+	template<Bounds B>
+	    requires Enforceable<B>
+	[[nodiscard]] static auto from(Reader<B>& reader, std::string_view text) -> core::Result<JsonText, ReadError>;
+
+	[[nodiscard]] auto text() const -> std::string_view {
+		return text_;
+	}
+
+	[[nodiscard]] auto operator==(JsonText const&) const -> bool = default;
+
+private:
+	template<Bounds B>
+	    requires Enforceable<B>
+	friend class Value;
+
+	explicit JsonText(std::string_view text) : text_{text} {}
+
+	std::string text_;
+};
+
+export template<Bounds B>
+    requires Enforceable<B>
 class Object;
+
+export template<Bounds B>
+    requires Enforceable<B>
+[[nodiscard]] auto check(Value<B> value) -> core::Result<void, ReadError>;
 
 export template<Bounds B>
     requires Enforceable<B>
@@ -157,6 +194,22 @@ public:
 	 */
 	[[nodiscard]] auto raw() -> core::Result<std::string_view, ReadError> {
 		return lift(value_.raw());
+	}
+
+	/** Reads the whole value, checking every part, and keeps its exact text. */
+	[[nodiscard]] auto capture() -> core::Result<JsonText, ReadError> {
+		auto const text = reader_.text();
+		auto const begin = value_.offset(text);
+		if (!begin) {
+			return refuse(begin.error());
+		}
+		if (auto const checked = check(*this); !checked) {
+			return std::unexpected(checked.error());
+		}
+		auto const end = reader_.offset();
+		core::invariant(*begin <= end && end <= text.size());
+		auto const written = text.substr(*begin, end - *begin);
+		return JsonText{written.substr(0, written.find_last_not_of(" \t\n\r") + 1)};
 	}
 
 private:
@@ -350,6 +403,7 @@ public:
 		if (text.text().size() > B.document_bytes) {
 			return refuse(ParseFault::TooLarge);
 		}
+		text_ = text.text();
 		auto root = parser_->iterate(text);
 		if (!root) {
 			return refuse(root.error());
@@ -377,10 +431,21 @@ public:
 
 private:
 	friend class Object<B>;
+	friend class Value<B>;
+
+	[[nodiscard]] auto text() const -> std::string_view {
+		return text_;
+	}
+
+	[[nodiscard]] auto offset() const -> std::size_t {
+		return parser_->offset();
+	}
 
 	explicit Reader(std::unique_ptr<simdjson::Parser> parser) : parser_{std::move(parser)}, names_(B.depth + 1) {}
 
 	std::unique_ptr<simdjson::Parser> parser_;
+	/** The text of the current document. */
+	std::string_view text_;
 	/** A padded copy of the current text, when it was not read in place; at most `B.document_bytes` plus padding. */
 	std::string copy_;
 	/** The names seen so far in the object open at each depth: siblings at one depth are read one after another. */
@@ -394,9 +459,9 @@ auto Object<B>::names() -> std::unordered_set<std::string_view>& {
 }
 
 /** Reads a whole value, checking every part of it against the grammar and `B`. */
-export template<Bounds B>
+template<Bounds B>
     requires Enforceable<B>
-[[nodiscard]] auto check(Value<B> value) -> core::Result<void, ReadError> {
+auto check(Value<B> value) -> core::Result<void, ReadError> {
 	auto const kind = value.kind();
 	if (!kind) {
 		return std::unexpected(kind.error());
@@ -470,6 +535,27 @@ export template<Bounds B>
 		return checked;
 	}
 	return reader.finish();
+}
+
+}
+
+namespace engine::json {
+
+template<Bounds B>
+    requires Enforceable<B>
+auto JsonText::from(Reader<B>& reader, std::string_view text) -> core::Result<JsonText, ReadError> {
+	auto root = reader.read_copy(text);
+	if (!root) {
+		return std::unexpected(root.error());
+	}
+	auto captured = root->capture();
+	if (!captured) {
+		return captured;
+	}
+	if (auto const finished = reader.finish(); !finished) {
+		return std::unexpected(finished.error());
+	}
+	return captured;
 }
 
 }

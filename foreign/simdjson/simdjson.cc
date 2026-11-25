@@ -258,6 +258,8 @@ public:
 	[[nodiscard]] auto array() -> core::Result<ArrayCursor, ParseError>;
 	/** The exact text of the value, read to its end without checking more than its structure. */
 	[[nodiscard]] auto raw() -> core::Result<std::string_view, ParseError>;
+	/** Where the value starts in its text, before it is read. */
+	[[nodiscard]] auto offset(std::string_view text) -> core::Result<std::size_t, ParseError>;
 
 private:
 	friend class Parser;
@@ -412,6 +414,17 @@ auto Value::raw() -> core::Result<std::string_view, ParseError> {
 	});
 }
 
+auto Value::offset(std::string_view text) -> core::Result<std::size_t, ParseError> {
+	return on_handle(handle_, [text](auto& held) -> core::Result<std::size_t, ParseError> {
+		auto location = static_cast<char const*>(nullptr);
+		if (auto const code = held.current_location().get(location)) {
+			return failure(code);
+		}
+		/* SAFETY: simdjson's location points into the text it was given, at or before its end. */
+		return static_cast<std::size_t>(location - text.data());
+	});
+}
+
 auto ObjectCursor::next() -> core::Result<std::optional<Field>, ParseError> {
 	if (!at_) {
 		auto begin = od::object_iterator{};
@@ -514,10 +527,24 @@ public:
 	[[nodiscard]] auto iterate(PaddedView text) -> core::Result<Value, ParseError> {
 		auto const bytes = text.text();
 		auto const view = ::simdjson::padded_string_view{bytes.data(), bytes.size(), bytes.size() + padding};
+		text_ = bytes;
 		if (auto const code = parser_.iterate(view).get(document_)) {
 			return failure(code);
 		}
 		return Value{od::document_reference{document_}};
+	}
+
+	/**
+	 * How far into the text reading has gone: the start of the next token after everything read so far, or the
+	 * end of the text once the root has been read.
+	 */
+	[[nodiscard]] auto offset() const -> std::size_t {
+		auto location = static_cast<char const*>(nullptr);
+		if (document_.current_location().get(location) != ::simdjson::SUCCESS) {
+			return text_.size();
+		}
+		/* SAFETY: simdjson's location points into the text it was given, at or before its end. */
+		return static_cast<std::size_t>(location - text_.data());
 	}
 
 	/** After the root has been read to its end: refuses anything but whitespace after it. */
@@ -533,6 +560,7 @@ private:
 
 	od::parser parser_{0};
 	od::document document_;
+	std::string_view text_;
 };
 
 }
