@@ -166,7 +166,7 @@ kept as ideas and rewritten in the new style:
   | preset | purpose |
   |---|---|
   | `dev` | `-O1`, warnings as errors, trap-mode ubsan on host, device invariant checks |
-  | `release` | `-O3`, lto, device checks off |
+  | `release` | `-O3`, thin lto with lld, device checks off |
   | `asan-ubsan` | host-only runtime sanitizers for the cpu test suite |
   | `profile` | release plus the per-phase profiler |
   | `lint` | clang-tidy over the whole graph |
@@ -189,8 +189,9 @@ copied and adapted:
   `.clang-format`, `.clang-tidy` (split into a dialect profile and a quarantine profile).
 - **`src/handle.cc`**: generational `{index, generation}` handles for slots, kv blocks and connections.
 - **`src/core.cc`**: the `std::expected` error shape ("errors are decision surfaces").
-- **`foreign/exec.cc` + `exec.backend.cc`**: the stdexec boundary. its narrow-abi quarantine was a gcc ice workaround;
-  under clang, retest importing stdexec inside the module graph and delete the workaround if it is clean.
+- **`foreign/exec/`**: the stdexec boundary. stdexec ships its own `stdexec` module, which imports cleanly under clang
+  and libc++, so cpp-starter's narrow-abi quarantine (a gcc ice workaround) is gone and senders compose across modules.
+  `exec::static_thread_pool` is outside stdexec's module and is not used.
 - **`unsafe/net.cc`, `net.loop.cc`, `net.linux.cc`, `net.internal.h`**: the bounded single-threaded epoll reactor.
 - **`src/http.cc`**: bounded http, extended with request bodies and sse streaming.
 - **`tests/compile_fail/`** and **`PINS.md`** (the ledger of the toolchain pair and deliberate deviations).
@@ -315,8 +316,11 @@ data/              draft vocabulary, tokenizer and chat-format fixtures
 | module | holds |
 |---|---|
 | `engine.model` | re-export of the model description: dims, layer kinds, head splits, tensor list |
+| `engine.core`, `engine.handle`, `engine.fail` | the error algebra, generational handles, the always-on invariant (quarantined in `unsafe/fail`) |
+| `engine.file` | read-only whole-file mappings (checkpoint, image, test inputs) |
+| `engine.safetensors` | typed decode of a safetensors file: bounded header, closed dtype set, byte ranges tiling the data |
 | `engine.image` | baked-image format: header with checkpoint hash, per-tensor extents; typed errors on mismatch |
-| `engine.bake` | safetensors reader, tensor-parallel split, tile layout in stream order |
+| `engine.bake` | tensor-parallel split and tile layout in stream order, over `engine.safetensors` |
 | `engine.tokenizer` | qwen byte-level bpe, special tokens, utf-8-safe streaming decode |
 | `engine.chat` | qwen3.8 chat format: system, user, assistant, tool turns, thinking, reasoning effort, tool-call parse |
 | `engine.sampling` | sampling parameters as a closed type; exact top-k / top-p / min-p / temperature; seeds |
@@ -325,11 +329,24 @@ data/              draft vocabulary, tokenizer and chat-format fixtures
 | `engine.sched` | slots, admission, preemption, chunked-prefill share, row budget, turn replay |
 | `engine.device` | typed launch surface over the driver api: cards, streams, events, the resident ring |
 | `engine.pipeline` | stdexec request pipeline |
-| `engine.json`, `engine.http`, `engine.openai` | bounded json, http with bodies and sse, the openai endpoint |
+| `engine.json`, `engine.http`, `engine.openai` | json over simdjson on-demand, http with bodies and sse, the openai endpoint with full streaming |
 
 **one model description, held once.** `device/model.h` is the single source of every model and layout constant: plain
 `constexpr`, no macros, because device code must read it. `foreign/model.cc` re-exports it as `engine.model`. tile
 schedules and buffer geometries are `consteval` functions over it. nothing else defines a dimension.
+
+facts the checkpoint fixes that the config alone does not say (read from the safetensors headers and tensor values):
+- block scales are stored bf16 (`weight_scale_inv`) and multiply: weight = e4m3 x scale. there are no fp32 tensors;
+  `A_log` and `dt_bias` are bf16, and `mamba_ssm_dtype: float32` names the deltanet state.
+- every rms norm stores a zero-centred weight and applies (1 + w), except the deltanet gated norm, which applies w.
+- the attention output gate is sigmoid; deltanet's output gate is silu (`output_gate_type: swish`).
+- the mrope sections [11, 11, 10] interleave three position streams that are equal for text, so the rope is plain
+  partial rope over 64 dims, pairs half-split (feature j with j + 32), frequencies in natural order.
+- `modules_to_not_convert` is not reliable (it names modules the checkpoint lacks); the headers decide the format.
+- the mtp layer is a full-attention decoder layer with its own kv: 17 kv layers per card, not 16.
+- kv blocks hold 64 positions (two 32-position split-k tiles); snapshots are capped at a quarter of the pool.
+- the kv pool size is derived, not chosen: what is left of the card after weights, workspace, slot state, snapshots
+  and the driver's reserve, divided by the kv bytes per position.
 
 **the baked image.** `geezuz-bake` reads the safetensors checkpoint once and writes one image per card:
 - verifies the checkpoint hash and stamps it in the header;
@@ -752,7 +769,6 @@ reopens it only if the handoff exceeds ~100 µs.
 ## 3. risks
 
 - **clang cuda and the latest toolkit**: clang can trail the newest toolkit; use the newest pair it supports.
-- **stdexec on clang + libc++**: the module boundary may still need the narrow-abi quarantine.
 - **kernels are unverified until phase c**: phase a proves builds, resource budgets and host logic, not kernel
   correctness. the cpu reference exists so phase c catches mistakes on day one.
 - **the bf16 compute ceiling**: the lossless contract caps verify width at 24-32 rows per cycle. retune on hardware.
