@@ -7,6 +7,21 @@ import :status;
 
 namespace engine::http {
 
+/**
+ * Text that a JSON string holds verbatim: printable ASCII with no quote and no backslash. The constructor is
+ * consteval, so every refusal's fixed text is checked when the server is compiled and needs no escaping at run time.
+ */
+struct JsonText {
+	std::string_view text;
+
+	consteval explicit JsonText(std::string_view literal) : text{literal} {
+		for (auto const c : literal) {
+			// A character that would need escaping makes this a non-constant expression: the build fails here.
+			core::invariant(c >= ' ' && c <= '~' && c != '"' && c != '\\');
+		}
+	}
+};
+
 /** Why a request was refused. Each kind is one named response; none can succeed by sending the same bytes again. */
 export enum class HttpErrorKind : std::uint8_t {
 	/** The request line or a header field breaks the grammar (including bare LF and obsolete line folding). */
@@ -83,42 +98,86 @@ export [[nodiscard]] constexpr auto status_of(HttpErrorKind kind) -> StatusCode 
 	return StatusCode::BadRequest;
 }
 
-/** The refusal's body: one line a person reads. */
-[[nodiscard]] constexpr auto explanation(HttpErrorKind kind) -> std::string_view {
+[[nodiscard]] constexpr auto code_text(HttpErrorKind kind) -> JsonText {
 	switch (kind) {
 	case HttpErrorKind::Malformed:
-		return "malformed request\n";
+		return JsonText{"malformed_request"};
 	case HttpErrorKind::HeadTooLarge:
-		return "request head too large\n";
+		return JsonText{"request_head_too_large"};
 	case HttpErrorKind::TooManyHeaders:
-		return "too many header fields\n";
+		return JsonText{"too_many_header_fields"};
 	case HttpErrorKind::UnsupportedVersion:
-		return "only HTTP/1.1 is served\n";
+		return JsonText{"http_version_not_supported"};
 	case HttpErrorKind::HostRequired:
-		return "exactly one Host field is required\n";
+		return JsonText{"host_required"};
 	case HttpErrorKind::AmbiguousFraming:
-		return "Transfer-Encoding and Content-Length together\n";
+		return JsonText{"ambiguous_framing"};
 	case HttpErrorKind::UnsupportedTransferCoding:
-		return "unsupported transfer coding\n";
+		return JsonText{"unsupported_transfer_coding"};
 	case HttpErrorKind::ChunkedUpload:
-		return "chunked uploads are refused; send Content-Length\n";
+		return JsonText{"chunked_upload_refused"};
 	case HttpErrorKind::BadContentLength:
-		return "invalid Content-Length\n";
+		return JsonText{"invalid_content_length"};
 	case HttpErrorKind::LengthRequired:
-		return "Content-Length required\n";
+		return JsonText{"length_required"};
 	case HttpErrorKind::BodyTooLarge:
-		return "request body too large\n";
+		return JsonText{"request_body_too_large"};
 	case HttpErrorKind::BodyNotAllowed:
-		return "this route takes no body\n";
+		return JsonText{"body_not_allowed"};
 	case HttpErrorKind::UnsupportedExpectation:
-		return "only 100-continue is supported\n";
+		return JsonText{"unsupported_expectation"};
 	case HttpErrorKind::NotFound:
-		return "not found\n";
+		return JsonText{"route_not_found"};
 	case HttpErrorKind::ExpectedPost:
+		return JsonText{"post_required"};
 	case HttpErrorKind::ExpectedGet:
-		return "method not allowed\n";
+		return JsonText{"get_required"};
 	}
-	return "bad request\n";
+	return JsonText{"malformed_request"};
+}
+
+/** The refusal's stable OpenAI error `code`, one per kind: clients and logs may match on it. */
+export [[nodiscard]] constexpr auto error_code(HttpErrorKind kind) -> std::string_view {
+	return code_text(kind).text;
+}
+
+/** The refusal's `message`: a sentence a person reads. */
+[[nodiscard]] constexpr auto explanation(HttpErrorKind kind) -> JsonText {
+	switch (kind) {
+	case HttpErrorKind::Malformed:
+		return JsonText{"the request line or a header field is malformed"};
+	case HttpErrorKind::HeadTooLarge:
+		return JsonText{"the request head is too large"};
+	case HttpErrorKind::TooManyHeaders:
+		return JsonText{"the request has too many header fields"};
+	case HttpErrorKind::UnsupportedVersion:
+		return JsonText{"only HTTP/1.1 is served"};
+	case HttpErrorKind::HostRequired:
+		return JsonText{"exactly one Host field is required"};
+	case HttpErrorKind::AmbiguousFraming:
+		return JsonText{"Transfer-Encoding and Content-Length must not appear together"};
+	case HttpErrorKind::UnsupportedTransferCoding:
+		return JsonText{"the final transfer coding must be chunked"};
+	case HttpErrorKind::ChunkedUpload:
+		return JsonText{"chunked uploads are refused; send Content-Length"};
+	case HttpErrorKind::BadContentLength:
+		return JsonText{"Content-Length must be one decimal number"};
+	case HttpErrorKind::LengthRequired:
+		return JsonText{"a chat request needs Content-Length"};
+	case HttpErrorKind::BodyTooLarge:
+		return JsonText{"the request body is too large"};
+	case HttpErrorKind::BodyNotAllowed:
+		return JsonText{"this route takes no request body"};
+	case HttpErrorKind::UnsupportedExpectation:
+		return JsonText{"only Expect: 100-continue is supported"};
+	case HttpErrorKind::NotFound:
+		return JsonText{"no route has this path"};
+	case HttpErrorKind::ExpectedPost:
+		return JsonText{"this route takes POST"};
+	case HttpErrorKind::ExpectedGet:
+		return JsonText{"this route takes GET"};
+	}
+	return JsonText{"the request is malformed"};
 }
 
 /** The Allow field a 405 carries; other refusals carry none. */

@@ -490,6 +490,29 @@ constexpr std::string_view simple = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
 	       http::status_of(Kind::ExpectedGet) == Status::MethodNotAllowed && http::status_of(Kind::NotFound) == Status::NotFound;
 }
 
+/** Every refusal kind has its own error code: a client or a log can tell any two refusals apart by it. */
+[[nodiscard]] auto error_codes_are_distinct() -> bool {
+	using enum http::HttpErrorKind;
+	constexpr auto kinds = std::array{Malformed,
+	                                  HeadTooLarge,
+	                                  TooManyHeaders,
+	                                  UnsupportedVersion,
+	                                  HostRequired,
+	                                  AmbiguousFraming,
+	                                  UnsupportedTransferCoding,
+	                                  ChunkedUpload,
+	                                  BadContentLength,
+	                                  LengthRequired,
+	                                  BodyTooLarge,
+	                                  BodyNotAllowed,
+	                                  UnsupportedExpectation,
+	                                  NotFound,
+	                                  ExpectedPost,
+	                                  ExpectedGet};
+	auto const codes = kinds | std::views::transform(http::error_code) | std::ranges::to<std::set>();
+	return codes.size() == kinds.size();
+}
+
 [[nodiscard]] auto request_ids_are_sane_or_absent() -> bool {
 	return http::RequestId::parse("req_01HZ-x.y:z").has_value() && !http::RequestId::parse("").has_value() &&
 	       !http::RequestId::parse("a b").has_value() && !http::RequestId::parse(std::string(http::max_request_id_bytes + 1, 'a')) &&
@@ -517,6 +540,7 @@ auto main() -> int {
 	    engine::testing::Case{.name = "nothing after a refused request is parsed", .holds = nothing_after_a_refusal_is_parsed()},
 	    engine::testing::Case{.name = "framing refusals are the named 411, 413 and 400 responses",
 		                      .holds = status_of_is_the_named_response()},
+	    engine::testing::Case{.name = "every refusal kind has its own error code", .holds = error_codes_are_distinct()},
 	    engine::testing::Case{.name = "a request id is 1 to 64 id characters", .holds = request_ids_are_sane_or_absent()},
 	};
 	return engine::testing::report(cases);

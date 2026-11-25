@@ -2,6 +2,7 @@
 import std;
 import engine.http;
 import engine.http_test_client;
+import engine.json;
 import engine.net;
 import engine.testing;
 
@@ -267,26 +268,106 @@ struct Harness {
 	return parsed.complete.size() == 1 && field(parsed.complete[0], "connection") == "close" && h->service.exchanges.size() == 1;
 }
 
+/** An OpenAI error object's members, as the engine's own JSON reader reads them: the oracle reads JSON, not text. */
+struct ErrorObject {
+	std::string message;
+	std::string type;
+	engine::json::Kind param;
+	std::string code;
+};
+
+using ErrorReader = engine::json::Reader<engine::json::request_bounds>;
+
+/** Reads `{"error": {...}}` member by member: exactly the four members, nothing else, and nothing after the root. */
+[[nodiscard]] auto read_error(ErrorReader& reader, std::string_view body) -> std::optional<ErrorObject> {
+	auto root = reader.read_copy(body);
+	auto outer = root ? root->as_object() : std::unexpected(root.error());
+	auto first = outer ? outer->next() : std::unexpected(outer.error());
+	if (!first || !*first || (**first).name != "error") {
+		return std::nullopt;
+	}
+	auto inner = (**first).value.as_object();
+	if (!inner) {
+		return std::nullopt;
+	}
+	auto out = ErrorObject{.message = "", .type = "", .param = engine::json::Kind::Object, .code = ""};
+	auto names = std::set<std::string>{};
+	for (;;) {
+		auto member = inner->next();
+		if (!member) {
+			return std::nullopt;
+		}
+		if (!*member) {
+			break;
+		}
+		auto& [name, value] = **member;
+		names.emplace(name);
+		if (name == "param") {
+			auto const kind = value.kind();
+			if (!kind) {
+				return std::nullopt;
+			}
+			out.param = *kind;
+			continue;
+		}
+		auto const text = value.as_string();
+		if (!text) {
+			return std::nullopt;
+		}
+		if (name == "message") {
+			out.message = *text;
+		} else if (name == "type") {
+			out.type = *text;
+		} else if (name == "code") {
+			out.code = *text;
+		}
+	}
+	auto const after = outer->next();
+	if (names != std::set<std::string>{"code", "message", "param", "type"} || !after || *after || !reader.finish()) {
+		return std::nullopt;
+	}
+	return out;
+}
+
+/** The response is OpenAI's error object as valid JSON, with `type`, a null `param` and the stable `code`. */
+[[nodiscard]] auto is_error_object(ErrorReader& reader, client::Parsed const& response, std::string_view type, std::string_view code)
+    -> bool {
+	auto const error = read_error(reader, response.body);
+	return field(response, "content-type") == "application/json" && is_issued_id(field(response, "x-request-id")) && error &&
+	       !error->message.empty() && error->type == type && error->param == engine::json::Kind::Null && error->code == code;
+}
+
 struct Refusal {
 	std::string request;
 	int status;
+	http::HttpErrorKind kind;
 };
 
 [[nodiscard]] auto refusals_are_named_and_close_the_connection() -> bool {
+	using enum http::HttpErrorKind;
+	auto reader = ErrorReader::make();
+	if (!reader) {
+		return false;
+	}
 	auto const refusals = std::array{
-	    Refusal{.request = get("/nowhere", ""), .status = 404},
-	    Refusal{.request = get("/v1/chat/completions", ""), .status = 405},
+	    Refusal{.request = get("/nowhere", ""), .status = 404, .kind = NotFound},
+	    Refusal{.request = get("/v1/chat/completions", ""), .status = 405, .kind = ExpectedPost},
 	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
-		        .status = 411},
-	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n\r\n", .status = 411},
+		        .status = 411,
+		        .kind = ChunkedUpload},
+	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n\r\n", .status = 411, .kind = LengthRequired},
 	    Refusal{.request = std::format("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n{}", bounds.bytes + 1,
 		                               std::string(4096, 'z')),
-		        .status = 413},
+		        .status = 413,
+		        .kind = BodyTooLarge},
 	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}",
-		        .status = 400},
-	    Refusal{.request = "GET /health HTTP/1.0\r\nHost: t\r\n\r\n", .status = 505},
-	    Refusal{.request = get("/health", "X-Big: " + std::string(http::max_head_bytes, 'a') + "\r\n"), .status = 431},
-	    Refusal{.request = "GET /health HTTP/1.1\r\n\r\n", .status = 400},
+		        .status = 400,
+		        .kind = AmbiguousFraming},
+	    Refusal{.request = "GET /health HTTP/1.0\r\nHost: t\r\n\r\n", .status = 505, .kind = UnsupportedVersion},
+	    Refusal{
+	        .request = get("/health", "X-Big: " + std::string(http::max_head_bytes, 'a') + "\r\n"), .status = 431, .kind = HeadTooLarge},
+	    Refusal{.request = "GET /health HTTP/1.1\r\n\r\n", .status = 400, .kind = HostRequired},
+	    Refusal{.request = "G@T /health HTTP/1.1\r\nHost: t\r\n\r\n", .status = 400, .kind = Malformed},
 	};
 	for (auto const& refusal : refusals) {
 		auto h = harness(Chat::Echo, quick);
@@ -300,7 +381,8 @@ struct Refusal {
 		}
 		auto const parsed = responses(*peer);
 		if (parsed.complete.size() != 1 || parsed.complete[0].status != refusal.status ||
-		    field(parsed.complete[0], "connection") != "close" || !h->service.exchanges.empty()) {
+		    field(parsed.complete[0], "connection") != "close" || !h->service.exchanges.empty() ||
+		    !is_error_object(*reader, parsed.complete[0], "invalid_request_error", http::error_code(refusal.kind))) {
 			std::println("refusal {} answered {}", refusal.status, parsed.complete.empty() ? 0 : parsed.complete[0].status);
 			return false;
 		}
@@ -649,10 +731,13 @@ enum class Departure : std::uint8_t {
 [[nodiscard]] auto an_oversized_answer_is_a_500() -> bool {
 	auto h = harness(Chat::Oversized, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
-	if (!peer || !h->push(*peer, chat("{}", "")) || !h->pump(*peer, has_responses(*peer, 1), 2000ms)) {
+	auto reader = ErrorReader::make();
+	if (!peer || !reader || !h->push(*peer, chat("{}", "")) || !h->pump(*peer, has_responses(*peer, 1), 2000ms)) {
 		return false;
 	}
-	return responses(*peer).complete[0].status == 500;
+	auto const parsed = responses(*peer);
+	auto const& response = parsed.complete[0];
+	return response.status == 500 && is_error_object(*reader, response, "server_error", "response_too_large");
 }
 
 /** Stopping refuses new work, lets the open stream finish, closes its connection after it, and then stops. */
@@ -726,8 +811,9 @@ auto main() -> int {
 		                      .holds = an_insane_client_id_is_replaced()},
 	    engine::testing::Case{.name = "Connection: close is answered and the next pipelined request is not read",
 		                      .holds = connection_close_is_honoured()},
-	    engine::testing::Case{.name = "404, 405, 411, 413, 400, 505, 431 are sent whole, then the connection closes",
-		                      .holds = refusals_are_named_and_close_the_connection()},
+	    engine::testing::Case{
+	        .name = "404, 405, 411, 413, 400, 505, 431 are OpenAI error objects with stable codes, then the connection closes",
+	        .holds = refusals_are_named_and_close_the_connection()},
 	    engine::testing::Case{.name = "pipelined requests sent whole, byte by byte and in 7-byte pieces draw the same answers (seed 1)",
 		                      .holds = socket_fragmentation_never_changes_the_answers(1)},
 	    engine::testing::Case{.name = "pipelined requests sent whole, byte by byte and in 7-byte pieces draw the same answers (seed 2)",
@@ -752,7 +838,7 @@ auto main() -> int {
 		                      .holds = an_idle_connection_is_closed_at_the_read_deadline()},
 	    engine::testing::Case{.name = "Expect: 100-continue draws the interim response before the body",
 		                      .holds = continue_is_sent_before_the_body()},
-	    engine::testing::Case{.name = "a whole response over max_response_body_bytes is answered 500",
+	    engine::testing::Case{.name = "a whole response over max_response_body_bytes is answered 500 as an OpenAI error object",
 		                      .holds = an_oversized_answer_is_a_500()},
 	    engine::testing::Case{.name = "stop closes idle connections, refuses new ones, and drains the open stream",
 		                      .holds = stop_drains_in_flight_streams()},

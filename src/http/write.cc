@@ -56,15 +56,25 @@ constexpr std::string_view stream_end = "0\r\n\r\n";
 	return encode_whole(response.status, media_type(response.content_type), response.body, std::nullopt, persistence, id);
 }
 
+/**
+ * OpenAI's error object, `{"error": {"message", "type", "param", "code"}}`: every client of this server is an
+ * OpenAI client. The parts are JsonText, checked at compile time, so the document is valid JSON by construction.
+ */
+[[nodiscard]] auto error_document(JsonText message, JsonText type, JsonText code) -> std::string {
+	return std::format(R"({{"error":{{"message":"{}","type":"{}","param":null,"code":"{}"}}}})", message.text, type.text, code.text);
+}
+
 /** A refused request's response. Its connection always closes: the bytes after a refused head cannot be framed. */
 [[nodiscard]] auto encode_refusal(HttpErrorKind kind, RequestId const& id) -> std::string {
-	return encode_whole(status_of(kind), media_type(ContentType::Text), explanation(kind), allowed_method(kind), Persistence::Close, id);
+	auto const body = error_document(explanation(kind), JsonText{"invalid_request_error"}, code_text(kind));
+	return encode_whole(status_of(kind), media_type(ContentType::Json), body, allowed_method(kind), Persistence::Close, id);
 }
 
 /** The 500 that replaces a whole response longer than max_response_body_bytes. */
 [[nodiscard]] auto encode_oversized(Persistence persistence, RequestId const& id) -> std::string {
-	return encode_whole(StatusCode::InternalServerError, media_type(ContentType::Text), "response too large\n", std::nullopt, persistence,
-	                    id);
+	auto const body =
+	    error_document(JsonText{"the response is too large to send whole"}, JsonText{"server_error"}, JsonText{"response_too_large"});
+	return encode_whole(StatusCode::InternalServerError, media_type(ContentType::Json), body, std::nullopt, persistence, id);
 }
 
 [[nodiscard]] auto encode_stream_head(Persistence persistence, RequestId const& id) -> std::string {
