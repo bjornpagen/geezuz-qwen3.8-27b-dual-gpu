@@ -173,3 +173,27 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
   `#pragma once`
 - `lint` passes `--allow-no-checks`: the std module CMake synthesizes lies outside the tree, has no profile, and is
   not ours to lint; every source in the tree has a profile through its zone's `.clang-tidy`
+- the quarantine profile turns off `portability-no-assembler`: at ptx 9.3 every gated device operation is inline ptx
+  in `device/prims`, and every kernel translation unit that includes a primitive takes its checks from its own zone
+
+## driver-abi-enum-size
+
+- symptom: `performance-enum-size` asks for narrower enums, but the CUDA driver and NVML C enums are `int`-sized by
+  their ABI
+- sites: `foreign/driver/abi.cc`, one `NOLINTBEGIN/END(performance-enum-size)` block around exactly the vendor enum
+  declarations (quarantine code; dialect code never carries a suppression)
+- decision: the enums mirror the vendor ABI byte for byte; narrowing them would corrupt every call that passes one
+- retire: if the quarantine profile gains an ignore list for ABI enums
+
+## driver-double-installed-state
+
+- symptom: the CUDA driver and NVML test double fills the same tables of C function pointers the loader fills; a C
+  function pointer carries no closure, so the fake functions cannot reach their modelled machine except through
+  process-wide state
+- sites: `foreign/driver_double/ledger.cc`: `State* installed`, the one non-const global, set by
+  `driver_double::Fake`'s constructor and cleared by its destructor (an invariant allows at most one Fake at a time);
+  only tests link the double
+- decision: keep the product's tables the raw vendor C ABI (no closure slot or self pointer on every product call);
+  confine the deviation from "no non-const globals" to the test double
+- retire: if the driver tables ever carry a context argument (they will not while they are the vendor's own entry
+  points), or if the double moves to a separate process
