@@ -18,7 +18,7 @@ fixed, and update the facts below in the same commit as the bump.
 | build | CMake 4.4.4 (MacPorts `cmake-devel`), Ninja 1.13.2 | configure gate: CMake 4.4.x, Ninja ≥ 1.13 |
 | device target | `.target sm_86`, ptx isa 9.3 (`+ptx93`) | `cmake/engine.cmake` (`ENGINE_PTX_ISA`) |
 | ptxas gate | the system CUDA toolkit's `ptxas` on linux; absent on darwin | `cmake/engine.cmake` |
-| minimum driver to jit ptx 9.3 | _to be filled by the coordinator from research_ | — |
+| minimum driver to jit ptx 9.3 | the R610 branch (cuda 13.3 pairs with R610: documented; ptx 9.3 shipping with cuda 13.3: inferred; see docs/HARDWARE.md) | the linux box's driver install |
 | senders | NVIDIA stdexec v0.11.0 (latest tag, 2026-11-11), commit `fc5937a544db908edbde37c9aa67b8d308e6a788` | top-level `CMakeLists.txt` (`FetchContent_Declare`) |
 
 The presets search `/opt/local/libexec/llvm-23/bin` (`CMAKE_PROGRAM_PATH`) before `PATH` for `clang++`, so the
