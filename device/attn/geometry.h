@@ -9,7 +9,6 @@
 #include "model.h"
 #include "prims/budget.h"
 #include "prims/fragment.h"
-#include "schedule/program.h"
 
 namespace engine::device::attn {
 
