@@ -229,4 +229,70 @@ export template<class Destination, class Source>
 	return Watched<Copying<Destination, Source>>{.watch = Copying<Destination, Source>{.transfer = std::move(transfer)}};
 }
 
+/**
+ * A caller's question about work in flight: nothing while it runs, then its outcome, a value or a typed error. It is
+ * asked once when its sender starts and then once per tick until it answers; it must not block.
+ */
+export template<class P>
+concept Poll = std::move_constructible<P> && std::invocable<P&> && requires {
+	typename std::invoke_result_t<P&>::value_type;
+	requires std::same_as<std::invoke_result_t<P&>, std::optional<typename std::invoke_result_t<P&>::value_type>>;
+	requires core::Classified<typename std::invoke_result_t<P&>::value_type::error_type>;
+	requires std::same_as<typename std::invoke_result_t<P&>::value_type,
+	                      core::Result<typename std::invoke_result_t<P&>::value_type::value_type,
+	                                   typename std::invoke_result_t<P&>::value_type::error_type>>;
+};
+
+/** The value channel of a poll's sender: none for a poll whose outcome carries no value. */
+template<class V>
+struct ValueSignature {
+	using type = ex::set_value_t(V);
+};
+
+template<>
+struct ValueSignature<void> {
+	using type = ex::set_value_t();
+};
+
+/** A caller's poll, watched: its outcome is the sender's completion. */
+template<Poll P>
+struct Polled {
+	using Outcome = std::invoke_result_t<P&>::value_type;
+	using Value = Outcome::value_type;
+	using Error = Outcome::error_type;
+	using Signatures =
+	    ex::completion_signatures<typename ValueSignature<Value>::type, ex::set_error_t(Error), ex::set_stopped_t()>;
+
+	P poll;
+
+	[[nodiscard]] auto begin() -> std::optional<Outcome> {
+		return std::invoke(poll);
+	}
+
+	[[nodiscard]] auto check() -> std::optional<Outcome> {
+		return std::invoke(poll);
+	}
+
+	template<class R>
+	static auto deliver(R&& receiver, Outcome outcome) -> void {
+		if (!outcome) {
+			ex::set_error(std::forward<R>(receiver), std::move(outcome).error());
+		} else if constexpr (std::is_void_v<Value>) {
+			ex::set_value(std::forward<R>(receiver));
+		} else {
+			ex::set_value(std::forward<R>(receiver), std::move(*outcome));
+		}
+	}
+};
+
+/**
+ * Work the caller polls, as a sender: it completes with the poll's value, or its error, once the poll answers. The
+ * poll runs on the loop of whoever waits for the sender, as a card's scheduled senders do, so a host-side completion
+ * (a ring's answer, a mapped flag) joins the cards' events in one wait.
+ */
+export template<Poll P>
+[[nodiscard]] auto polled(P poll) -> Watched<Polled<P>> {
+	return Watched<Polled<P>>{.watch = Polled<P>{.poll = std::move(poll)}};
+}
+
 }

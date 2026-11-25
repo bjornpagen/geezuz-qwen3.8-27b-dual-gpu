@@ -166,6 +166,78 @@ struct Pair {
 	return errors + 1 == span.second - span.first;
 }
 
+/** A poll's typed failure, as a caller's own error type. */
+struct Late {
+	std::uint32_t polls;
+
+	[[nodiscard]] constexpr auto retry() const -> engine::core::Retry {
+		return engine::core::Retry::Transient;
+	}
+
+	[[nodiscard]] constexpr auto operator==(Late const&) const -> bool = default;
+};
+
+/** A poll that answers on its `answer_at`-th call, counted from one: the call count, or `Late` with it. */
+enum class Answer : std::uint8_t {
+	Value,
+	Failure,
+};
+
+struct Countdown {
+	std::uint32_t answer_at;
+	Answer answer;
+	std::uint32_t calls;
+
+	[[nodiscard]] auto operator()() -> std::optional<engine::core::Result<std::uint32_t, Late>> {
+		calls += 1;
+		if (calls < answer_at) {
+			return std::nullopt;
+		}
+		if (answer == Answer::Failure) {
+			return engine::core::Result<std::uint32_t, Late>{std::unexpected(Late{.polls = calls})};
+		}
+		return engine::core::Result<std::uint32_t, Late>{calls};
+	}
+};
+
+/** A poll with no value: done on its `answer_at`-th call. */
+struct Bare {
+	std::uint32_t answer_at;
+	std::uint32_t calls;
+
+	[[nodiscard]] auto operator()() -> std::optional<engine::core::Result<void, Late>> {
+		calls += 1;
+		return calls < answer_at ? std::nullopt : std::optional{engine::core::Result<void, Late>{}};
+	}
+};
+
+/**
+ * A polled sender completes with its poll's value, or its typed error, exactly when the poll first answers: for every
+ * answer from the first call to the hundredth, alone and joined with a card.
+ */
+[[nodiscard]] auto polled_completes_when_the_poll_answers() -> bool {
+	auto const driver = fake::Fake{fake::Machine{.pending_queries = 5}};
+	auto cards = pair(driver);
+	if (!cards) {
+		return false;
+	}
+	return std::ranges::all_of(std::views::iota(std::uint32_t{1}, std::uint32_t{101}), [&](std::uint32_t answer_at) {
+		auto const value = ex::wait<Late>(
+		    ex::when_all(engine::card_scheduler::polled(Countdown{.answer_at = answer_at, .answer = Answer::Value, .calls = 0}),
+		                 cards->card(engine::model::Card::One).schedule() | ex::upon_error([](device::DeviceError const& /*error*/) {})));
+		auto const failed = ex::wait<Late>(engine::card_scheduler::polled(Countdown{.answer_at = answer_at, .answer = Answer::Failure, .calls = 0}));
+		auto const done = ex::wait<Late>(engine::card_scheduler::polled(Bare{.answer_at = answer_at, .calls = 0}));
+		// A capturing lambda is a poll too: it moves into the sender and is never assigned.
+		auto const lambda = ex::wait<Late>(
+		    engine::card_scheduler::polled([answer_at, calls = std::uint32_t{0}] mutable -> std::optional<engine::core::Result<std::uint32_t, Late>> {
+			    calls += 1;
+			    return calls < answer_at ? std::nullopt : std::optional{engine::core::Result<std::uint32_t, Late>{calls * 2}};
+		    }));
+		return value && *value && std::get<0>(**value) == answer_at && failed && !*failed && failed->error() == Late{.polls = answer_at} &&
+		       done && *done && lambda && *lambda && std::get<0>(**lambda) == answer_at * 2;
+	});
+}
+
 struct Note {
 	std::uint64_t value;
 };
@@ -233,6 +305,7 @@ auto main() -> int {
 	    {.name = "uploads on both cards round trip (seed 1)", .holds = uploads_on_both_cards_round_trip(1)},
 	    {.name = "uploads on both cards round trip (seed 2)", .holds = uploads_on_both_cards_round_trip(2)},
 	    {.name = "every failing driver call is the sender's error", .holds = every_failing_call_is_the_senders_error()},
+	    {.name = "a polled sender completes when its poll answers", .holds = polled_completes_when_the_poll_answers()},
 	    {.name = "a worker takes every message and returns its outcome (seed 3)", .holds = a_worker_takes_every_message_and_returns_its_outcome(3)},
 	    {.name = "a worker takes every message and returns its outcome (seed 4)", .holds = a_worker_takes_every_message_and_returns_its_outcome(4)},
 	});
