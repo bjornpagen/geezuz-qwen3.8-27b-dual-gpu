@@ -145,7 +145,7 @@ struct Card {
 	PatternCard pattern;
 };
 
-/** Opens and verifies card `card`'s image, takes its digest, copies it to the card, and sets up both lanes. */
+/** Opens and verifies card `card`'s image, takes its recorded digest, copies it to the card, and sets up both lanes. */
 template<image::Catalog C>
 [[nodiscard]] auto load_card(device::Context const& context, std::filesystem::path const& path, image::Checkpoint const& checkpoint, model::Card card,
                              std::chrono::steady_clock::time_point deadline) -> core::Result<Card<C>, SetupError> {
@@ -153,8 +153,7 @@ template<image::Catalog C>
 	if (!opened) {
 		return refuse(opened.error());
 	}
-	// Opening checked the payload against the digest the header records, so this is that digest.
-	auto const expected = sha256::digest(opened->payload());
+	auto const expected = opened->payload_digest();
 	auto stream = context.create_stream();
 	auto done = stream.and_then([&](auto const&) { return context.create_event(); });
 	auto state = done.and_then([&](auto const&) { return context.allocate_mapped<soak::HashState, 1>(); });
