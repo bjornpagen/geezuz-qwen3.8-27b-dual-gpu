@@ -287,6 +287,7 @@ microbench: U5 (streaming gemv at R = 8..40)
 
 ```text
 claim:      "~13.5 gb weights plus ~1 gb workspace leaves ~9 gb: about 280k tokens of bf16 kv"
+(superseded: the workspace is now derived, 0.68 gb, and the pool is 293,952 positions; PLAN.md 0.3)
 attack:     - resident weights are 13.70 gb (main pass 13.46 + mtp head 0.24), not 13.5. the draft lm_head is free
               only if it is a view (bake permutation).
             - deltanet state at 8 slots (0.6 gb) is not in the subtraction.

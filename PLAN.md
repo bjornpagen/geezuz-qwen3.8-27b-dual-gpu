@@ -106,10 +106,12 @@ weight stream between 32 and 40 rows. the engine spends a **row budget of 24 row
 slots and their drafts: a compile-time constant. 32 (4 tiles) is the first thing measured on hardware.
 
 **vram per card** (24 gib, ~25.3 gb usable).
-- weights ~13.7 gb (main pass 13.46, mtp head 0.24; the draft lm_head is a view of lm_head, 1.3), ~1 gb workspace and
-  ~0.6 gb of deltanet state leave ~9.5 gb: about 275k tokens of bf16 kv at 34 kb per token (32 kb for the 16 layers,
-  2 kb for the mtp layer's own attention), shared by all slots, snapshots included.
-- deltanet state is 75.5 mb per slot (fp32), ~600 mb at 8 slots, plus ~3 mb of conv state per slot, plus snapshots
+- weights ~13.7 gb (main pass 13.46, mtp head 0.24; the draft lm_head is a view of lm_head, 1.3), a 0.68 gb workspace
+  derived from its layouts (decode, row-to-token table, control, prefill; `model::workspace_plan`), slot state and a
+  0.5 gib driver reserve (assumed until bring-up measures it) leave a block pool of 4,593 blocks: 293,952 positions of
+  bf16 kv at 34 kb per token (32 kb for the 16 layers, 2 kb for the mtp layer's own attention), shared by all slots,
+  snapshots included (at most a quarter). everything is counted in whole 2 mib pages.
+- deltanet state is 75.5 mb per slot (fp32), ~600 mb at 8 slots, plus 1.5 mb of bf16 conv window per slot, plus snapshots
   (75.5 mb each).
 - the embedding table (2.54 gb bf16) lives in pinned host memory on numa node 0. each row a cycle needs crosses pcie
   once, into a vram staging buffer, fetched by the step that first uses it (an mtp draft step or the verify pass).
