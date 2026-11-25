@@ -9,8 +9,8 @@ this plan has two parts:
   measure it, and when to kill it.
 
 speed numbers are back-of-envelope estimates from upstream geezuz's published measurements and 3090 specs, not
-measurements on this box. the code-only phase (section 1.10) builds and type-checks; real numbers start when the
-hardware is up.
+measurements on this box; docs/HARDWARE.md holds the evidence and docs/ADVERSARIAL.md checks every claim against it.
+the code-only phase (section 1.10) builds and type-checks; real numbers start when the hardware is up.
 
 ---
 
@@ -41,16 +41,18 @@ image are the only configuration.
 ### 0.2 the lossless contract
 
 full bf16 is 54 gb and does not fit in 48 gb, so the reference function is qwen's own fp8 checkpoint: 24.70b params
-in e4m3 and 3.08b in bf16 (lm_head, embeddings, norms, small linear_attn params, mtp fc). the engine computes exactly
-that function:
+in e4m3 and 2.62b in bf16 (lm_head, embeddings, norms, small linear_attn params, mtp fc; 3.08b with the dropped vision
+tower). the engine computes exactly that function:
 
 - e4m3 to bf16 conversion is exact; the block scale is applied in fp32.
 - weights only are quantized. activations stay bf16, even though the checkpoint says `activation_scheme: dynamic`.
-- every matmul accumulates in fp32; the residual stream and deltanet state are fp32; the kv cache is bf16.
+- every matmul accumulates in fp32 on the tensor cores; the residual stream and deltanet state are fp32; the kv cache
+  is bf16.
 - lm_head runs in bf16 with exact top-k and argmax merged across the two cards.
 - speculative decoding verifies exactly (greedy is exact; sampling uses rejection sampling).
 - sampling parameters are exact for every value the server accepts; anything else is refused with a named error.
-- the only allowed difference is floating-point summation order.
+- the only allowed differences are floating-point summation order and the tensor core's own fp32 accumulation, which
+  on sm_86 is not ieee: it sums products in blocks of 8, aligned to the largest and truncated (docs/HARDWARE.md).
 
 outside the boundary, because they only move acceptance rates: the drafter, the draft vocabulary, suffix drafting,
 tree shape, slot scheduling and the row budget.
@@ -65,29 +67,44 @@ tree shape, slot scheduling and the row budget.
 
 ### 0.3 the budget (per card, one decode cycle)
 
-| item | bytes | at 936 gb/s | at ~88% |
+| item | bytes | at 936 gb/s | at ~820 gb/s |
 |---|---|---|---|
-| body (fp8, 64 layers, half of each matrix) | 12.19 gb | 13.0 ms | 14.8 ms |
-| lm_head (bf16, half of 248,320 vocab) | 1.27 gb | 1.36 ms | 1.5 ms |
-| **main pass** | **13.46 gb** | **14.4 ms** | **16.3 ms** |
-| mtp head (~5 passes: catch-up + 4 drafts) | ~1.2 gb | 1.3 ms | — |
-| draft lm_head (32k vocab, 4 steps) | ~0.65 gb | 0.7 ms | — |
-| kv reads (bf16, 2 kv heads per card x 16 layers) | 32 kb x context tokens, per slot | 1.0 ms per 30k tokens | — |
+| body (fp8, 64 layers, half of each matrix) | 12.19 gb | 13.0 ms | 14.9 ms |
+| lm_head (bf16, half of 248,320 vocab) | 1.27 gb | 1.36 ms | 1.55 ms |
+| **main pass** | **13.46 gb** | **14.4 ms** | **16.4 ms** |
+| mtp head (d passes for d drafts: catch-up, then d − 1 steps) | 0.24 gb per pass: 0.95 gb at d = 4 | 1.0 ms | 1.16 ms |
+| draft lm_head (32k vocab split across cards, d steps) | 0.17 gb per step: 0.67 gb at d = 4 | 0.72 ms | 0.82 ms |
+| deltanet state (fp32, read and written once per cycle) | 151 mb per live slot: 1.21 gb at 8 slots | 1.29 ms at 8 | 1.47 ms at 8 |
+| kv reads (bf16, 2 kv heads per card x 16 layers) | 32 kb x context tokens, per slot | 1.0 ms per 30k tokens | 1.2 ms per 30k |
+| mtp kv reads (its own attention layer) | 2 kb x context tokens, per slot and pass | — | — |
+
+~820 gb/s is 90% of the 912 gb/s cuda actually gets: geforce ampere runs cuda work in p2, memory at 9501 instead of
+9751 mhz (1.7). a clean read stream reaches 93-96% of peak, so 90% leaves room for kv, state and nvlink traffic sharing
+the controllers; dependency stalls are not in the rate, they are $t_{\text{serial}}$. a 1-stream cycle (d = 4, 4k
+context) moves ~15.4 gb per card, an 8-stream cycle (d = 2, 4k context each) ~16.7 gb.
 
 $$t_{\text{cycle}} \approx \max\left(t_{\text{bytes}},\ t_{\text{flops}}\right) + t_{\text{serial}}, \qquad \text{tok/s per slot} = \frac{\tau}{t_{\text{cycle}}}$$
 
-**the compute ceiling.** on the 3090, bf16 tensor-core math with fp32 accumulation runs at ~71 tflops dense per card,
-half the fp16-accumulate rate. one verify row costs ~27 gflop per card, ~0.5 ms realistically:
+**the compute ceiling.** on the 3090, bf16 tensor-core math with fp32 accumulation runs at ~71 tflops dense per card
+at the rated 1695 mhz boost (it scales with the sustained clock), half the fp16-accumulate rate. one verify row costs
+~25.6 gflop per card (24.3 body, 1.3 lm_head), ~0.36 ms at peak and ~0.5 ms realistically. rows are bought in n8 tiles
+(weights are the mma's m16 operand, tokens its n8 operand), so a row budget between multiples of 8 costs the next one:
 
-$$t_{\text{flops}}(R) \approx 0.5\ \text{ms} \times R$$
+$$t_{\text{flops}}(R) \approx 4\ \text{ms} \times \lceil R/8 \rceil$$
 
-compute crosses the 16.3 ms weight stream at about 32 rows. the engine therefore spends a **row budget of ~24 rows per
-cycle**, shared by all slots and their drafts: a compile-time constant, retuned on hardware.
+per tensor core, one 256-byte weight fragment arrives every ~152 clocks at 936 gb/s and ~173 at 820 gb/s (both at
+1695 mhz), and each n8 tile costs it 32 clocks: 24 rows use ~96, 32 rows ~128, 40 rows ~160. compute crosses the
+weight stream between 32 and 40 rows. the engine spends a **row budget of 24 rows per cycle** (3 tiles), shared by all
+slots and their drafts: a compile-time constant. 32 (4 tiles) is the first thing measured on hardware.
 
-**vram per card.**
-- ~13.5 gb weights plus ~1 gb workspace leaves ~9 gb: about 280k tokens of bf16 kv, shared by all slots.
-- deltanet state is ~75 mb per slot (fp32), ~600 mb at 8 slots, plus snapshots.
-- the embedding table (2.54 gb bf16) lives in pinned host memory.
+**vram per card** (24 gib, ~25.3 gb usable).
+- weights ~13.7 gb (main pass 13.46, mtp head 0.24; the draft lm_head is a view of lm_head, 1.3), ~1 gb workspace and
+  ~0.6 gb of deltanet state leave ~9.5 gb: about 275k tokens of bf16 kv at 34 kb per token (32 kb for the 16 layers,
+  2 kb for the mtp layer's own attention), shared by all slots, snapshots included.
+- deltanet state is 75.5 mb per slot (fp32), ~600 mb at 8 slots, plus ~3 mb of conv state per slot, plus snapshots
+  (75.5 mb each).
+- the embedding table (2.54 gb bf16) lives in pinned host memory on numa node 0. each row a cycle needs crosses pcie
+  once, into a vram staging buffer, fetched by the step that first uses it (an mtp draft step or the verify pass).
 
 ---
 
@@ -211,6 +228,13 @@ development, next to the linux epoll backend.
   blocks per SM are `static_assert`ed. the build fails if `ptxas -v` reports spills or registers over budget.
 - device invariant traps exist only in `dev`.
 - one narrow typed launch function per kernel, exported upward as a module from `foreign/`.
+- **rounding is pinned in the ptx**, so neither llvm nor the driver's jit can change a result:
+  - every fp32 operation is ieee round-to-nearest (`add.rn`, `mul.rn`, `fma.rn`, `div.rn`, `sqrt.rn`) or a fixed
+    routine built from them;
+  - no `.approx` and no `.ftz` anywhere;
+  - contraction is explicit (`-ffp-contract=off`, fmas spelled out);
+  - exp, log, rsqrt and the silu, sigmoid and softplus built on them are fixed fp32 algorithms, specified once.
+    `geezuz-ref` follows the same specification, and each is tested over every fp32 input.
 
 ### device style: the newest idiom sm_86 has (hard cutover)
 
@@ -221,29 +245,42 @@ baseline keeps geezuz's algorithm, but its building blocks are these primitives 
 
 **required idioms**, each a named primitive in `device/prims/` with a microbenchmark in `bench/ubench/`:
 - **warp specialization**: producer warps own the weight stream, consumer warps own the math. roles are fixed per
-  kernel and come from the compile-time schedule.
-- **async copy**: `cp.async.cg` 16-byte transfers, completion signalled with `cp.async.mbarrier.arrive.noinc` into
-  mbarriers; `cp.async.commit_group` / `wait_group` only where an mbarrier does not fit.
+  kernel and come from the compile-time schedule. sm_86 has no `setmaxnreg`, so a producer warp holds as many
+  registers as a consumer: as few producer warps as keep ~11 kb per SM in flight (one `cp.async.cg` warp instruction
+  moves 512 b; an SM needs one every ~76 clocks), counted by a microbenchmark.
+- **async copy**: `cp.async.cg` 16-byte transfers with the `.L2::256B` hint (the dram chunk), whole contiguous 16 kb
+  tiles, completion signalled with `cp.async.mbarrier.arrive.noinc` into mbarriers; `cp.async.commit_group` /
+  `wait_group` only where an mbarrier does not fit.
 - **mbarrier inside a block**: `mbarrier.init` / `arrive` and phase-parity waits, multi-stage rings. sm_86 has no
   `try_wait` and no `expect_tx` (both sm_90), so a wait is a `test_wait.parity` spin with `nanosleep` backoff and
   `cp.async` completion is counted in arrivals, not bytes. no `__syncthreads` in steady state; named barriers
-  (`bar.sync id, n`) only for fixed sub-groups.
-- **l2 control**: `createpolicy.fractional` with evict_first on the weight stream, evict_last on activations, kv
-  tiles and flags; `prefetch.global.L2` for run-ahead past the shared-memory ring; `discard.global.L2` on dead
-  scratch.
-- **fragments**: `ldmatrix` (and `.trans`) from xor-swizzled shared memory with zero bank conflicts;
-  `mma.sync.m16n8k16` bf16 x bf16 to fp32; register double-buffering across k-steps (the wgmma pipeline, by hand).
+  (`bar.sync id, n`) only for fixed sub-groups. a ring of ≤ 7 slots could signal "slot free" with named-barrier pairs
+  instead; a microbenchmark picks the cheaper.
+- **l2 control**: `createpolicy.fractional` with evict_first on every single-use stream (weights, kv, deltanet state)
+  and evict_last only on what is reused within microseconds (activations, partials, flags);
+  `prefetch.global.L2::evict_last` for run-ahead past the shared-memory ring, `applypriority` back to evict_normal
+  after use; `discard.global.L2` on dead scratch.
+- **fragments**: weights need no `ldmatrix`: the bake stores each lane's a-fragment bytes for two k16 steps as one
+  contiguous 16 bytes, so a warp's 512 bytes are one conflict-free `ld.shared.v4`. `ldmatrix` (and `.trans`) from
+  xor-swizzled shared memory is for the bf16 activation b-fragments. `mma.sync.m16n8k16` bf16 x bf16 to fp32; register
+  double-buffering across k-steps (the wgmma pipeline, by hand).
 - **reductions**: `redux.sync` for integers, butterfly `shfl.sync` for floats in a fixed order (determinism).
-- **cross-card**: peer stores over nvlink; `st.release.sys` / `ld.acquire.sys` flags with `nanosleep` backoff, or
-  `red.release.sys` counters; one fence per item, never per element.
+- **cross-card**: push, never pull: weak stores into the peer's receive slot, then a single-writer
+  `st.release.sys` flag carrying a monotonic epoch; the peer polls its own memory with `ld.acquire.sys` and `nanosleep`
+  backoff. one release per tile, never per element. no peer atomics (native atomics over the bridge are not
+  established). sm_86 has one memory-sync domain, so a `.sys` release also waits for in-flight host-ring writes: those
+  happen once per cycle, away from release points.
 
 **emulated, because the silicon lacks it**:
 - **tma**: producers issue the baked image's precomputed 16-byte transaction stream. the image is laid out as exactly
   that stream, so a producer is a pointer bump plus `cp.async`, nothing else.
 - **clusters / distributed shared memory**: none. cross-SM handoff goes through l2-resident flags and buffers with an
   explicit evict_last policy.
-- **fp8 cvt**: an exact e4m3-to-bf16 bit sequence (`prmt` / `lop3` / shifts) converting straight into mma
-  a-fragments in registers, exhaustively tested against all 256 codes.
+- **fp8 cvt**: an exact e4m3-to-bf16 sequence on a bake-permuted encoding, straight into mma a-fragments in
+  registers. 5 integer ops (`and`, shifts, one `lop3`) place each pair's payload bits, then `fma.rn.bf16x2` by 2¹²⁰
+  with a -0 addend fixes the exponent: 7 instructions per 4 weights. the 2¹²⁰ is never folded into the block scale,
+  which is exact only while partial sums stay normal. bf16 scales widen to fp32 with an integer shift. tested
+  exhaustively over all 256 codes, through the mma.
 - **wgmma**: consumer warpgroups of 4 warps sharing one stage, register-blocked mma with the next stage's `ldmatrix`
   overlapped.
 
@@ -297,7 +334,13 @@ schedules and buffer geometries are `consteval` functions over it. nothing else 
 **the baked image.** `geezuz-bake` reads the safetensors checkpoint once and writes one image per card:
 - verifies the checkpoint hash and stamps it in the header;
 - splits for tensor parallel 2 and drops the vision tower;
-- lays out e4m3 tiles and scales in exact stream order, 16-byte aligned;
+- lays out the image as the exact transaction stream producers issue:
+  - each 128x128 e4m3 tile is one contiguous 16 kb run (whole 256-byte dram chunks, for row locality);
+  - inside it, each lane's 16 bytes are in m16n8k16 a-fragment order for two k16 steps, bit-permuted for the decode;
+  - scales sit in a small separate array;
+- rejects the e4m3 nan codes (0x7f, 0xff) with a typed error, so the device has no nan path;
+- permutes each card's lm_head rows so its half of the draft vocabulary is a contiguous prefix: the draft lm_head is a
+  view, not a copy;
 - converts nothing lossy.
 
 the engine mmaps the image and copies it to vram with no layout decisions. a mismatched image is refused at the
@@ -307,9 +350,10 @@ boundary.
 
 - **`S = 8` slots**, each with its own deltanet state, mtp state and position; kv comes from the shared pool.
 - **every cycle runs all live slots together**, so weights are read once per cycle.
-- **row budget**: ~24 rows per cycle. a fixed, simple allocation ships first: one row per live slot for its
-  committed token, and the rest split evenly as draft depth, capped at 4 per slot. an adaptive allocator is an
-  experiment (2.3).
+- **row budget**: rows come in n8 tiles, so 24 or 32 per cycle. step 2 ships 24 and measures 32 first; step 1 runs 32,
+  as upstream did (its stream leaves the tensor cores half idle). a fixed, simple allocation ships first: one row per
+  live slot for its committed token, and the rest split evenly as draft depth, capped at 4 per slot. an adaptive
+  allocator is an experiment (2.3).
 - **per-slot work**: attention, deltanet, draft check and sampling run per slot with its own row count.
 - **preemption**: cached blocks are evicted first, then the newest admitted request pauses with its state cached and
   resumes at the head of the queue.
@@ -370,49 +414,103 @@ rules:
 
 grid barriers stay, so it is directly comparable to upstream.
 
+a straight port must not carry upstream's numerics outside the contract. step 1 uses the fixes from the start:
+- the fp16 state operand of upstream's chunked prefill deltanet: replaced by the recurrence (prefill, below);
+- P rounded to 16 bits before PV, in decode and prefill attention: settled by the owner's decision on P;
+- fp16 activations and fp16-accumulate prefill gemms: culled (1.1);
+- fast-math `expf` / `logf` / `rsqrtf`: replaced by the pinned routines (1.2).
+
 **step 2: the dataflow core. certain from first principles, so it is part 1:**
 - **producer/consumer warp specialization**: producers stream weights continuously through a `cp.async`
-  shared-memory ring; consumers wait on per-layer and per-tile counters instead of ~340 grid barriers. weights
-  have no data dependency, so dram never has to wait. ~8 mb of shared memory plus 6 mb of l2 gives ~15 µs of
-  run-ahead.
-- **all-reduce fused into the gemv epilogue**: fp32 partials go over nvlink per tile as they finish.
-- **serial phases under the weight stream**: deltanet core, attention, lm_head merge, sampling and the mtp steps run
-  while producers prefetch. the mtp steps overlap the next cycle's layer-0 prefetch.
-- **device-resident loop**: the kernel stays resident and exchanges cycle descriptors and results through a mapped,
-  pinned ring. no launch or readback per cycle.
-- **compile-time schedule**: generated from the model description; resource budgets are `static_assert`ed.
+  shared-memory ring; consumers wait on per-layer and per-tile counters instead of ~340 grid barriers.
+  - weights have no data dependency, so producers wait only for ring space.
+  - the ring is 64-80 kb per SM, 5.4-6.7 mb per card: ~6-8 µs at the stream rate, ≤ ~11 µs with
+    `prefetch.global.L2::evict_last` run-ahead.
+  - little's law needs only ~1 mb in flight per card, so the ring is a jitter buffer: it rides over dependency hops
+    (~1-3 µs each), not over serial phases.
+- **all-reduce fused into the gemv epilogue**: fp32 partials go over nvlink per output tile as they finish. 128
+  exchanges per main pass, each exposing only its last tile and one handoff (~1-2.5 µs).
+- **one arithmetic per output element**: the k-split is static and independent of the row count, and attention
+  splits the context into chunks at fixed absolute positions, merged in order; balance comes only from assigning
+  chunks to ctas. each output tile's epilogue also writes its per-row partial sum of squares, which the next phase's
+  rms norm adds in a fixed order, with no extra pass.
+- **serial phases made bandwidth-bound, not hidden**: at 8 slots the deltanet core alone moves ~25 mb of state per
+  layer (~27 µs at full rate; upstream's took ~80 µs), far past the run-ahead. so:
+  - the core runs as one wave over all SMs at state bandwidth. value columns are independent chains; a head's 128
+    columns stay in one cta for the output norm;
+  - state reads are a dependency-free producer stream;
+  - split-k attention runs from a balanced per-cycle plan that one warp computes on the device;
+  - dependency-free weights stream while the core and attention run: `in_proj_z` is consumed only after the core,
+    the gate half of `q_proj` only after attention;
+  - the mtp steps stream 0.41 gb each and are bandwidth-bound already.
+- **device-resident loop**: the kernel stays resident, builds each next cycle itself from the accepted tokens, and
+  exchanges results through a mapped, pinned ring. no launch or readback per cycle.
+  - the host's mailbox (admissions, cancellations) is read with a load issued at cycle start and consumed at cycle
+    end, so its pcie round trip is never on the critical path.
+  - for a prefill chunk the loop yields at a cycle boundary: one relaunch (~10 µs) against ~1 s chunks.
+- **compile-time schedule**: generated from the model description; resource budgets are `static_assert`ed. the
+  producer stream depends only on the draft depth, so a cycle's shape is an enum case (d = 1 to 4), each a
+  compile-time stream program.
 
 why it's certain: upstream's measured cycle (~20.9 ms on q4_k_m) is about twice its weight-read floor (~9.3 ms),
 so about half of every cycle is not moving weights. the exact split between barriers, exchange and serial phases gets
 measured in phase b, but the gap itself is arithmetic.
 
 **prefill (forced by the contract):**
-- bf16 x bf16 to fp32 tensor-core gemm on e4m3 converted in registers: ~71 tflops per card, so ~2,000 tok/s total
-  is the target;
+- bf16 x bf16 to fp32 tensor-core gemm on e4m3 converted in registers.
+  - each card does 24.3 gflop per token, so 71 tflops is a ~2,900 tok/s ceiling.
+  - fp32-accumulate gemms sustain ~50-60 tflops on the 3090 in isolation and less in situ, so expect ~1,300-2,000
+    tok/s total.
+  - ~1,600 is the planning number, 2,000 the stretch.
 - fused `silu(gate) * up`;
-- chunked (wy) deltanet on tensor cores with fp32 state;
-- causal flash attention over the cache;
+- deltanet as the decode recurrence itself, in fp32 on the cuda cores.
+  - value columns are independent chains: 3,072 per layer per card, ~0.2-0.4 ms per layer per 2,048-token chunk,
+    ~1-2% of prefill.
+  - the chunked (wy) form re-associates gate products, and its tensor-core operands round the state (upstream: fp16),
+    so it is outside the contract.
+  - the recurrence leaves bit for bit the state decode would have;
+- causal flash attention over the cache; P enters the PV mma as the owner's decision on P says (docs/ADVERSARIAL.md);
 - all-reduces over nvlink, overlapped with the gemm.
 
 ## 1.7 platform
 
-- **nvlink**: `nvidia-smi topo -m` shows NV4; the stock driver does p2p over nvlink with no patch. check that the
-  2-slot bridge spacing matches PCIE_6 / PCIE_4.
-- **power**: limit at or above stock 350 w, persistence mode, locked clocks so boost doesn't oscillate between
-  cycles.
-- **memory overclock**: sweep for peak decode throughput (gddr6x error replay hides errors as slowdowns), then
-  accept the clock only after a long golden-hash soak at operating temperature. adrien's 5090s got +15% raw bandwidth
-  but only +4% at tp2, because allreduce latency co-bound his decode. our fused nvlink exchange should let more of
-  it through.
-- **memory thermals**: 12 of the 24 gddr6x chips sit under the xg7's passive backplate. watch the memory junction
-  temperature during the soak; add a backplate fan if it climbs.
-- **host**: iommu passthrough, hugepage-backed pinned memory for the embedding table and rings, the resident loop's
-  host thread pinned to one core.
+- **nvlink**: the stock driver does p2p over nvlink with no patch. the owner confirmed the 2-slot bridge fits the
+  water-blocked cards in PCIE_6 / PCIE_4. bring-up checks:
+  - persistence mode on (links stay inactive without it);
+  - `nvidia-smi topo -m` shows NV4 and `nvlink -s` shows 4 x 14.062 gb/s;
+  - peer access works both ways.
+- **power**: limit at the fe maximum of 400 w. power cut by a cap comes out of the core clock, and the row budget
+  needs it ($t_{\text{flops}} \propto 1/f_{\text{core}}$).
+  - persistence mode on.
+  - clocks locked one step below what 400 w sustains under the heaviest phase mix. a lock above that is undone by
+    throttling, so accept it only if the `sw_power_cap` event counter stays flat over a 10-minute soak.
+  - all settings come from a systemd unit after nvidia-persistenced; nothing persists on its own.
+- **memory clock**: cuda runs geforce ampere in p2, memory at 9501 mhz (912 gb/s), not 9751 (936). bring-up tries
+  `-lgc F,F -lmc 9751,9751` in one call, then `--cuda-clocks=1`. otherwise the budget stays on 912, and an overclock
+  counts from 9501.
+- **memory overclock**: sweep a pure-read kernel per offset step at operating temperature; the edr knee is where gb/s
+  stops tracking the clock.
+  - the in-rating ceiling is ~21 gb/s (micron's -21 bin): +10% over p2's 19.0, worth ~+8% of a stream-bound cycle.
+    adrien's +15% raw gave only +4% at tp2 because allreduce latency and the drafter co-bound his decode.
+  - edr's crc covers link data only, not the array or the command bus. acceptance therefore needs a long soak at
+    temperature: an on-device hash of the whole weight image every few minutes, a pattern test over the free kv
+    region, and the golden hashes.
+  - the engine refuses to start if the memory clock differs from the accepted one, and a low-rate weight-hash scrub
+    runs in production.
+- **memory thermals**: 12 of the 24 gddr6x chips sit under the xg7's passive backplate. the 110 c junction throttle is
+  the binding limit, so a backplate fan is the default. nvml does not report the junction temperature on the 3090;
+  reading it needs the `gddr6` tool and `iomem=relaxed`, which is an owner decision.
+- **host**: iommu passthrough. both slots hang off cpu0, so every pinned buffer (embedding table, rings) is
+  hugepage-backed on numa node 0, and the resident loop's host thread is pinned to a cpu0 core.
 
 ## 1.8 verification (built first; gates everything)
 
 - **cpu reference (`geezuz-ref`)**: the model computed straight from the fp8 checkpoint in fp32 on the cpu, written
   independently of the kernels. teacher-forced logits for plain text and for your own agent transcripts.
+  - it rounds to bf16 exactly where the engine does: the activation points, listed once in the model description.
+  - it carries a bit-exact model of the sm_86 mma: 8-product blocks aligned to the largest and truncated, as measured
+    in docs/HARDWARE.md. that model tests device primitives exactly and sizes the noise floor the hardware alone
+    causes.
 - **decode-path ruler**: compares greedy continuations token by token against the reference. a prefill-only ruler
   can't see decode kernels, and adrien's gotcha #2 is a decode kernel that read bit-identical on the prefill ruler.
 - **rulers**: top-1 agreement, kl and perplexity, with the noise floor measured.
@@ -421,24 +519,41 @@ measured in phase b, but the gap itself is arithmetic.
 - **determinism harness**: a deterministic mode plus golden logit hashes per prompt and per slot mix. every clock,
   kernel or schedule change reproduces them bit-for-bit, or stays within the noise floor and re-goldens with the
   reason recorded.
+- **batch invariance**: a slot's logits are bit-identical whatever the other slots, the row count and the draft depth
+  (one arithmetic per output element, 1.6). so speculative greedy output equals plain greedy output token for token,
+  and the golden hashes per slot mix check it.
 - **host property tests**: pool and prefix fuzzing; a scheduler simulation over a fake engine (preemption, budgets,
   no lost tokens, no hangs); http/json/sse bounds.
 - **static device gates** (code-only phase): `ptxas -v` per kernel with zero spills and registers in budget;
-  shared memory and occupancy asserted; schedule geometry `static_assert`ed against the model description.
+  shared memory and occupancy asserted; schedule geometry `static_assert`ed against the model description; the ptx
+  has no `.approx`, no `.ftz` and no fp32 `add` / `mul` without `.rn`.
 - **measurement protocol** (adrien's gotcha #9: speculative decode varies ~10% between runs through content-dependent
   acceptance): compare speed at temperature 0, within one boot, normalized per accepted token, best of n.
 - **profiler** in the `profile` preset: time per phase, warp arrival, peer wait, dram utilization.
 
 ## 1.9 must-do outcome (estimates)
 
-| config | cycle | 1 stream code (τ ≈ 4.46) | 1 stream prose (τ ≈ 2.16) | 8 streams code, aggregate |
-|---|---|---|---|---|
-| upstream geezuz q8_0 (pcie, 280 w) | ~25 ms | ~143 | ~85 (est) | 610 |
-| step 1: straight port on fp8 + nvlink | ~23 ms | ~190 | ~95 | ~700 |
-| step 2: dataflow core + resident loop | ~18 ms | ~250 | ~120 | ~1,000 |
-| + memory overclock (~8%) | ~16.8 ms | ~265 | ~128 | ~1,080 |
+| config | 1-stream cycle | 1 stream code (τ ≈ 4.46) | 1 stream prose (τ ≈ 2.16) | 8-stream cycle | 8 streams code, aggregate |
+|---|---|---|---|---|---|
+| upstream geezuz q8_0 (pcie, 280 w), measured | 24.9 ms | ~179 (est; 143 measured at τ ≈ 3.6) | ~87 (est) | 43.8 ms, 32 rows | 610 |
+| step 1: straight port on fp8 + nvlink | ~25 ms | ~180 | ~87 | ~42 ms, 32 rows | ~640 |
+| step 2: dataflow core + resident loop | ~19 ms | ~230 | ~112 | ~21-24 ms, 24 rows | ~900-1,000 |
+| + memory overclock (~21 gb/s) | ~17.5 ms | ~255 | ~123 | ~19-22 ms | ~980-1,100 |
 
-estimates. step 2 is the row physics most clearly supports. long multi-slot contexts add kv-read time per cycle.
+estimates. the assumptions:
+- every byte moves at ~820 gb/s (90% of p2), at 4k tokens of context per slot;
+- d = 4 at 1 stream; d = 2 at 8 streams with 24 rows, d = 3 with 32;
+- 8-stream τ ≈ 2.66 per slot (3.34 with 32 rows), from the acceptance upstream's 8-slot run implies;
+- exposed serial time is 0.3-0.6 ms per cycle at 1 stream and 0.5-3.3 ms at 8.
+
+the 8-stream range is set by how much per-slot serial time step 2 leaves exposed (upstream's barrier design leaves
+~1.8 ms per slot). other cases:
+- step 1's ~25 ms assumes upstream's own efficiency (~595 gb/s).
+- at 30k tokens per slot, kv reads add ~8 ms to the 8-stream cycle: ~700 aggregate.
+- 32 rows at 8 streams, if they fit under the stream, give ~1,100-1,250.
+- at the ~80% cycle efficiency prior art reaches, step 2 lands at ~21.5 ms: ~205 code, ~100 prose.
+
+docs/ADVERSARIAL.md holds the arithmetic.
 
 ## 1.10 order of work
 
@@ -468,8 +583,10 @@ pass. nothing claims runtime kernel correctness until phase c.
 
 ### phase b: hardware bring-up
 
-nvlink, power and thermals (1.7). upstream `v0.3.2` q8_0 with `MK_PROFILE=1`, with and without the bridge, gives the
-baseline and the real phase breakdown.
+nvlink, power, clocks and thermals (1.7). then the microbenchmarks in `bench/ubench/` (docs/ADVERSARIAL.md lists each
+with its expected value and the decision it settles). the first is a plain read kernel per card that must reach ≥ 93%
+of the measured memory clock's peak before any kernel tuning. upstream `v0.3.2` q8_0 with `MK_PROFILE=1`, with and
+without the bridge, gives the baseline and the real phase breakdown.
 
 ### phase c: correctness on gpu
 
@@ -492,7 +609,8 @@ value.
 
 - **hypothesis**: verifying a tree of mtp top-k branches raises τ, mostly on prose, where today's chain accepts
   ~2.16 of 5.
-- **why uncertain**: the bf16 compute ceiling caps rows at ~24 per cycle, so a tree competes with slots for rows.
+- **why uncertain**: the bf16 compute ceiling caps rows at 24-32 per cycle, so at 8 streams a tree competes with slots
+  for rows (at 1 stream, 5 of 32 rows are in use).
   per-branch deltanet state is real work: only the accepted path is replayed, but each branch needs its own state
   update in the verify pass. the gain at one stream may not survive at eight.
 - **measure**: τ and tok/s at 1 and 8 streams, code and prose, against the chain.
@@ -510,30 +628,33 @@ value.
 
 ### 2.3 adaptive row allocator
 
-- **hypothesis**: spending the ~24 rows where expected accepted tokens per row is highest beats the fixed split, e.g.
-  a deep tree for one busy slot, shallow drafts for eight.
+- **hypothesis**: spending the 24 or 32 rows where expected accepted tokens per row is highest beats the fixed split,
+  e.g. a deep tree for one busy slot, shallow drafts for eight.
 - **why uncertain**: the gain depends on acceptance variance across slots and needs good live estimates.
 - **kill if**: under +5% aggregate on mixed loads.
 
 ### 2.4 row budget and slot count tuning
 
-- **hypothesis**: the real compute crossover sits somewhere between 20 and 32 rows; `S` other than 8 may be better.
-- **measure**: cycle time against rows on the hardware, then tok/s per stream and aggregate.
+- **hypothesis**: rows come in n8 tiles, so the row budget is 24 or 32 (40 only if the sustained clock and stream
+  allow). 32 gives each of 8 slots a third draft (code τ ≈ 2.66 to 3.34) for one more mtp pass (~0.5 ms): ~+20%
+  aggregate if 4 tiles stay under the stream (~128 of ~173 tensor clocks per weight fragment at 90% of p2).
+- **`S`**: other than 8 is a separate question. at 32 rows, 16 slots with one draft each give about the same aggregate
+  as 8 with three, at half the per-stream speed, and the kv pool (~275k tokens) caps S x context.
+- **measure**: cycle time against rows {8, 16, 24, 32, 40} on the hardware, then tok/s per stream and aggregate.
 - **ship**: the measured constants. this changes constants, not code paths.
 
-### 2.5 replicated drafter
+### 2.5 replicated drafter (killed by arithmetic)
 
-- **hypothesis**: holding the whole mtp head on both cards (+0.48 gb vram each) removes every cross-card exchange
-  from the latency-bound draft steps.
-- **why uncertain**: it doubles mtp bytes per card (~+1.3 ms per cycle) to save the exchange latency of ~10 serial
-  steps. which wins depends on nvlink latency, measured in phase b.
-- **kill if**: the cycle isn't faster.
+holding the whole mtp head on both cards adds the other card's half to every pass: +0.24 gb x d per card per cycle,
+~1.2 ms at d = 4. it saves ~2-3 nvlink exchanges per pass at ~1-2 µs each, ~20-50 µs per cycle. break-even needs ~100
+µs per exchange. adrien measured a tensor-parallel-1 drafter as null. not built; the nvlink handoff microbenchmark
+reopens it only if the handoff exceeds ~100 µs.
 
 ### 2.6 reduced-precision drafter
 
-- **hypothesis**: drafter bytes (~1.85 gb per card per cycle as shipped) drop by about half at 8-bit-int or lower
-  for the fc and draft lm_head, saving ~1 ms per cycle. this sits outside the lossless boundary, so output is
-  unchanged.
+- **hypothesis**: drafter bytes (~1.6 gb per card per cycle at 4 drafts, ~0.8 gb at 2) drop by about half at
+  8-bit-int or lower for the fc and draft lm_head, saving ~1 ms per cycle. this sits outside the lossless boundary, so
+  output is unchanged.
 - **why uncertain**: adrien saw a quantized drafter beat the original on two checkpoints, and a mismatched one lose
   26% of code decode. acceptance can move either way.
 - **kill if**: τ x (1 / cycle) doesn't improve.
@@ -558,7 +679,7 @@ value.
 
 - **hypothesis**: agent steps resend the whole transcript, so a spilled prefix restored from ram or disk beats
   re-prefill. adrien measured 0.45 s from disk against 7.5 s cold at 32k.
-- **why uncertain**: it only matters if the ~280k-token pool evicts under your workload, and it is a lot of code.
+- **why uncertain**: it only matters if the ~275k-token pool evicts under your workload, and it is a lot of code.
 - **measure first**: the pool eviction rate on real agent sessions.
 - **gate** (adrien's gotcha #3): a needle planted deep in a long context must be retrieved correctly after a restart.
   the tier namespace keys on the image's checkpoint hash (gotcha #4).
@@ -581,6 +702,51 @@ value.
   and capped context. parallel requests are required here, so it likely loses.
 - **priority**: lowest. revisit only if single-stream speed is the main use.
 
+### 2.12 deferred deltanet write-back
+
+- **hypothesis**: lazy replay already makes this exact. a slot writes its committed state every k cycles and replays k
+  cycles of accepted tokens from the ring, through the same recurrence. k = 4 saves 3/4 x 75.5 mb per slot per cycle:
+  0.45 gb at 8 slots, ~0.55 ms (~2.5%).
+- **why uncertain**: replay adds ~k·τ x 0.2 µs per layer to the core (≲ 0.1 ms per cycle, mostly under the state
+  stream), the ring grows, and snapshot points and preemption must force a write.
+- **kill if**: the 8-slot cycle isn't ≥ 1.5% faster.
+
+### 2.13 windowed mtp attention
+
+- **hypothesis**: the drafter is outside the lossless boundary, so its attention may see only the last w tokens.
+  at 8 slots, d = 2 and 30k context, w = 4k cuts mtp kv reads from 0.98 to 0.13 gb per card, ~1 ms (~3%).
+- **why uncertain**: acceptance may fall on long-range copies.
+- **kill if**: τ x (1 / cycle) doesn't improve at long contexts.
+
+### 2.14 prefill and decode bit-identical
+
+- **hypothesis**: the prefill gemms walk k in decode's static split order with the same per-k128 scale step, and
+  attention uses decode's fixed chunking. then every logit is bit-identical whichever path computed it: prefix hits,
+  chunk boundaries and preemption never change output, and the decode-path ruler becomes an exact gpu-vs-gpu check.
+- **why uncertain**: fixed split-k partials cost ~2-3% of prefill.
+- **kill if**: the cost exceeds 3%, or 2.16 replaces the prefill path (which makes it free).
+
+### 2.15 draft-vocabulary embedding rows in vram
+
+- **hypothesis**: keeping the 32k draft rows on the cards (335.5 mb each) removes a pcie fetch (~2-5 µs) from every
+  serial draft step.
+- **why uncertain**: that is ≤ ~15 µs per cycle (< 0.1%), against ~10k tokens of kv pool.
+- **kill if**: the measured host fetch per draft step is under ~10 µs.
+
+### 2.16 prompt rows in decode cycles
+
+- **hypothesis**: a prefill chunk is a verify whose rows are all accepted, so spare rows of every cycle can carry
+  prompt tokens of a prefilling slot, riding a weight stream that is read anyway.
+  - one stream decoding at 32 rows leaves 27 spare: ~1,400 tok/s of prefill with the decoding stream unslowed. the
+    time-sliced prefill instead stops decode for its share.
+  - all 32 rows as prompt rows prefill at ~1,950 tok/s, comparable to the dedicated gemm path. if that holds, the
+    dedicated prefill kernels go, and prefill equals decode bit for bit.
+- **why uncertain**: the allocation policy (a prompt row is worth one token, a draft row p^k), and attention cost on
+  long prompts.
+- **measure**: prefill tok/s and decode tok/s with one prompt arriving during 1, 4 and 7 decoding streams, against
+  the time-sliced default.
+- **kill if**: decode or time-to-first-token gets worse on mixed loads.
+
 ---
 
 ## 3. risks
@@ -589,7 +755,10 @@ value.
 - **stdexec on clang + libc++**: the module boundary may still need the narrow-abi quarantine.
 - **kernels are unverified until phase c**: phase a proves builds, resource budgets and host logic, not kernel
   correctness. the cpu reference exists so phase c catches mistakes on day one.
-- **the bf16 compute ceiling**: the lossless contract caps verify width at ~24 rows per cycle. retune on hardware.
+- **the bf16 compute ceiling**: the lossless contract caps verify width at 24-32 rows per cycle. retune on hardware.
+- **per-slot serial time**: the 8-stream estimate assumes step 2 leaves ≤ ~0.35 ms of serial time exposed per slot
+  (upstream: ~1.8 ms). the deltanet core and split-k attention at state and kv bandwidth carry it.
+- **the p2 memory clock**: cuda may hold the memory at 9501 mhz whatever bring-up tries; the budget already assumes it.
 - **memory overclock without ecc**: errors can be silent. accept a clock only after a long golden-hash soak at
   temperature.
 - **checkpoint drift**: the image header carries the checkpoint hash; a re-uploaded checkpoint is refused, never
