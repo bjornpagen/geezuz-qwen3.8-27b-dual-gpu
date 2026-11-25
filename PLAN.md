@@ -346,6 +346,8 @@ facts the checkpoint fixes that the config alone does not say (read from the saf
   `A_log` and `dt_bias` are bf16, and `mamba_ssm_dtype: float32` names the deltanet state.
 - every rms norm stores a zero-centred weight and applies (1 + w), except the deltanet gated norm, which applies w.
 - the attention output gate is sigmoid; deltanet's output gate is silu (`output_gate_type: swish`).
+- lm_head has 248,320 rows but the tokenizer has 248,077 tokens; the 243 padding ids are never sampleable, in the engine
+  or the reference, because no tokenizer emits or decodes them.
 - the mrope sections [11, 11, 10] interleave three position streams that are equal for text, so the rope is plain
   partial rope over 64 dims, pairs half-split (feature j with j + 32), frequencies in natural order.
 - `modules_to_not_convert` is not reliable (it names modules the checkpoint lacks); the headers decide the format.
@@ -363,8 +365,10 @@ facts the checkpoint fixes that the config alone does not say (read from the saf
   - inside it, each lane's 16 bytes are in m16n8k16 a-fragment order for two k16 steps, bit-permuted for the decode;
   - scales sit in a small separate array;
 - rejects the e4m3 nan codes (0x7f, 0xff) with a typed error, so the device has no nan path;
-- permutes each card's lm_head rows so its half of the draft vocabulary is a contiguous prefix: the draft lm_head is a
-  view, not a copy;
+- permutes the whole vocabulary before the split: card c's lm_head rows are the draft ids d[2i + c], then the other ids
+  n[2j + c], each in ascending order, so each card holds half of the draft vocabulary as a contiguous prefix and the
+  draft lm_head is a view, not a copy. one component, `engine.vocabulary`, holds the row-to-token map every consumer
+  uses (bake, top-k merge, reference);
 - converts nothing lossy.
 
 the engine mmaps the image and copies it to vram with no layout decisions. a mismatched image is refused at the
