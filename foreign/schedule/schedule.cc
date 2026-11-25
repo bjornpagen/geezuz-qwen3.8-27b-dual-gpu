@@ -6,6 +6,7 @@
 module;
 
 #include "schedule/geometry.h"
+#include "schedule/table.h"
 
 export module engine.schedule;
 
@@ -17,13 +18,16 @@ namespace model = engine::model;
 export using device::Blocks;
 export using device::CardImage;
 export using device::Exchange;
+export using device::ImageOffset;
 export using device::ImagePhase;
+export using device::ImageTable;
 export using device::Instance;
 export using device::Op;
 export using device::Part;
 export using device::Pass;
 export using device::PassKind;
 export using device::Phase;
+export using device::PhaseOffsets;
 export using device::Placement;
 export using device::Program;
 export using device::Read;
@@ -56,9 +60,13 @@ export using device::dataflow_row_budget;
 export using device::deltanet_state_bytes_per_layer_per_slot;
 export using device::draft_depths;
 export using device::image_phases;
+export using device::image_table;
+export using device::image_unit;
 export using device::kv_bytes_per_position_per_layer;
 export using device::max_cycle_phases;
 export using device::max_dependencies;
+export using device::max_ring_reads;
+export using device::max_side_reads;
 export using device::mtp_phases;
 export using device::placements;
 export using device::side_alignment;
@@ -76,6 +84,7 @@ export using device::decode_budget;
 export using device::decode_shared_bytes;
 export using device::extent;
 export using device::finisher;
+export using device::first_phase;
 export using device::fixup_slot_bytes;
 export using device::partial_tile_bytes;
 export using device::ring;
@@ -110,6 +119,7 @@ export using device::reads;
 export using device::row_tiles;
 export using device::selected;
 export using device::shape;
+export using device::side_index;
 export using device::tile_columns;
 export using device::traffic;
 

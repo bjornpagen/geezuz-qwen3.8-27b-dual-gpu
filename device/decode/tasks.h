@@ -470,7 +470,7 @@ __attribute__((device, always_inline)) inline void meet(Machine const& machine, 
 }
 
 template<Op op, model::Stream stream, Count ring, int rows>
-using Shape = gemv::Shape<gemv::matrix(image_phase_in(op, stream), ring), rows, ring_stages, ConsumerBarrier>;
+using Shape = gemv::Shape<gemv::matrix(first_phase(op, stream), ring), rows, ring_stages, ConsumerBarrier>;
 
 static_assert(sizeof(gemv::Ring<ring_stages>::Storage) == sizeof(GemvShared::barriers));
 
@@ -529,7 +529,7 @@ __attribute__((device)) inline void gemv_task(Machine const& machine, Shared& sh
 	    .ring = GemvRing::at(shared.gemv.barriers),
 	    .stages = prims::shared_address(shared.gemv.stages),
 	    .activation_tiles = {prims::shared_address(shared.gemv.activations[0]), prims::shared_address(shared.gemv.activations[1])},
-	    .run = at<Chunk const>(machine.image(entry.run)),
+	    .run = at<Chunk const>(machine.image(entry.ring[0])),
 	    .cursor = GemvRing::Cursor::start(),
 	    .epoch = epochs.fixups,
 	    .warp = warp,

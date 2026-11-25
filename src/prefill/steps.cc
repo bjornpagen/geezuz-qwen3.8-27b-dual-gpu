@@ -189,7 +189,8 @@ public:
 
 	/** The final norm of every row, the mtp head's pass over the chunk's entries, and the carried row. */
 	auto end() -> void {
-		norm(side(pd::head_phase, pd::side_index(Op::Head, schedule::tensors.final_norm, Part::Whole)), pd::workspace.final_normed, rows());
+		norm(side(pd::head_phase, schedule::side_index(Op::Head, schedule::tensors.final_norm, Part::Whole)), pd::workspace.final_normed,
+		     rows());
 		auto const entries = mtp_entries(chunk_);
 		if (entries.count > 0) {
 			mtp(entries);
@@ -217,14 +218,15 @@ private:
 	}
 
 	[[nodiscard]] auto side(Count phase, Count index) const -> Address {
-		return view_.memories.image + pd::image_table.phase[phase].side[index];
+		return view_.memories.image + schedule::image_table.phase[phase].side[index].bytes();
 	}
 
 	/** Ring placement `ring` of `phase`: its tiles and its tensors' scales (one tensor names its scales twice). */
 	[[nodiscard]] auto weights(Count phase, Count ring, Count tensors) const -> pd::Weights {
-		auto const& entry = pd::image_table.phase[phase];
+		auto const& entry = schedule::image_table.phase[phase];
 		auto const image = view_.memories.image;
-		return {.tiles = image + entry.ring[ring], .scales = {image + entry.scales[ring][0], image + entry.scales[ring][tensors - 1]}};
+		return {.tiles = image + entry.ring[ring].bytes(),
+		        .scales = {image + entry.scales[ring][0].bytes(), image + entry.scales[ring][tensors - 1].bytes()}};
 	}
 
 	[[nodiscard]] auto gemm(Count phase, Count ring, Count tensors, pd::Rows rows) const -> pd::GemmParams {
@@ -255,10 +257,10 @@ private:
 
 	auto deltanet_mixer(Count layer, pd::LayerPhases const& phases) -> void {
 		auto const& t = schedule::tensors;
-		norm(side(phases.mixer_in, pd::side_index(Op::DeltanetIn, t.input_norm, Part::Whole)), pd::workspace.normed, rows());
+		norm(side(phases.mixer_in, schedule::side_index(Op::DeltanetIn, t.input_norm, Part::Whole)), pd::workspace.normed, rows());
 		add<pd::DeltanetIn>(gemm(phases.mixer_in, 0, 1, rows()));
-		add<pd::Decay>({.a = side(phases.mixer_in, pd::side_index(Op::DeltanetIn, t.a, Part::Whole)),
-		                .b = side(phases.mixer_in, pd::side_index(Op::DeltanetIn, t.b, Part::Whole)),
+		add<pd::Decay>({.a = side(phases.mixer_in, schedule::side_index(Op::DeltanetIn, t.a, Part::Whole)),
+		                .b = side(phases.mixer_in, schedule::side_index(Op::DeltanetIn, t.b, Part::Whole)),
 		                .workspace = view_.workspace,
 		                .rows = rows()});
 		auto const core = [&](Count index) {
@@ -266,10 +268,10 @@ private:
 		};
 		auto params = deltanet::PrefillParams{
 		    .images = deltanet::address<unsigned char>(view_.memories.states),
-		    .weights = {.conv = core(pd::side_index(Op::DeltanetCore, t.conv, Part::Whole)),
-			            .a_log = core(pd::side_index(Op::DeltanetCore, t.a_log, Part::Whole)),
-			            .dt_bias = core(pd::side_index(Op::DeltanetCore, t.dt_bias, Part::Whole)),
-			            .norm = core(pd::side_index(Op::DeltanetCore, t.deltanet_norm, Part::Whole))},
+		    .weights = {.conv = core(schedule::side_index(Op::DeltanetCore, t.conv, Part::Whole)),
+			            .a_log = core(schedule::side_index(Op::DeltanetCore, t.a_log, Part::Whole)),
+			            .dt_bias = core(schedule::side_index(Op::DeltanetCore, t.dt_bias, Part::Whole)),
+			            .norm = core(schedule::side_index(Op::DeltanetCore, t.deltanet_norm, Part::Whole))},
 		    .rows = {.qkv = deltanet::address<deltanet::Bf16 const>(view_.workspace + pd::workspace.qkv),
 			         .gates = deltanet::address<float const>(view_.workspace + pd::workspace.gates),
 			         .outputs = deltanet::address<float>(view_.workspace + pd::workspace.core)},
@@ -287,7 +289,7 @@ private:
 	template<class Kernels>
 	auto attention_mixer(pd::LayerPhases const& phases, unsigned kv, Prompt prompt) -> void {
 		auto const& t = schedule::tensors;
-		norm(side(phases.mixer_in, pd::side_index(Op::AttentionIn, t.input_norm, Part::Whole)), pd::workspace.normed, prompt.rows);
+		norm(side(phases.mixer_in, schedule::side_index(Op::AttentionIn, t.input_norm, Part::Whole)), pd::workspace.normed, prompt.rows);
 		add<typename Kernels::QueryKernel>(gemm(phases.mixer_in, 0, 1, prompt.rows));
 		add<typename Kernels::KeyKernel>(gemm(phases.mixer_in, 1, 1, prompt.rows));
 		add<typename Kernels::ValueKernel>(gemm(phases.mixer_in, 2, 1, prompt.rows));
@@ -302,8 +304,8 @@ private:
 			         .key = view_.workspace + pd::workspace.key,
 			         .value = view_.workspace + pd::workspace.value,
 			         .gate = view_.workspace + pd::workspace.attention_gate},
-		    .preparation = {.query = side(phases.mixer_in, pd::side_index(Op::AttentionIn, t.q_norm, Part::Whole)),
-			                .key = side(phases.mixer_in, pd::side_index(Op::AttentionIn, t.k_norm, Part::Whole)),
+		    .preparation = {.query = side(phases.mixer_in, schedule::side_index(Op::AttentionIn, t.q_norm, Part::Whole)),
+			                .key = side(phases.mixer_in, schedule::side_index(Op::AttentionIn, t.k_norm, Part::Whole)),
 			                .rotations = view_.memories.rotations},
 		    .output = view_.workspace + pd::workspace.attention_output,
 		};
@@ -315,7 +317,7 @@ private:
 
 	template<class Kernels>
 	auto mlp(pd::LayerPhases const& phases, pd::Rows rows) -> void {
-		norm(side(phases.mlp_in, pd::side_index(Op::MlpIn, schedule::tensors.post_norm, Part::Whole)), pd::workspace.normed, rows);
+		norm(side(phases.mlp_in, schedule::side_index(Op::MlpIn, schedule::tensors.post_norm, Part::Whole)), pd::workspace.normed, rows);
 		add<typename Kernels::MlpInKernel>(gemm(phases.mlp_in, 0, 2, rows));
 		exchange<typename Kernels::MlpOutKernel, pd::ResidualAdd>(phases.mlp_out, rows);
 	}
@@ -328,8 +330,8 @@ private:
 		    .embedding = view_.embedding,
 		    .tokens = view_.tokens,
 		    .workspace = view_.workspace,
-		    .embedding_norm = side(pd::layers.mtp_in, pd::side_index(Op::MtpIn, t.pre_fc_norm_embedding, Part::Whole)),
-		    .hidden_norm = side(pd::layers.mtp_in, pd::side_index(Op::MtpIn, t.pre_fc_norm_hidden, Part::Whole)),
+		    .embedding_norm = side(pd::layers.mtp_in, schedule::side_index(Op::MtpIn, t.pre_fc_norm_embedding, Part::Whole)),
+		    .hidden_norm = side(pd::layers.mtp_in, schedule::side_index(Op::MtpIn, t.pre_fc_norm_hidden, Part::Whole)),
 		    .slot = chunk_.slot,
 		    .from = chunk_.from,
 		    .first = entries.first,

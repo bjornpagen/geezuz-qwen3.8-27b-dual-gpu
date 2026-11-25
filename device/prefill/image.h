@@ -1,88 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Where each weight a prefill chunk reads lies in a card's image: per image phase, each ring placement's first tile and
-// its tensors' block scales, and each side read; and per decoder layer, the image phase of each of its ops. Computed
-// once at compile time from the schedule's image layout (both cards' layouts agree in every offset), so the host turns
-// a layer into kernel parameters by indexing, never by searching. It uses no standard headers so that it compiles
-// unchanged as device code and inside a module purview.
+// Per decoder layer, the image phase of each op a prefill chunk walks: computed once at compile time from the
+// schedule's image layout, so the host turns a layer into kernel parameters by indexing the schedule's image table,
+// never by searching. It uses no standard headers so that it compiles unchanged as device code and inside a module
+// purview.
 #pragma once
 
 #include "model.h"
-#include "schedule/geometry.h"
 #include "schedule/program.h"
+#include "schedule/table.h"
 
 namespace engine::device::prefill {
 
 using model::Count;
+using schedule::first_phase;
 using schedule::Op;
-using schedule::Part;
-
-inline constexpr Count max_ring_reads = sizeof(schedule::Reads{}.ring) / sizeof(schedule::Read);
-inline constexpr Count max_side_reads = sizeof(schedule::Reads{}.side) / sizeof(schedule::Read);
-
-/** One image phase's weights, as byte offsets from the image's start. */
-struct PhaseOffsets {
-	Count ring[max_ring_reads];
-	/** Per ring placement, per interleaved tensor: its block scales (e4m3 placements only). */
-	Count scales[max_ring_reads][2];
-	Count side[max_side_reads];
-};
-
-struct ImageTable {
-	PhaseOffsets phase[schedule::image_phases];
-};
-
-[[nodiscard]] consteval auto plan_image_table() -> ImageTable {
-	auto const layout = schedule::image(0);
-	auto table = ImageTable{};
-	for (auto index = Count{0}; index < schedule::image_phases; ++index) {
-		auto const& phase = layout.phases[index];
-		auto& entry = table.phase[index];
-		for (auto side = Count{0}; side < phase.side.length; ++side) {
-			entry.side[side] = layout.placements[phase.side.begin + side].offset;
-		}
-		for (auto ring = Count{0}; ring < phase.ring.length; ++ring) {
-			auto const& placed = layout.placements[phase.ring.begin + ring];
-			entry.ring[ring] = placed.offset;
-			for (auto which = Count{0}; which < placed.read.tensor_count; ++which) {
-				for (auto side = Count{0}; side < phase.side.length; ++side) {
-					auto const& candidate = layout.placements[phase.side.begin + side].read;
-					if (candidate.part == Part::Scales && candidate.tensor[0] == placed.read.tensor[which] &&
-					    candidate.select == placed.read.select) {
-						entry.scales[ring][which] = layout.placements[phase.side.begin + side].offset;
-					}
-				}
-			}
-		}
-	}
-	return table;
-}
-
-inline constexpr ImageTable image_table = plan_image_table();
-
-/** The side read of `op` that is `part` of inventory tensor `tensor`; resolved while compiling. */
-[[nodiscard]] consteval auto side_index(Op op, Count tensor, Part part) -> Count {
-	auto const r = schedule::reads(op);
-	for (auto index = Count{0}; index < r.side_count; ++index) {
-		if (r.side[index].tensor[0] == tensor && r.side[index].part == part) {
-			return index;
-		}
-	}
-	// Not a constant expression: the phase reads no such side data.
-	__builtin_unreachable();
-}
-
-/** The first image phase computing `op` in `stream`: the geometry every layer of that op in that stream shares. */
-[[nodiscard]] consteval auto first_phase(Op op, model::Stream stream) -> Count {
-	auto const layout = schedule::image(0);
-	for (auto index = Count{0}; index < schedule::image_phases; ++index) {
-		if (layout.phases[index].step.op == op && layout.phases[index].step.stream == stream) {
-			return index;
-		}
-	}
-	// Not a constant expression: no image phase computes `op` in `stream`.
-	__builtin_unreachable();
-}
 
 /** The image phases one decoder layer's chunk walks; the ops its mixer lacks stay zero. */
 struct LayerPhases {
@@ -171,25 +103,5 @@ inline constexpr LayerTable layers = plan_layer_table();
 inline constexpr Count head_phase = first_phase(Op::Head, model::Stream::Head);
 
 static_assert(model::mtp_layers == 1, "the mtp head is one decoder layer");
-
-/** Whether every e4m3 ring placement found its scales: an entry left at zero would read the image's first bytes. */
-[[nodiscard]] consteval auto scales_found() -> bool {
-	auto const layout = schedule::image(0);
-	for (auto index = Count{0}; index < schedule::image_phases; ++index) {
-		auto const& phase = layout.phases[index];
-		for (auto ring = Count{0}; ring < phase.ring.length; ++ring) {
-			auto const& read = layout.placements[phase.ring.begin + ring].read;
-			for (auto which = Count{0}; which < read.tensor_count; ++which) {
-				if (model::inventory[read.tensor[which]].format == model::Format::E4m3 &&
-				    image_table.phase[index].scales[ring][which] == 0) {
-					return false;
-				}
-			}
-		}
-	}
-	return true;
-}
-
-static_assert(scales_found(), "every e4m3 tile run has its block scales in the same phase");
 
 }

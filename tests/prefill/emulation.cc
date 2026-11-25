@@ -833,13 +833,13 @@ export auto execute(Model const& model, Memory& memory, std::array<std::vector<p
                            Count width) -> std::vector<float> {
 	auto out = std::vector<float>(width);
 	for (auto output = Count{0}; output < width; ++output) {
-		out[output] = model.project(card, pd::image_table.phase[phase].ring[ring], tensor, output, row);
+		out[output] = model.project(card, schedule::image_table.phase[phase].ring[ring].bytes(), tensor, output, row);
 	}
 	return out;
 }
 
 [[nodiscard]] auto side_values(Memory const& memory, model::Card card, Count phase, Count index, Count count) -> std::vector<Bf16> {
-	return memory.values<Bf16>(base(Region::Image, card) + pd::image_table.phase[phase].side[index], count);
+	return memory.values<Bf16>(base(Region::Image, card) + schedule::image_table.phase[phase].side[index].bytes(), count);
 }
 
 /** residual + (card 0 + card 1), element by element: the decode's `add_to_residual`. */
@@ -871,9 +871,10 @@ public:
 			}
 			mlp(residual, phases);
 		}
-		auto const normed = normalized(residual, model::hidden_squares(residual),
-		                               side_values(*memory_, model::Card::Zero, pd::head_phase,
-		                                           pd::side_index(Op::Head, schedule::tensors.final_norm, Part::Whole), model::hidden));
+		auto const normed =
+		    normalized(residual, model::hidden_squares(residual),
+			           side_values(*memory_, model::Card::Zero, pd::head_phase,
+			                       schedule::side_index(Op::Head, schedule::tensors.final_norm, Part::Whole), model::hidden));
 		// The entry before this token's position waits for this token: a prompt's first token completes none.
 		if (position > 0) {
 			mtp_entry(last_, token, position - 1);
@@ -901,17 +902,19 @@ private:
 
 	auto deltanet_layer(std::vector<float>& residual, Count layer, pd::LayerPhases const& phases) -> void {
 		auto const& t = schedule::tensors;
-		auto const normed = norm_of(residual, phases.mixer_in, pd::side_index(Op::DeltanetIn, t.input_norm, Part::Whole));
+		auto const normed = norm_of(residual, phases.mixer_in, schedule::side_index(Op::DeltanetIn, t.input_norm, Part::Whole));
 		auto sums = std::array<std::vector<float>, model::cards>{};
 		for (auto const card : {model::Card::Zero, model::Card::One}) {
 			auto const qkv = rounded(project(*model_, card, phases.mixer_in, 0, 0, normed, static_cast<Count>(deltanet::channels)));
 			auto const image = base(Region::Image, card);
 			auto const gates = decay_inputs(
-			    *memory_, image + pd::image_table.phase[phases.mixer_in].side[pd::side_index(Op::DeltanetIn, t.a, Part::Whole)],
-			    image + pd::image_table.phase[phases.mixer_in].side[pd::side_index(Op::DeltanetIn, t.b, Part::Whole)], normed);
+			    *memory_,
+			    image + schedule::image_table.phase[phases.mixer_in].side[schedule::side_index(Op::DeltanetIn, t.a, Part::Whole)].bytes(),
+			    image + schedule::image_table.phase[phases.mixer_in].side[schedule::side_index(Op::DeltanetIn, t.b, Part::Whole)].bytes(),
+			    normed);
 			auto const at = [&](Count tensor) {
-				return deltanet::address<deltanet::Bf16 const>(image +
-				                                               pd::image_table.phase[phases.deltanet_core].side[side_of_core(tensor)]);
+				return deltanet::address<deltanet::Bf16 const>(
+				    image + schedule::image_table.phase[phases.deltanet_core].side[side_of_core(tensor)].bytes());
 			};
 			auto const sides =
 			    deltanet_sides(*memory_, {.conv = at(t.conv), .a_log = at(t.a_log), .dt_bias = at(t.dt_bias), .norm = at(t.deltanet_norm)});
@@ -934,15 +937,15 @@ private:
 	[[nodiscard]] static auto side_of_core(Count tensor) -> Count {
 		auto const& t = schedule::tensors;
 		if (tensor == t.conv) {
-			return pd::side_index(Op::DeltanetCore, t.conv, Part::Whole);
+			return schedule::side_index(Op::DeltanetCore, t.conv, Part::Whole);
 		}
 		if (tensor == t.a_log) {
-			return pd::side_index(Op::DeltanetCore, t.a_log, Part::Whole);
+			return schedule::side_index(Op::DeltanetCore, t.a_log, Part::Whole);
 		}
 		if (tensor == t.dt_bias) {
-			return pd::side_index(Op::DeltanetCore, t.dt_bias, Part::Whole);
+			return schedule::side_index(Op::DeltanetCore, t.dt_bias, Part::Whole);
 		}
-		return pd::side_index(Op::DeltanetCore, t.deltanet_norm, Part::Whole);
+		return schedule::side_index(Op::DeltanetCore, t.deltanet_norm, Part::Whole);
 	}
 
 	[[nodiscard]] auto layer_memory(model::Card card, Count layer) -> deltanet::LayerBuffers& {
@@ -953,17 +956,17 @@ private:
 	/** Attention for one row at `position`: append its kv, attend over [0, position], gate, then o_proj on both cards. */
 	auto attention_layer(std::vector<float>& residual, pd::LayerPhases const& phases, unsigned kv, std::uint32_t position) -> void {
 		auto const& t = schedule::tensors;
-		auto const normed = norm_of(residual, phases.mixer_in, pd::side_index(Op::AttentionIn, t.input_norm, Part::Whole));
+		auto const normed = norm_of(residual, phases.mixer_in, schedule::side_index(Op::AttentionIn, t.input_norm, Part::Whole));
 		auto sums = std::array<std::vector<float>, model::cards>{};
 		for (auto const card : {model::Card::Zero, model::Card::One}) {
 			auto const query = project(*model_, card, phases.mixer_in, 0, 0, normed, attn_device::query_row_floats);
 			auto const key = project(*model_, card, phases.mixer_in, 1, 0, normed, attn_device::kv_row_floats);
 			auto const value = project(*model_, card, phases.mixer_in, 2, 0, normed, attn_device::kv_row_floats);
 			auto const gate = project(*model_, card, phases.attention_gate, 0, 0, normed, attn_device::gate_row_floats);
-			auto const q_norm =
-			    side_values(*memory_, card, phases.mixer_in, pd::side_index(Op::AttentionIn, t.q_norm, Part::Whole), attn_device::head_dim);
-			auto const k_norm =
-			    side_values(*memory_, card, phases.mixer_in, pd::side_index(Op::AttentionIn, t.k_norm, Part::Whole), attn_device::head_dim);
+			auto const q_norm = side_values(*memory_, card, phases.mixer_in, schedule::side_index(Op::AttentionIn, t.q_norm, Part::Whole),
+			                                attn_device::head_dim);
+			auto const k_norm = side_values(*memory_, card, phases.mixer_in, schedule::side_index(Op::AttentionIn, t.k_norm, Part::Whole),
+			                                attn_device::head_dim);
 			auto const pool = base(Region::Pool, card);
 			auto const tables = base(Region::Tables, card);
 			append_row(*memory_, pool, tables, slot_, kv, key, value, k_norm, position);
@@ -974,7 +977,7 @@ private:
 	}
 
 	auto mlp(std::vector<float>& residual, pd::LayerPhases const& phases) -> void {
-		auto const normed = norm_of(residual, phases.mlp_in, pd::side_index(Op::MlpIn, schedule::tensors.post_norm, Part::Whole));
+		auto const normed = norm_of(residual, phases.mlp_in, schedule::side_index(Op::MlpIn, schedule::tensors.post_norm, Part::Whole));
 		auto sums = std::array<std::vector<float>, model::cards>{};
 		for (auto const card : {model::Card::Zero, model::Card::One}) {
 			auto const gate = project(*model_, card, phases.mlp_in, 0, 0, normed, model::ffn_per_card);
@@ -999,9 +1002,9 @@ private:
 		auto sums = std::array<std::vector<float>, model::cards>{};
 		for (auto const card : {model::Card::Zero, model::Card::One}) {
 			auto const embedding_norm = side_values(*memory_, card, pd::layers.mtp_in,
-			                                        pd::side_index(Op::MtpIn, t.pre_fc_norm_embedding, Part::Whole), model::hidden);
-			auto const hidden_norm =
-			    side_values(*memory_, card, pd::layers.mtp_in, pd::side_index(Op::MtpIn, t.pre_fc_norm_hidden, Part::Whole), model::hidden);
+			                                        schedule::side_index(Op::MtpIn, t.pre_fc_norm_embedding, Part::Whole), model::hidden);
+			auto const hidden_norm = side_values(*memory_, card, pd::layers.mtp_in,
+			                                     schedule::side_index(Op::MtpIn, t.pre_fc_norm_hidden, Part::Whole), model::hidden);
 			auto const e = normalized(embedded, model::hidden_squares(embedded), embedding_norm);
 			auto const h = normalized(hidden_wide, model::hidden_squares(hidden_wide), hidden_norm);
 			auto input = std::vector<Bf16>{};

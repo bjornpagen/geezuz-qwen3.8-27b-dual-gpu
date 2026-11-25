@@ -85,8 +85,8 @@ struct Machine {
 		return params.workspace + offset;
 	}
 
-	[[nodiscard]] __attribute__((device, always_inline)) auto image(unsigned units) const -> Address {
-		return params.image + Count{units} * image_unit;
+	[[nodiscard]] __attribute__((device, always_inline)) auto image(ImageOffset offset) const -> Address {
+		return params.image + offset.bytes();
 	}
 
 	[[nodiscard]] __attribute__((device, always_inline)) auto descriptor() const -> Descriptor const& {

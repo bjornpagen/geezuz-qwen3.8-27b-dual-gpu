@@ -311,11 +311,15 @@ struct Read {
 	return {.tensor = {tensor, tensor}, .tensor_count = 1, .part = part, .select = select};
 }
 
+/** The most ring reads and side reads any phase has: attention's q, k and v and their norms and scales. */
+inline constexpr Count max_ring_reads = 3;
+inline constexpr Count max_side_reads = 6;
+
 /** What one phase reads from the image: tiles through the ring, in stream order, and side data read directly. */
 struct Reads {
-	Read ring[3];
+	Read ring[max_ring_reads];
 	Count ring_count;
-	Read side[6];
+	Read side[max_side_reads];
 	Count side_count;
 };
 
@@ -736,7 +740,7 @@ constexpr auto place(Image<Capacity>& image, Count card) -> Count {
 }
 
 /** Every read of every image phase placed apart: the most placements an image can need. */
-inline constexpr Count placement_bound = image_phases * (sizeof(Reads{}.ring) / sizeof(Read) + sizeof(Reads{}.side) / sizeof(Read));
+inline constexpr Count placement_bound = image_phases * (max_ring_reads + max_side_reads);
 
 [[nodiscard]] consteval auto placement_count() -> Count {
 	auto probe = Image<placement_bound>{};

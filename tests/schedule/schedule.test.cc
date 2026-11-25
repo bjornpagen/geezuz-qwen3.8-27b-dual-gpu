@@ -493,6 +493,40 @@ struct Flow {
 	       at(first.read.tensor, 0) == schedule::tensors.lm_head;
 }
 
+/**
+ * Every image table entry lands where the layout placed its read: each ring placement's first tile (the first starting
+ * the phase's run), each side read, and for each e4m3 ring tensor the side read holding that tensor's block scales.
+ */
+[[nodiscard]] auto image_table_is_the_layout() -> bool {
+	auto sound = true;
+	for (auto index = Count{0}; index < schedule::image_phases; ++index) {
+		auto const& phase = at(card0.phases, index);
+		auto const& entry = at(schedule::image_table.phase, index);
+		for (auto ring = Count{0}; ring < phase.ring.length; ++ring) {
+			auto const& placed = at(card0.placements, phase.ring.begin + ring);
+			sound = sound && at(entry.ring, ring).bytes() == placed.offset;
+			for (auto which = Count{0}; which < placed.read.tensor_count; ++which) {
+				auto const tensor = at(placed.read.tensor, which);
+				if (at(model::inventory, tensor).format != model::Format::E4m3) {
+					continue;
+				}
+				auto const scales = at(at(entry.scales, ring), which).bytes();
+				auto const holder = std::ranges::find_if(card0.placements, [&](auto const& candidate) {
+					return candidate.offset == scales;
+				});
+				sound = sound && holder != std::ranges::end(card0.placements) && holder->read.part == schedule::Part::Scales &&
+				        at(holder->read.tensor, 0) == tensor && holder->read.select == placed.read.select &&
+				        holder->instance.layer == placed.instance.layer && holder->instance.stream == placed.instance.stream;
+			}
+		}
+		sound = sound && at(entry.ring, 0).bytes() == schedule::run(card0, phase).offset;
+		for (auto side = Count{0}; side < phase.side.length; ++side) {
+			sound = sound && at(entry.side, side).bytes() == at(card0.placements, phase.side.begin + side).offset;
+		}
+	}
+	return sound;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Partition.
 
@@ -662,6 +696,10 @@ auto main() -> int {
 	    engine::testing::Case{
 	        .name = "the draft lm_head streams the front of the lm_head's tiles",
 	        .holds = draft_head_is_a_prefix_of_the_head(),
+	    },
+	    engine::testing::Case{
+	        .name = "the image table holds every phase's ring, scale and side offsets where the layout placed them",
+	        .holds = image_table_is_the_layout(),
 	    },
 	    engine::testing::Case{
 	        .name = "the split over the SMs is contiguous and balanced to one unit, seed 0x5c4ed01e",
