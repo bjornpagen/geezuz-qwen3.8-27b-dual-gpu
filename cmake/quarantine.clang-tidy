@@ -20,6 +20,7 @@ Checks: >
   performance-*,
   portability-*,
   -portability-avoid-pragma-once,
+  -portability-no-assembler,
   readability-container-size-empty,
   readability-misleading-indentation
 
