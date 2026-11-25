@@ -4,7 +4,6 @@ export module engine.decode:error;
 import std;
 import engine.core;
 import engine.device;
-import engine.file;
 import engine.image;
 import engine.model;
 
@@ -214,52 +213,6 @@ export struct [[nodiscard]] DecodeError {
 	std::unreachable();
 }
 
-[[nodiscard]] constexpr auto name(file::Failure failure) -> std::string_view {
-	switch (failure) {
-	case file::Failure::NotFound:
-		return "there is no file at its path";
-	case file::Failure::Permission:
-		return "the process may not read it";
-	case file::Failure::NotRegular:
-		return "its path is not a regular file";
-	case file::Failure::Empty:
-		return "the file is empty";
-	case file::Failure::Exhausted:
-		return "the process ran out of descriptors or address space mapping it";
-	case file::Failure::MapFailed:
-		return "the kernel refused to map it";
-	case file::Failure::Unreadable:
-		return "it cannot be opened or inspected";
-	}
-	std::unreachable();
-}
-
-[[nodiscard]] constexpr auto name(image::Failure failure) -> std::string_view {
-	switch (failure) {
-	case image::Failure::Truncated:
-		return "it ends before the payload its table lays out";
-	case image::Failure::Overlong:
-		return "it goes on past the payload its table lays out";
-	case image::Failure::BadMagic:
-		return "it is not a baked image";
-	case image::Failure::UnsupportedVersion:
-		return "its format version is not this engine's";
-	case image::Failure::ModelMismatch:
-		return "it was baked from another model description";
-	case image::Failure::CheckpointMismatch:
-		return "it was baked from another checkpoint";
-	case image::Failure::WrongTarget:
-		return "it was baked for another memory";
-	case image::Failure::ScheduleMismatch:
-		return "its section table is not this engine's catalog";
-	case image::Failure::DirtyPadding:
-		return "the bytes before its payload are not all zero";
-	case image::Failure::PayloadMismatch:
-		return "its payload is not the bytes the baker hashed";
-	}
-	std::unreachable();
-}
-
 [[nodiscard]] constexpr auto name(Disagreement what) -> std::string_view {
 	switch (what) {
 	case Disagreement::Accepted:
@@ -278,13 +231,7 @@ struct Describe {
 	}
 
 	[[nodiscard]] auto operator()(Unloadable const& unloadable) const -> std::string {
-		// The image module has no description of its own errors yet; this one names every case it has.
-		auto const file = core::alternative<file::FileError>(unloadable.error.cause);
-		if (file) {
-			return std::format("{} cannot be mapped: {}", name(unloadable.image), name(file->failure));
-		}
-		return std::format("{} is refused: {}; rebake it with this engine's geezuz-bake", name(unloadable.image),
-		                   name(std::get<image::Rejection>(unloadable.error.cause).failure));
+		return std::format("{} {}", name(unloadable.image), image::describe(unloadable.error));
 	}
 
 	[[nodiscard]] auto operator()(Refused const& refused) const -> std::string {

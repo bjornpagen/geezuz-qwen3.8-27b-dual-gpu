@@ -98,6 +98,13 @@ template<class E, E last>
 	return decode::describe({.reason = error}).contains(device::describe(error));
 }
 
+/** An image error is described by image's own description, after the name of the image it is about. */
+[[nodiscard]] auto image_errors_read_as_image_describes_them() -> bool {
+	auto const error = image::ImageError{.cause = image::Rejection{.failure = image::Failure::ScheduleMismatch}};
+	return decode::describe({.reason = decode::Unloadable{.image = decode::ImageOf::CardOne, .error = error}})
+	    .contains(image::describe(error));
+}
+
 }
 
 auto main() -> int {
@@ -109,6 +116,10 @@ auto main() -> int {
 	    engine::testing::Case{
 	        .name = "a device error reads as device describes it",
 	        .holds = device_errors_read_as_device_describes_them(),
+	    },
+	    engine::testing::Case{
+	        .name = "an image error reads as image describes it",
+	        .holds = image_errors_read_as_image_describes_them(),
 	    },
 	};
 	return engine::testing::report(cases);
