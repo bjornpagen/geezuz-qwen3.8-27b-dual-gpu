@@ -612,6 +612,11 @@ inline constexpr Count trunk_kv_bytes_per_token_per_card =
 inline constexpr Count kv_block_tokens = 64;
 inline constexpr Count kv_block_bytes = kv_block_tokens * kv_bytes_per_token_per_card;
 
+/** Entries of one slot's block table: enough blocks for the longest sequence the model takes. */
+inline constexpr Count kv_table_blocks = divide_up(max_positions, kv_block_tokens);
+
+static_assert(kv_table_blocks == 4096);
+
 static_assert(trunk_kv_bytes_per_token_per_card == Count{32} * 1024, "trunk kv reads: 32 KiB per position per card");
 
 /** fp32 deltanet state of one slot on one card: a key_dim x value_dim matrix per value head per deltanet layer. */
@@ -657,6 +662,7 @@ struct CardMemory {
 inline constexpr CardMemory card_memory = plan_card_memory();
 
 inline constexpr Count snapshot_pool_blocks = card_memory.snapshot_pool_blocks;
+/** Snapshots the pool holds at once. */
 inline constexpr Count snapshot_capacity = snapshot_pool_blocks / snapshot_blocks;
 inline constexpr Count kv_pool_blocks = card_memory.kv_pool_blocks;
 inline constexpr Count kv_pool_tokens = kv_pool_blocks * kv_block_tokens;
