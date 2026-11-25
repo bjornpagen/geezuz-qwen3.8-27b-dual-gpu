@@ -90,6 +90,12 @@ auto fake_device_get_attribute(int* value, driver::Attribute attribute, CUdevice
 	case driver::Attribute::ComputeCapabilityMinor:
 		*value = model.compute_minor;
 		return Status::Success;
+	case driver::Attribute::MaxPersistingL2CacheSize:
+		*value = model.max_persisting_l2_bytes;
+		return Status::Success;
+	case driver::Attribute::MaxAccessPolicyWindowSize:
+		*value = model.max_access_policy_window_bytes;
+		return Status::Success;
 	}
 	return Status::InvalidValue;
 }
@@ -114,6 +120,28 @@ auto fake_device_can_access_peer(int* can, CUdevice from, CUdevice to) -> Status
 	}
 	*can = card(from).reaches_peer ? 1 : 0;
 	return Status::Success;
+}
+
+auto fake_device_get_p2p_attribute(int* value, driver::PeerAttribute attribute, CUdevice from, CUdevice to) -> Status {
+	if (injected()) {
+		return Status::Unknown;
+	}
+	if (!card_exists(from) || !card_exists(to) || from == to) {
+		return Status::InvalidDevice;
+	}
+	auto const& model = card(from);
+	switch (attribute) {
+	case driver::PeerAttribute::PerformanceRank:
+		*value = model.peer_performance_rank;
+		return Status::Success;
+	case driver::PeerAttribute::AccessSupported:
+		*value = model.reaches_peer ? 1 : 0;
+		return Status::Success;
+	case driver::PeerAttribute::NativeAtomicSupported:
+		*value = model.native_atomics ? 1 : 0;
+		return Status::Success;
+	}
+	return Status::InvalidValue;
 }
 
 auto fake_primary_ctx_retain(CUcontext* context, CUdevice device) -> Status {

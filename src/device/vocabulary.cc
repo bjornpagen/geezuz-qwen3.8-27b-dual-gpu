@@ -31,9 +31,18 @@ using driver::Timing;
 using driver::Transfer;
 using driver::Wire;
 
+using driver::ClocksEventCounters;
+using driver::ClocksEventReason;
+using driver::ClocksEventReasons;
+using driver::L2Persistence;
 using driver::MemoryClock;
+using driver::NvlinkLinkReading;
+using driver::NvlinkVersion;
 using driver::PciAddress;
+using driver::PeerFacts;
 using driver::PerformanceState;
+using driver::Power;
+using driver::SmClock;
 
 using driver::CardCount;
 using driver::CardFact;

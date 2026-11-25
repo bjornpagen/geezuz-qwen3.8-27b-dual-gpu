@@ -103,6 +103,50 @@ export [[nodiscard]] auto census(Api const& api) -> core::Result<Census, DeviceE
 	return census;
 }
 
+/** What the driver says about the path from one card to another. */
+export struct PeerFacts {
+	/** The driver's relative rank of this path among the machine's peer paths; lower is better. */
+	int performance_rank;
+	/** Whether atomic operations on the peer's memory are atomic across the link. */
+	bool native_atomics;
+
+	[[nodiscard]] constexpr auto operator==(PeerFacts const&) const -> bool = default;
+};
+
+export [[nodiscard]] auto peer_facts(Api const& api, CUdevice from, CUdevice to) -> core::Result<PeerFacts, DeviceError> {
+	auto rank = 0;
+	auto atomics = 0;
+	return call(api.device_get_p2p_attribute, &rank, PeerAttribute::PerformanceRank, from, to)
+	    .and_then([&] {
+		    return call(api.device_get_p2p_attribute, &atomics, PeerAttribute::NativeAtomicSupported, from, to);
+	    })
+	    .transform([&] {
+		    return PeerFacts{.performance_rank = rank, .native_atomics = atomics == 1};
+	    });
+}
+
+/** How much of a card's L2 can be set aside for persisting accesses, and the largest access-policy window, in bytes. */
+export struct L2Persistence {
+	std::uint64_t max_persisting_bytes;
+	std::uint64_t max_access_policy_window_bytes;
+
+	[[nodiscard]] constexpr auto operator==(L2Persistence const&) const -> bool = default;
+};
+
+export [[nodiscard]] auto l2_persistence(Api const& api, CUdevice device) -> core::Result<L2Persistence, DeviceError> {
+	auto const persisting = attribute(api, device, Attribute::MaxPersistingL2CacheSize);
+	auto const window = persisting.and_then([&](int) {
+		return attribute(api, device, Attribute::MaxAccessPolicyWindowSize);
+	});
+	if (!window) {
+		return std::unexpected(window.error());
+	}
+	return L2Persistence{
+	    .max_persisting_bytes = core::narrow<std::uint64_t>(*persisting),
+	    .max_access_policy_window_bytes = core::narrow<std::uint64_t>(*window),
+	};
+}
+
 /** Whether the driver can map `to`'s memory into `from`'s address space. */
 export [[nodiscard]] auto can_access_peer(Api const& api, CUdevice from, CUdevice to) -> core::Result<bool, DeviceError> {
 	auto can = 0;

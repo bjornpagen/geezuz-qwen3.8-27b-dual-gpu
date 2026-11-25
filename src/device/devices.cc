@@ -171,6 +171,7 @@ public:
 			return std::unexpected(mapped.error());
 		}
 		return Devices{
+		    driver.cuda,
 		    std::move(*management),
 		    {
 		        Card{.context = std::move(*zero), .pci = pci(model::Card::Zero)},
@@ -191,15 +192,61 @@ public:
 		return management_.memory_clock(cards_[index(card)].pci);
 	}
 
+	// The reads below only observe: nothing in the engine sets a clock or a limit; bring-up does.
+
+	[[nodiscard]] auto sm_clock(model::Card card) const -> core::Result<driver::SmClock, driver::DeviceError> {
+		return management_.sm_clock(cards_[index(card)].pci);
+	}
+
+	/** The card's power draw now and the limit the driver enforces, in milliwatts. */
+	[[nodiscard]] auto power(model::Card card) const -> core::Result<driver::Power, driver::DeviceError> {
+		return management_.power(cards_[index(card)].pci);
+	}
+
+	/** The reasons holding the card's clocks down now. */
+	[[nodiscard]] auto clocks_event_reasons(model::Card card) const -> core::Result<driver::ClocksEventReasons, driver::DeviceError> {
+		return management_.clocks_event_reasons(cards_[index(card)].pci);
+	}
+
+	/** How long each reason has held the card's clocks down since the driver loaded. */
+	[[nodiscard]] auto clocks_event_counters(model::Card card) const -> core::Result<driver::ClocksEventCounters, driver::DeviceError> {
+		return management_.clocks_event_counters(cards_[index(card)].pci);
+	}
+
+	/** The version and speed of each of the card's nvlink links, in link order. */
+	[[nodiscard]] auto nvlinks(model::Card card) const
+	    -> core::Result<std::array<driver::NvlinkLinkReading, nvlink_links>, driver::DeviceError> {
+		auto readings = std::array<driver::NvlinkLinkReading, nvlink_links>{};
+		for (auto link = std::uint32_t{0}; link < nvlink_links; ++link) {
+			auto const reading = management_.nvlink(cards_[index(card)].pci, link);
+			if (!reading) {
+				return std::unexpected(reading.error());
+			}
+			readings[link] = *reading;
+		}
+		return readings;
+	}
+
+	/** What the driver says about the path from `card` to its peer: performance rank and native atomics. */
+	[[nodiscard]] auto peer_facts(model::Card card) const -> core::Result<driver::PeerFacts, driver::DeviceError> {
+		return driver::peer_facts(cuda_, ordinal(card), ordinal(peer(card)));
+	}
+
+	/** The card's limits for persisting L2 accesses. */
+	[[nodiscard]] auto l2_persistence(model::Card card) const -> core::Result<driver::L2Persistence, driver::DeviceError> {
+		return driver::l2_persistence(cuda_, ordinal(card));
+	}
+
 private:
 	struct Card {
 		driver::Context context;
 		driver::PciAddress pci;
 	};
 
-	Devices(driver::ManagementSession management, std::array<Card, model::cards> cards)
-	    : management_{std::move(management)}, cards_{std::move(cards)} {}
+	Devices(driver::Api const& cuda, driver::ManagementSession management, std::array<Card, model::cards> cards)
+	    : cuda_{cuda}, management_{std::move(management)}, cards_{std::move(cards)} {}
 
+	driver::Api cuda_;
 	driver::ManagementSession management_;
 	std::array<Card, model::cards> cards_;
 };

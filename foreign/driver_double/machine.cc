@@ -26,6 +26,23 @@ export struct CardModel {
 	bool reaches_peer = true;
 	std::uint32_t memory_clock = 9501;
 	int performance_state = 2;
+	std::uint32_t sm_clock = 1695;
+	std::uint32_t power_draw_milliwatts = 300'000;
+	std::uint32_t power_limit_milliwatts = 350'000;
+	std::uint64_t clocks_event_reasons = 0x4;
+	driver::ClocksEventCounters clocks_event_counters = {
+	    .sw_power_cap = std::chrono::nanoseconds{1'500'000},
+	    .sync_boost = std::chrono::nanoseconds{0},
+	    .sw_thermal_slowdown = std::chrono::nanoseconds{0},
+	    .hw_thermal_slowdown = std::chrono::nanoseconds{0},
+	    .hw_power_brake_slowdown = std::nullopt,
+	};
+	unsigned int nvlink_version = 4;
+	std::uint32_t nvlink_megabytes_per_second = 14'062;
+	int peer_performance_rank = 0;
+	bool native_atomics = false;
+	int max_persisting_l2_bytes = 3 * 1024 * 1024;
+	int max_access_policy_window_bytes = 134'213'632;
 };
 
 /** The modelled jit accepts every image and finds the entries the ptx text declares. */

@@ -96,14 +96,23 @@ export enum class Status : int {
 	Unknown = 999,
 };
 
-/** `CUdevice_attribute`, the attributes the engine reads. */
+/** `CUdevice_attribute`, the attributes the engine reads (CUDA Driver API reference, Data types). */
 export enum class Attribute : int {
-	MultiprocessorCount = 16,
-	PciBusId = 33,
-	PciDeviceId = 34,
-	PciDomainId = 50,
-	ComputeCapabilityMajor = 75,
-	ComputeCapabilityMinor = 76,
+	MultiprocessorCount = 16,        // CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+	PciBusId = 33,                   // CU_DEVICE_ATTRIBUTE_PCI_BUS_ID
+	PciDeviceId = 34,                // CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID
+	PciDomainId = 50,                // CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID
+	ComputeCapabilityMajor = 75,     // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
+	ComputeCapabilityMinor = 76,     // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
+	MaxPersistingL2CacheSize = 108,  // CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE
+	MaxAccessPolicyWindowSize = 109, // CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE
+};
+
+/** `CUdevice_P2PAttribute`, the peer facts the engine reads (CUDA Driver API reference, Data types). */
+export enum class PeerAttribute : int {
+	PerformanceRank = 0x01,       // CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK
+	AccessSupported = 0x02,       // CU_DEVICE_P2P_ATTRIBUTE_ACCESS_SUPPORTED
+	NativeAtomicSupported = 0x03, // CU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED
 };
 
 /** `CUjit_option`, the options the engine passes to the jit. */
@@ -143,15 +152,93 @@ export enum class EnableState : int {
 	Enabled = 1,
 };
 
-/** `nvmlClockType_t`. */
+/** `nvmlClockType_t` (nvml.h; the NVML API reference gives every speed in MHz). */
 export enum class ClockType : int {
-	Graphics = 0,
-	Sm = 1,
-	Memory = 2,
-	Video = 3,
+	Graphics = 0, // NVML_CLOCK_GRAPHICS
+	Sm = 1,       // NVML_CLOCK_SM
+	Memory = 2,   // NVML_CLOCK_MEM
+	Video = 3,    // NVML_CLOCK_VIDEO
+};
+
+/** `nvmlValueType_t` (nvml.h): which member of a field value's `nvmlValue_t` holds its value. */
+export enum class ValueType : int {
+	Double = 0,           // NVML_VALUE_TYPE_DOUBLE
+	UnsignedInt = 1,      // NVML_VALUE_TYPE_UNSIGNED_INT
+	UnsignedLong = 2,     // NVML_VALUE_TYPE_UNSIGNED_LONG
+	UnsignedLongLong = 3, // NVML_VALUE_TYPE_UNSIGNED_LONG_LONG
+	SignedLongLong = 4,   // NVML_VALUE_TYPE_SIGNED_LONG_LONG
+	SignedInt = 5,        // NVML_VALUE_TYPE_SIGNED_INT
+	UnsignedShort = 6,    // NVML_VALUE_TYPE_UNSIGNED_SHORT
+};
+
+/**
+ * `nvmlNvlinkVersion_t` (NVML API reference, NvLink methods), the value `nvmlDeviceGetNvLinkVersion` returns. The
+ * reference lists the cases in this order without numbers; the values are that order counted from zero, inferred, to
+ * be confirmed against a real driver (older drivers answered with the bare major version instead).
+ */
+export enum class NvlinkVersion : unsigned int {
+	Invalid = 0, // NVML_NVLINK_VERSION_INVALID
+	V1_0 = 1,    // NVML_NVLINK_VERSION_1_0
+	V2_0 = 2,    // NVML_NVLINK_VERSION_2_0
+	V2_2 = 3,    // NVML_NVLINK_VERSION_2_2
+	V3_0 = 4,    // NVML_NVLINK_VERSION_3_0
+	V3_1 = 5,    // NVML_NVLINK_VERSION_3_1
+	V4_0 = 6,    // NVML_NVLINK_VERSION_4_0
+	V5_0 = 7,    // NVML_NVLINK_VERSION_5_0
+	V6_0 = 8,    // NVML_NVLINK_VERSION_6_0
+};
+
+/**
+ * The `NVML_FI_DEV_*` field ids the engine reads through `nvmlDeviceGetFieldValues` (nvml.h). The clocks-event counters
+ * are cumulative nanoseconds the clocks were held down for that reason; the speeds are MBps per link.
+ */
+export enum class Field : std::uint32_t {
+	SwPowerCap = 74,            // NVML_FI_DEV_CLOCKS_EVENT_REASON_SW_POWER_CAP = NVML_FI_DEV_PERF_POLICY_POWER
+	SyncBoost = 76,             // NVML_FI_DEV_CLOCKS_EVENT_REASON_SYNC_BOOST = NVML_FI_DEV_PERF_POLICY_SYNC_BOOST
+	NvlinkSpeedLink0 = 84,      // NVML_FI_DEV_NVLINK_SPEED_MBPS_L0 (L1 to L5 follow as 85 to 89)
+	SwThermalSlowdown = 269,    // NVML_FI_DEV_CLOCKS_EVENT_REASON_SW_THERM_SLOWDOWN
+	HwThermalSlowdown = 270,    // NVML_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN
+	HwPowerBrakeSlowdown = 271, // NVML_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN
+};
+
+/** The bits of `nvmlDeviceGetCurrentClocksEventReasons`' answer (nvml.h `nvmlClocksEventReason*`). */
+export enum class ClocksEventReason : std::uint64_t {
+	GpuIdle = 0x1,                   // nvmlClocksEventReasonGpuIdle
+	ApplicationsClocksSetting = 0x2, // nvmlClocksEventReasonApplicationsClocksSetting
+	SwPowerCap = 0x4,                // nvmlClocksEventReasonSwPowerCap
+	HwSlowdown = 0x8,                // nvmlClocksThrottleReasonHwSlowdown
+	SyncBoost = 0x10,                // nvmlClocksEventReasonSyncBoost
+	SwThermalSlowdown = 0x20,        // nvmlClocksEventReasonSwThermalSlowdown
+	HwThermalSlowdown = 0x40,        // nvmlClocksThrottleReasonHwThermalSlowdown
+	HwPowerBrakeSlowdown = 0x80,     // nvmlClocksThrottleReasonHwPowerBrakeSlowdown
+	DisplayClockSetting = 0x100,     // nvmlClocksEventReasonDisplayClockSetting
+	BoardLimit = 0x200,              // nvmlClocksEventReasonBoardLimit
+	Reliability = 0x400,             // nvmlClocksEventReasonReliability
 };
 
 // NOLINTEND(performance-enum-size)
+
+/** The field id of link `link`'s speed; links 0 to 5 have consecutive ids. */
+export [[nodiscard]] constexpr auto nvlink_speed_field(std::uint32_t link) -> Field {
+	return static_cast<Field>(std::to_underlying(Field::NvlinkSpeedLink0) + link);
+}
+
+/**
+ * `nvmlFieldValue_t` (nvml.h): one field of a `nvmlDeviceGetFieldValues` request, its id set by the caller and the rest
+ * filled by NVML. `value` is the 8-byte `nvmlValue_t` union, read according to `value_type`.
+ */
+export struct FieldValue {
+	Field field;
+	std::uint32_t scope;
+	std::int64_t timestamp_microseconds;
+	std::int64_t latency_microseconds;
+	ValueType value_type;
+	ManagementStatus status;
+	alignas(8) std::array<std::byte, 8> value;
+};
+
+static_assert(sizeof(FieldValue) == 40 && offsetof(FieldValue, value_type) == 24 && offsetof(FieldValue, value) == 32,
+              "nvmlFieldValue_t's layout");
 
 /** `nvmlPciInfo_t`, the layout `nvmlDeviceGetNvLinkRemotePciInfo_v2` fills. */
 export struct PciInfo {
@@ -184,6 +271,7 @@ export struct Api {
 	Entry<"cuDeviceGetAttribute", Status(int*, Attribute, CUdevice)> device_get_attribute;
 	Entry<"cuDeviceTotalMem_v2", Status(std::size_t*, CUdevice)> device_total_mem;
 	Entry<"cuDeviceCanAccessPeer", Status(int*, CUdevice, CUdevice)> device_can_access_peer;
+	Entry<"cuDeviceGetP2PAttribute", Status(int*, PeerAttribute, CUdevice, CUdevice)> device_get_p2p_attribute;
 	Entry<"cuDevicePrimaryCtxRetain", Status(CUcontext*, CUdevice)> primary_ctx_retain;
 	Entry<"cuDevicePrimaryCtxRelease_v2", Status(CUdevice)> primary_ctx_release;
 	Entry<"cuCtxSetCurrent", Status(CUcontext)> ctx_set_current;
@@ -226,6 +314,11 @@ export struct Management {
 	Entry<"nvmlDeviceGetNvLinkRemotePciInfo_v2", ManagementStatus(nvmlDevice_t, unsigned int, PciInfo*)> nvlink_remote_pci_info;
 	Entry<"nvmlDeviceGetClockInfo", ManagementStatus(nvmlDevice_t, ClockType, unsigned int*)> clock_info;
 	Entry<"nvmlDeviceGetPerformanceState", ManagementStatus(nvmlDevice_t, int*)> performance_state;
+	Entry<"nvmlDeviceGetPowerUsage", ManagementStatus(nvmlDevice_t, unsigned int*)> power_usage;
+	Entry<"nvmlDeviceGetEnforcedPowerLimit", ManagementStatus(nvmlDevice_t, unsigned int*)> enforced_power_limit;
+	Entry<"nvmlDeviceGetCurrentClocksEventReasons", ManagementStatus(nvmlDevice_t, unsigned long long*)> clocks_event_reasons;
+	Entry<"nvmlDeviceGetFieldValues", ManagementStatus(nvmlDevice_t, int, FieldValue*)> field_values;
+	Entry<"nvmlDeviceGetNvLinkVersion", ManagementStatus(nvmlDevice_t, unsigned int, unsigned int*)> nvlink_version;
 };
 
 /** Both vendor tables: what the engine's device layer is built over. */

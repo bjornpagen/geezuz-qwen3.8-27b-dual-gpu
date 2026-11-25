@@ -57,6 +57,7 @@ public:
 		            .device_get_attribute = {.function = fake_device_get_attribute},
 		            .device_total_mem = {.function = fake_device_total_mem},
 		            .device_can_access_peer = {.function = fake_device_can_access_peer},
+		            .device_get_p2p_attribute = {.function = fake_device_get_p2p_attribute},
 		            .primary_ctx_retain = {.function = fake_primary_ctx_retain},
 		            .primary_ctx_release = {.function = fake_primary_ctx_release},
 		            .ctx_set_current = {.function = fake_ctx_set_current},
@@ -94,6 +95,11 @@ public:
 		            .nvlink_remote_pci_info = {.function = fake_nvml_nvlink_remote_pci_info},
 		            .clock_info = {.function = fake_nvml_clock_info},
 		            .performance_state = {.function = fake_nvml_performance_state},
+		            .power_usage = {.function = fake_nvml_power_usage},
+		            .enforced_power_limit = {.function = fake_nvml_enforced_power_limit},
+		            .clocks_event_reasons = {.function = fake_nvml_clocks_event_reasons},
+		            .field_values = {.function = fake_nvml_field_values},
+		            .nvlink_version = {.function = fake_nvml_nvlink_version},
 		        },
 		};
 	}

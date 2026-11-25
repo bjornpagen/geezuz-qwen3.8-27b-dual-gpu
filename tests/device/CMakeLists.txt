@@ -15,3 +15,4 @@ engine_test(device.transfer SOURCES transfer.test.cc LINK engine_device engine_d
 engine_death_test(device.transfer_pending_aborts SOURCES transfer_pending.test.cc LINK engine_device engine_driver_double)
 engine_test(device.timing SOURCES timing.test.cc LINK engine_device engine_driver_double)
 engine_compile_fail(untimed_events_have_no_elapsed_time SOURCE untimed_since.cc LINK engine_device MATCH "constraints not satisfied")
+engine_test(device.telemetry SOURCES telemetry.test.cc LINK engine_device engine_driver_double)
