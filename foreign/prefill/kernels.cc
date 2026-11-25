@@ -25,47 +25,6 @@ export inline constexpr ptx::Image image = ptx::image(text);
 
 static_assert(image.header == ptx::abi.header, "every image shares the engine's isa and target");
 
-/**
- * The budget record `engine_budget_<entry>` the image holds, as the device compiler emitted it: four little-endian
- * 32-bit fields (threads, registers per thread, shared bytes, blocks per SM) as up to 16 byte values, trailing zeros
- * omitted. Records precede the first entry; a missing or malformed record does not compile.
- */
-[[nodiscard]] consteval auto recorded_budget(std::string_view entry) -> prims::Budget {
-	auto const all = std::string_view{image.text.data(), image.text.size() - 1};
-	auto const head = all.substr(0, all.find(".entry"));
-	auto const prefix = std::string_view{"engine_budget_"};
-	auto const suffix = std::string_view{"[16] = {"};
-	auto found = std::string_view::npos;
-	for (auto at = head.find(prefix); at != std::string_view::npos; at = head.find(prefix, at + 1)) {
-		auto const rest = head.substr(at + prefix.size());
-		if (rest.starts_with(entry) && rest.substr(entry.size()).starts_with(suffix)) {
-			found = at + prefix.size() + entry.size() + suffix.size();
-			break;
-		}
-	}
-	core::invariant(found != std::string_view::npos);
-	auto const values = head.substr(found, head.find('}', found) - found);
-	auto bytes = std::array<std::uint32_t, 16>{};
-	auto index = std::size_t{0};
-	auto value = std::uint32_t{0};
-	for (auto const character : values) {
-		if (character == ',') {
-			bytes.at(index++) = value;
-			value = 0;
-		} else if (character >= '0' && character <= '9') {
-			value = value * 10 + static_cast<std::uint32_t>(character - '0');
-		} else {
-			core::invariant(character == ' ');
-		}
-	}
-	bytes.at(index) = value;
-	auto const field = [&](std::size_t first) {
-		auto const word = bytes.at(first) | bytes.at(first + 1) << 8U | bytes.at(first + 2) << 16U | bytes.at(first + 3) << 24U;
-		return static_cast<int>(word);
-	};
-	return {.threads = field(0), .registers_per_thread = field(4), .shared_bytes = field(8), .blocks_per_sm = field(12)};
-}
-
 /** A kernel entry's name in fixed storage, NUL-terminated, so it can be a template argument and reach the loader. */
 export struct Entry {
 	std::array<char, 40> text{};
@@ -94,7 +53,8 @@ struct RowKernel {
 	static constexpr driver::Residency residency = driver::Residency::Ordinary;
 	using Params = P;
 
-	static_assert(recorded_budget(entry).threads == budget.threads && recorded_budget(entry).blocks_per_sm == budget.blocks_per_sm,
+	static_assert(ptx::recorded_budget(image, entry).threads == budget.threads &&
+	                  ptx::recorded_budget(image, entry).blocks_per_sm == budget.blocks_per_sm,
 	              "the image's record and the layout's budget agree");
 };
 
@@ -104,7 +64,7 @@ struct GemmKernel {
 	static constexpr ptx::Image image = prefill_device::image;
 	static constexpr std::string_view entry = name.view();
 	static constexpr driver::Dim grid = {.x = gemm_blocks, .y = 1, .z = 1};
-	static constexpr prims::Budget budget = recorded_budget(entry);
+	static constexpr prims::Budget budget = ptx::recorded_budget(image, entry);
 	static constexpr driver::Residency residency = driver::Residency::Ordinary;
 	using Params = P;
 };

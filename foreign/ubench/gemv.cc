@@ -50,7 +50,7 @@ struct GemvStreamKernel {
 	static constexpr EntryName name = entry_name("gemv_stream_r", row_tiles);
 	static constexpr std::string_view entry = name.view();
 	static constexpr driver::Dim grid = {.x = selfcheck::blocks, .y = 1, .z = 1};
-	static constexpr prims::Budget budget = recorded_budget(engine::gemv::bench_image, entry);
+	static constexpr prims::Budget budget = ptx::recorded_budget(engine::gemv::bench_image, entry);
 	static constexpr driver::Residency residency = driver::Residency::CoResident;
 	using Params = selfcheck::GemvStreamParams;
 
@@ -98,7 +98,7 @@ struct GemmPrefillKernel {
 	static constexpr ptx::Image image = engine::gemv::bench_image;
 	static constexpr std::string_view entry = which == PrefillMatrix::Down ? "gemm_prefill_down" : "gemm_prefill_gate_up";
 	static constexpr driver::Dim grid = {.x = selfcheck::blocks, .y = 1, .z = 1};
-	static constexpr prims::Budget budget = recorded_budget(engine::gemv::bench_image, entry);
+	static constexpr prims::Budget budget = ptx::recorded_budget(engine::gemv::bench_image, entry);
 	static constexpr driver::Residency residency = driver::Residency::Ordinary;
 	using Params = selfcheck::GemmBenchParams;
 	using Buffers = PrefillBuffers<which>;

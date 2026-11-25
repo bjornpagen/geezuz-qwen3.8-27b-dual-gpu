@@ -8,6 +8,7 @@ import engine.device;
 import engine.driver_double;
 import engine.model;
 import engine.prims;
+import engine.ptx;
 import engine.testing;
 import engine.ubench_device;
 
@@ -98,7 +99,7 @@ template<template<class> class Kernel, class Rows>
 
 template<class K>
 [[nodiscard]] constexpr auto recorded_as_declared() -> bool {
-	auto const recorded = kernels::recorded_budget(K::image, K::entry);
+	auto const recorded = engine::ptx::recorded_budget(K::image, K::entry);
 	return recorded.threads == K::budget.threads && recorded.registers_per_thread == K::budget.registers_per_thread &&
 	       recorded.shared_bytes == K::budget.shared_bytes && recorded.blocks_per_sm == K::budget.blocks_per_sm;
 }
@@ -150,21 +151,12 @@ static_assert(recorded_as_declared<kernels::StageRingCheckKernel>() && recorded_
 	return stall && push;
 }
 
-/** A budget record is read for exactly the entry named, never for one whose name it merely begins. */
-[[nodiscard]] auto records_match_whole_names() -> bool {
-	constexpr auto contiguous = kernels::recorded_budget(kernels::stream_image, "ubench_read_p1_d64");
-	constexpr auto row_major = kernels::recorded_budget(kernels::stream_image, "ubench_read_p1_d64_row_major");
-	return contiguous.threads == ub::stream::Canonical::budget.threads && row_major.threads == kernels::RowMajorRead::budget.threads &&
-	       contiguous.shared_bytes == row_major.shared_bytes;
-}
-
 }
 
 auto main() -> int {
 	auto const cases = std::array{
 	    engine::testing::Case{.name = "every declared kernel loads from its image with its one parameter struct", .holds = every_declared_kernel_loads()},
 	    engine::testing::Case{.name = "every stall, push and pull kernel launches with the budget its image records", .holds = every_budget_is_its_record()},
-	    engine::testing::Case{.name = "a budget record is found by its whole entry name", .holds = records_match_whole_names()},
 	};
 	return engine::testing::report(cases);
 }

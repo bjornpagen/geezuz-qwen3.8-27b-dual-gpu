@@ -3,3 +3,4 @@ export module engine.ptx;
 
 export import :image;
 export import :abi;
+export import :budget;
