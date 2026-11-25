@@ -22,6 +22,14 @@ struct Share {
 
 inline constexpr Count cards = 2;
 
+/** A card of the tensor-parallel pair, by its rank. */
+enum class Card : unsigned char {
+	Zero,
+	One,
+};
+
+static_assert(cards == 2, "one Card case per tensor-parallel rank");
+
 inline constexpr Count slots = 8;
 
 /** Verify rows come in tiles of the mma's n operand: tokens are the n8 side, weights the m16 side. */
