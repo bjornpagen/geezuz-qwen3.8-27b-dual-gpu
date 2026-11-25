@@ -4,11 +4,9 @@
 // device has no libm (no CUDA SDK), and two exponentials that differ in the last bit would let the two sides pick
 // different tokens from the same uniform.
 //
-// Why it is built from exact products and integers: the device compiles with fp contraction `fast`, which fuses any
-// floating-point product feeding an addition into an fma and ignores `#pragma clang fp contract`, while the host
-// does not fuse; a rounded product feeding an addition would therefore round differently on the two sides. Every
-// floating-point product below is exact (a power-of-two scaling, or a small integer times a short constant), so
-// fusing it changes nothing, and the series is evaluated in 64-bit fixed point.
+// Why it is built from exact products and integers: every floating-point product below is exact (a power-of-two
+// scaling, or a small integer times a short constant) and the series is evaluated in 64-bit fixed point, so
+// contraction cannot change a bit: fused or not, each sum rounds once from the same exact operands.
 #pragma once
 
 namespace engine::device::sampling {

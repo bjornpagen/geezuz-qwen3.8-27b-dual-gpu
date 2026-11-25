@@ -2,8 +2,8 @@
 //
 // The sampling arithmetic, held once for the device and the host reference: which candidates survive a request's
 // filters, their weights, how a uniform becomes a token, and how a drafted token is verified. Everything is
-// `constexpr` binary64 in which no rounded product feeds an addition (products only scale, divide or compare), so
-// the device's fp contraction has nothing to fuse and both compilers produce the same bits from the same fp32 logits
+// `constexpr` binary64 in which every floating-point product is exact or done in fixed point, or feeds only a
+// comparison, so contraction cannot change a bit and both compilers produce the same bits from the same fp32 logits
 // and the same uniforms. Raw pointers here are transient borrows of caller-owned arrays.
 #pragma once
 
