@@ -68,9 +68,10 @@ template<image::Catalog C>
 	auto const directory = std::filesystem::current_path() / "cards.scratch";
 	std::filesystem::remove_all(directory);
 	std::filesystem::create_directories(directory);
-	auto const paths = decode::Paths{.card_zero = directory / "card0.image", .card_one = directory / "card1.image", .host = directory / "host.image"};
-	auto const written = write_image<SyntheticCatalogs::CardZero>(paths.card_zero, 1) && write_image<SyntheticCatalogs::CardOne>(paths.card_one, 2) &&
-	                     write_image<SyntheticCatalogs::Host>(paths.host, 3);
+	auto const paths =
+	    decode::Paths{.card_zero = directory / "card0.image", .card_one = directory / "card1.image", .host = directory / "host.image"};
+	auto const written = write_image<SyntheticCatalogs::CardZero>(paths.card_zero, 1) &&
+	                     write_image<SyntheticCatalogs::CardOne>(paths.card_one, 2) && write_image<SyntheticCatalogs::Host>(paths.host, 3);
 	return written ? std::optional{paths} : std::nullopt;
 }
 
@@ -210,7 +211,12 @@ template<class S>
 }
 
 [[nodiscard]] auto row(std::size_t slot, std::uint64_t position, unsigned token) -> sched::Row {
-	return {.slot = kv::Slot::at(slot), .request = sched::RequestHandle{.bits = slot + 1}, .position = position, .token = token, .rule = rule(), .most = 8};
+	return {.slot = kv::Slot::at(slot),
+	        .request = sched::RequestHandle{.bits = slot + 1},
+	        .position = position,
+	        .token = token,
+	        .rule = rule(),
+	        .most = 8};
 }
 
 /** Runs one batch through draft and verify: its drafts as the pipeline sees them, and its outcome. */
@@ -268,21 +274,42 @@ struct Cycled {
 
 		// Continued, the row verifies the drafts the last cycle proposed, cut to the depth.
 		auto const continued = cycle(cards, sched::Batch{.depth = model::DraftDepth::Two, .rows = {row(0, 11, truth(11))}});
-		check(continued && continued->drafts.rows[0].count == 2 && std::ranges::equal(continued->drafts.rows[0].view(), std::array{proposal(11, 0), proposal(11, 1)}) &&
+		check(continued && continued->drafts.rows[0].count == 2 &&
+		      std::ranges::equal(continued->drafts.rows[0].view(), std::array{proposal(11, 0), proposal(11, 1)}) &&
 		      continued->done.rows[0].view().size() == 3 && continued->done.rows[0].tokens[2] == truth(14));
 
 		// A pool command queued before a chunk reaches the cards before the loops yield to it.
 		cards.apply(kv::SetTableEntry{.slot = kv::Slot::at(1), .entry = 0, .block = 5});
-		auto const chunk = sched::Chunk{.slot = kv::Slot::at(1), .request = sched::RequestHandle{.bits = 2}, .from = 0, .tokens = {1, 2, 3}, .read = sched::Read::Last, .rule = rule()};
-		auto const prompted = run(ex::when_all(cards.prefill(pipeline::Prefill{pipeline::Sampling{.chunk = chunk, .mask = everything()}}), until(loops, driver, 4)));
-		check(prompted.has_value() && std::get<0>(*prompted).sampled == std::optional{truth(3)} && std::get<0>(*prompted).took > std::chrono::nanoseconds{0});
+		auto const chunk = sched::Chunk{.slot = kv::Slot::at(1),
+		                                .request = sched::RequestHandle{.bits = 2},
+		                                .from = 0,
+		                                .tokens = {1, 2, 3},
+		                                .read = sched::Read::Last,
+		                                .rule = rule()};
+		auto const prompted = run(ex::when_all(cards.prefill(pipeline::Prefill{pipeline::Sampling{.chunk = chunk, .mask = everything()}}),
+		                                       until(loops, driver, 4)));
+		check(prompted.has_value() && std::get<0>(*prompted).sampled == std::optional{truth(3)} &&
+		      std::get<0>(*prompted).took > std::chrono::nanoseconds{0});
 
 		// The slot continues from its sampled token with the prompt end's drafts.
-		auto const after_prompt = cycle(cards, sched::Batch{.depth = model::DraftDepth::Three, .rows = {row(0, 14, truth(14)), sched::Row{.slot = kv::Slot::at(1), .request = sched::RequestHandle{.bits = 2}, .position = 3, .token = truth(3), .rule = rule(), .most = 8}}});
+		auto const after_prompt =
+		    cycle(cards, sched::Batch{.depth = model::DraftDepth::Three,
+			                          .rows = {row(0, 14, truth(14)), sched::Row{.slot = kv::Slot::at(1),
+			                                                                     .request = sched::RequestHandle{.bits = 2},
+			                                                                     .position = 3,
+			                                                                     .token = truth(3),
+			                                                                     .rule = rule(),
+			                                                                     .most = 8}}});
 		check(after_prompt && after_prompt->drafts.rows.size() == 2 && after_prompt->drafts.rows[1].count == 3 &&
-		      std::ranges::equal(after_prompt->drafts.rows[1].view(), std::array{proposal(3, 0), proposal(3, 1), proposal(3, 2)}) && after_prompt->masks == 8);
+		      std::ranges::equal(after_prompt->drafts.rows[1].view(), std::array{proposal(3, 0), proposal(3, 1), proposal(3, 2)}) &&
+		      after_prompt->masks == 8);
 
-		auto const reading = sched::Chunk{.slot = kv::Slot::at(2), .request = sched::RequestHandle{.bits = 3}, .from = 0, .tokens = {4, 5}, .read = sched::Read::Part, .rule = rule()};
+		auto const reading = sched::Chunk{.slot = kv::Slot::at(2),
+		                                  .request = sched::RequestHandle{.bits = 3},
+		                                  .from = 0,
+		                                  .tokens = {4, 5},
+		                                  .read = sched::Read::Part,
+		                                  .rule = rule()};
 		auto const read = run(ex::when_all(cards.prefill(pipeline::Prefill{pipeline::Reading{.chunk = reading}}), until(loops, driver, 6)));
 		check(read.has_value() && !std::get<0>(*read).sampled.has_value());
 	}
@@ -309,7 +336,8 @@ auto main() -> int {
 		return 1;
 	}
 	auto const cases = std::array{
-	    Case{.name = "the cards serve batches and chunks over decode and prefill, and tear down clean", .holds = serves_batches_and_chunks(*paths)},
+	    Case{.name = "the cards serve batches and chunks over decode and prefill, and tear down clean",
+		     .holds = serves_batches_and_chunks(*paths)},
 	};
 	return engine::testing::report(cases);
 }

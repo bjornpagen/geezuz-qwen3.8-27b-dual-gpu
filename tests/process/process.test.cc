@@ -21,7 +21,8 @@ using Clock = std::chrono::steady_clock;
 
 constexpr auto patience = std::chrono::milliseconds{10'000};
 
-[[nodiscard]] auto spawn(std::string_view program, std::vector<std::string> const& arguments) -> engine::core::Result<process::Child, process::ProcessError> {
+[[nodiscard]] auto spawn(std::string_view program, std::vector<std::string> const& arguments)
+    -> engine::core::Result<process::Child, process::ProcessError> {
 	return process::Child::spawn(std::filesystem::path{program}, arguments);
 }
 
@@ -78,7 +79,8 @@ constexpr auto patience = std::chrono::milliseconds{10'000};
 	auto const signalled = child->terminate().has_value();
 	auto const ended = child->wait_until(after(patience));
 	return quiet && std::holds_alternative<process::Quiet>(*quiet) && running && !running->has_value() && signalled && ended &&
-	       *ended == std::optional<process::Exit>{process::Signalled{.signal = process::termination_signal}} && child->terminate().has_value();
+	       *ended == std::optional<process::Exit>{process::Signalled{.signal = process::termination_signal}} &&
+	       child->terminate().has_value();
 }
 
 [[nodiscard]] auto an_overlong_line_is_refused() -> bool {
@@ -146,12 +148,14 @@ auto main(int argc, char** argv) -> int {
 	    Case{.name = "arguments reach the child, and its output comes back as a line", .holds = arguments_reach_the_child()},
 	    Case{.name = "lines arrive in order, empty and unterminated ones included", .holds = lines_arrive_in_order()},
 	    Case{.name = "the exit status is reported, the same on every wait", .holds = exit_status_is_reported()},
-	    Case{.name = "deadlines end reads and waits; terminate ends the child by SIGTERM", .holds = deadlines_end_waits_and_terminate_signals()},
+	    Case{.name = "deadlines end reads and waits; terminate ends the child by SIGTERM",
+		     .holds = deadlines_end_waits_and_terminate_signals()},
 	    Case{.name = "a line past the bound is refused", .holds = an_overlong_line_is_refused()},
 	    Case{.name = "a line exactly at the bound is read", .holds = a_line_at_the_bound_is_read()},
 	    Case{.name = "a missing program is refused as not found", .holds = a_missing_program_is_refused()},
 	    Case{.name = "dropping a running child kills it", .holds = dropping_a_running_child_kills_it()},
-	    Case{.name = "this process's output reaches a pipe as it is written", .holds = output_is_flushed(std::filesystem::path{arguments[0]})},
+	    Case{.name = "this process's output reaches a pipe as it is written",
+		     .holds = output_is_flushed(std::filesystem::path{arguments[0]})},
 	};
 	return engine::testing::report(cases);
 }

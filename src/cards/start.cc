@@ -86,7 +86,8 @@ export [[nodiscard]] auto start(std::filesystem::path const& directory) -> core:
 	if (auto const clocks = platform::check_memory_clocks(*devices, clock); !clocks) {
 		return std::unexpected(StartError{.reason = clocks.error()});
 	}
-	auto opened = decode::Decode::open(std::move(*devices), image_paths(directory), bake::checkpoint, std::chrono::steady_clock::now() + upload_patience);
+	auto opened = decode::Decode::open(std::move(*devices), image_paths(directory), bake::checkpoint,
+	                                   std::chrono::steady_clock::now() + upload_patience);
 	if (!opened) {
 		return std::unexpected(StartError{.reason = opened.error()});
 	}

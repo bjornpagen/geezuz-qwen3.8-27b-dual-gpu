@@ -25,7 +25,8 @@ namespace ex = engine::exec;
 
 using Clock = std::chrono::steady_clock;
 
-static_assert(std::same_as<decltype(pipeline::RowMask{}.card(model::Card::Zero)), decode::CardMask>, "the pipeline's row masks are what the cards read");
+static_assert(std::same_as<decltype(pipeline::RowMask{}.card(model::Card::Zero)), decode::CardMask>,
+              "the pipeline's row masks are what the cards read");
 static_assert(pipeline::max_drafts == decode::max_drafts, "a pipeline draft row holds every draft the cards keep");
 
 /** How long teardown waits for the loops to end: a cycle takes milliseconds, so loops silent this long are gone. */
@@ -65,7 +66,8 @@ template<decode::Catalogs C>
 [[nodiscard]] auto streams(decode::Engine<C> const& engine) -> prefill::CardStreams {
 	auto const zero = engine.card(model::Card::Zero);
 	auto const one = engine.card(model::Card::One);
-	return {prefill::CardStream{.context = zero.context, .stream = zero.stream}, prefill::CardStream{.context = one.context, .stream = one.stream}};
+	return {prefill::CardStream{.context = zero.context, .stream = zero.stream},
+	        prefill::CardStream{.context = one.context, .stream = one.stream}};
 }
 
 /** The pipeline's draft rows from what the cards verify per row: a fresh row verifies none. */
@@ -178,7 +180,6 @@ struct Tail {
 		    *begun,
 		    [&mask](std::size_t /*index*/, model::Card card) -> decode::CardMask {
 			    return mask.card(card);
-
 		    },
 		    begun->mask_count());
 		if (!published) {
@@ -261,8 +262,11 @@ public:
 	/** Publishes the batch's masks, then completes with its outcome and the masks' buffer once both cards answer. */
 	[[nodiscard]] auto verify(pipeline::Masks masks) {
 		core::invariant(pending_.has_value());
-		auto answer =
-		    Answer<C>{.engine = *engine_, .pending = *std::exchange(pending_, std::nullopt), .masks = {}, .refused = std::nullopt, .started = started_};
+		auto answer = Answer<C>{.engine = *engine_,
+		                        .pending = *std::exchange(pending_, std::nullopt),
+		                        .masks = {},
+		                        .refused = std::nullopt,
+		                        .started = started_};
 		answer.masks = std::move(masks);
 		auto const& rows = answer.masks.rows;
 		auto published = engine_->publish(
@@ -288,8 +292,7 @@ public:
 		    },
 		    work);
 		auto tail = Tail<C>{.engine = *engine_, .work = std::move(work), .pending = std::nullopt, .started = Clock::now()};
-		return card_scheduler::polled(Yield<C>{.engine = *engine_}) |
-		       ex::let_value([&engine = *engine_, &chunks = *chunks_, chunk] {
+		return card_scheduler::polled(Yield<C>{.engine = *engine_}) | ex::let_value([&engine = *engine_, &chunks = *chunks_, chunk] {
 			       auto ran = chunks.run(memories(engine), chunk, streams(engine)).transform_error([](device::DeviceError failed) {
 				       return as_decode(std::move(failed));
 			       });
