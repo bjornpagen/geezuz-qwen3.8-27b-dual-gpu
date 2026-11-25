@@ -550,6 +550,91 @@ auto Parser::arguments(std::string_view name, std::string_view body) -> std::str
 	return out;
 }
 
+/** The string `put_string` wrote at the front of `text`, read back, and the bytes it took. */
+struct ReadString {
+	std::string value;
+	std::size_t length;
+};
+
+[[nodiscard]] auto read_string(std::string_view text) -> ReadString {
+	core::invariant(text.starts_with('"'));
+	auto out = ReadString{.value = {}, .length = 1};
+	while (true) {
+		core::invariant(out.length < text.size());
+		auto const byte = text[out.length];
+		if (byte == '"') {
+			out.length += 1;
+			return out;
+		}
+		if (byte != '\\') {
+			out.value.push_back(byte);
+			out.length += 1;
+			continue;
+		}
+		core::invariant(out.length + 1 < text.size());
+		auto const escape = text[out.length + 1];
+		out.length += 2;
+		switch (escape) {
+		case '"':
+		case '\\':
+			out.value.push_back(escape);
+			break;
+		case 'n':
+			out.value.push_back('\n');
+			break;
+		case 'r':
+			out.value.push_back('\r');
+			break;
+		case 't':
+			out.value.push_back('\t');
+			break;
+		case 'b':
+			out.value.push_back('\b');
+			break;
+		case 'f':
+			out.value.push_back('\f');
+			break;
+		default: {
+			// `put_string` writes every other control as `\u00xx`, lowercase.
+			core::invariant(escape == 'u' && out.length + 4 <= text.size() && text.substr(out.length, 2) == "00");
+			auto code = 0U;
+			auto const digits = text.substr(out.length + 2, 2);
+			auto const read = std::from_chars(digits.data(), std::to_address(digits.end()), code, 16);
+			core::invariant(read.ptr == std::to_address(digits.end()) && code < 0x20U);
+			out.value.push_back(static_cast<char>(code));
+			out.length += 4;
+		}
+		}
+	}
+}
+
+/**
+ * A custom tool call's input, read back from the arguments the parser reports for it: a custom tool's one parameter,
+ * `input`, is never cast, so its arguments are an object of strings as `json.dumps` writes them, which this reads
+ * exactly. Nothing when the model wrote no `input` parameter. Arguments of any other shape are a caller's bug.
+ */
+export [[nodiscard]] auto custom_input(std::string_view arguments) -> std::optional<std::string> {
+	core::invariant(arguments.starts_with('{') && arguments.ends_with('}'));
+	auto rest = arguments.substr(1, arguments.size() - 2);
+	auto input = std::optional<std::string>{};
+	while (!rest.empty()) {
+		auto const name = read_string(rest);
+		rest.remove_prefix(name.length);
+		core::invariant(rest.starts_with(": "));
+		rest.remove_prefix(2);
+		auto const value = read_string(rest);
+		rest.remove_prefix(value.length);
+		if (name.value == "input") {
+			input = value.value;
+		}
+		if (!rest.empty()) {
+			core::invariant(rest.starts_with(", "));
+			rest.remove_prefix(2);
+		}
+	}
+	return input;
+}
+
 /** A call in a whole reply: its name and its arguments' JSON. */
 export struct ParsedCall {
 	std::string name;

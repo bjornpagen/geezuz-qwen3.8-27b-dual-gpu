@@ -156,6 +156,38 @@ template<class Holds>
 	return reply && reply->calls.size() == 1 && reply->calls.front().arguments == R"({"input": "42"})";
 }
 
+/**
+ * A custom call's input reads back from its parsed arguments as exactly the text the model wrote between the
+ * parameter's tags: quotes, backslashes, every control, newlines at either end, non-ascii. A call that wrote no
+ * `input` reads back as none, whatever else it wrote.
+ */
+[[nodiscard]] auto custom_input_reads_back(std::uint64_t seed) -> bool {
+	auto const tools = std::array{json::Tool{.name = "run", .description = std::nullopt, .input = json::CustomTool{.grammar = std::nullopt}}};
+	auto rng = engine::testing::generator(seed);
+	auto alphabet = std::vector<std::string>{"a", "Z", "0", " ", "\"", "\\", "\n", "\r", "\t", "{", "}", ":", ",", "é", "日", "/", ">"};
+	for (auto control = 0; control < 0x20; ++control) {
+		alphabet.emplace_back(1, static_cast<char>(control));
+	}
+	for (auto round = 0; round < 500; ++round) {
+		auto text = std::string{};
+		for (auto length = rng() % 40; length > 0; --length) {
+			text += alphabet[rng() % alphabet.size()];
+		}
+		auto const other = round % 3 == 0;
+		auto const call = std::format("<tool_call>\n<function=run>\n<parameter={}>\n{}\n</parameter>\n</function>\n</tool_call>",
+		                              other ? "note" : "input", text);
+		auto const reply = one_shot(Under{.tools = tools, .thinking = chat::Thinking::Disabled}, call);
+		if (!reply || reply->calls.size() != 1) {
+			return false;
+		}
+		auto const input = chat::custom_input(reply->calls.front().arguments);
+		if (other ? input.has_value() : input != text) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // The round trip: a reply written in the template's own format parses back to itself.
 
 inline constexpr auto solid = std::to_array<std::string_view>(
@@ -295,6 +327,7 @@ auto main() -> int {
 	    engine::testing::Case{.name = "object and array casts read strict JSON: repeated keys and NaN stay text",
 		                      .holds = structured_casts_stay_json()},
 	    engine::testing::Case{.name = "a custom tool's input is never cast", .holds = custom_input_is_never_cast()},
+	    engine::testing::Case{.name = "a custom call's input reads back from its arguments exactly (seed 1)", .holds = custom_input_reads_back(1)},
 	    engine::testing::Case{.name = "replies written as the template writes them parse back to themselves (seed 1)",
 		                      .holds = replies_round_trip(1)},
 	    engine::testing::Case{.name = "replies written as the template writes them parse back to themselves (seed 2)",
