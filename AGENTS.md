@@ -24,6 +24,10 @@ These decide every case this file does not spell out.
   is thrown away is a validator; return a type that carries what was learned and delete the downstream re-checks.
   A string that names a thing is a missing type. A switch on a tag repeated in two places is a polymorphism not yet
   named. Do not force two genuinely different cases into one representation; that hides the branch in a flag.
+- **Fail closed, as early as possible.** Every refusal happens at the first boundary that can decide it: a malformed
+  request, an unsupported parameter or grammar feature, a mismatched image, a wrong machine, an unexpected clock.
+  What the engine does not implement exactly is refused by name, never approximated, translated or ignored, and
+  nothing proceeds on a guess that a later stage might catch.
 - **A choice is a type or an enum case, never a `bool`.** A parameter, field or configuration that selects
   behaviour or state is an `enum class`, a `std::variant` or a type. A predicate (a question with a yes/no answer)
   may return `bool`.

@@ -413,6 +413,13 @@ boundary.
     results. a sender per phase would bring back ~340 launches per cycle.
   - the http reactor stays cpp-starter's owner-driven epoll state machine.
 - **api**:
+  - the reference is the newest openai sdk's chat completions types (openai-python's generated types for the latest
+    release, pinned in PINS.md): every modern field and shape is honoured or refused by name; deprecated and legacy
+    shapes (e.g. `functions` / `function_call`, `max_tokens` where the sdk has replaced it) are refused, never
+    translated.
+  - fail closed, as early as possible: every refusal happens at the first boundary that can decide it. a request is
+    validated whole at the http boundary, including compiling its grammar (1.4b) under compile-time size bounds, so
+    an unsupported schema or grammar feature is a named 400 before the request is admitted.
   - `/v1/chat/completions`, streaming and not: `messages`, `tools`, `tool_choice`, `stream`, `max_tokens`,
     `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`, and `chat_template_kwargs` (`enable_thinking`,
     `reasoning_effort`, `preserve_thinking`).
