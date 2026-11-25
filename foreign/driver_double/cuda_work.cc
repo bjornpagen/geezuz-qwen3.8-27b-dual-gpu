@@ -96,7 +96,7 @@ auto fake_event_record(CUevent event, CUstream stream) -> Status {
 	if (injected()) {
 		return Status::Unknown;
 	}
-	auto const* const marker = find_object(event, Kind::Event);
+	auto* const marker = find_object(event, Kind::Event);
 	auto const* const queue = find_object(stream, Kind::Stream);
 	if (!live_object(marker) || !live_object(queue)) {
 		return Status::InvalidHandle;
@@ -105,6 +105,7 @@ auto fake_event_record(CUevent event, CUstream stream) -> Status {
 		violate(Violation::WrongContext);
 		return Status::InvalidHandle;
 	}
+	marker->pending = state().machine.pending_queries;
 	return Status::Success;
 }
 
@@ -112,8 +113,16 @@ auto fake_event_query(CUevent event) -> Status {
 	if (injected()) {
 		return Status::Unknown;
 	}
-	// The fake runs no work, so whatever an event was recorded after has finished.
-	return live_object(find_object(event, Kind::Event)) ? Status::Success : Status::InvalidHandle;
+	// The fake runs no work: an event's work counts as running for the machine's number of queries, then finished.
+	auto* const marker = find_object(event, Kind::Event);
+	if (!live_object(marker)) {
+		return Status::InvalidHandle;
+	}
+	if (marker->pending > 0) {
+		--marker->pending;
+		return Status::NotReady;
+	}
+	return Status::Success;
 }
 
 auto fake_module_load_data_ex(CUmodule* module, void const* image, unsigned int count, driver::JitOption* options, void** values)

@@ -4,11 +4,13 @@ export module engine.driver:context;
 import std;
 import engine.core;
 import engine.ptx;
+import engine.hugepage;
 import :abi;
 import :error;
 import :memory;
 import :stream;
 import :program;
+import :transfer;
 
 namespace engine::driver {
 
@@ -72,26 +74,95 @@ public:
 			    return call(api_.mem_alloc, &address, DeviceArray<T, Count>::bytes);
 		    })
 		    .transform([&] {
-			    return DeviceArray<T, Count>{api_.mem_free, address};
+			    return DeviceArray<T, Count>{api_.mem_free, ordinal_, address};
 		    });
 	}
 
 	template<Wire T, std::size_t Count>
 	[[nodiscard]] auto allocate_mapped() const -> core::Result<MappedArray<T, Count>, DeviceError> {
-		static_assert(alignof(T) <= 4096, "pinned memory is page-aligned");
-		auto* host = static_cast<void*>(nullptr);
-		auto made = make_current()
-		                .and_then([&] {
-			                return call(api_.mem_host_alloc, &host, MappedArray<T, Count>::bytes, host_alloc_device_map);
-		                })
-		                .transform([&] {
-			                return MappedArray<T, Count>{api_.mem_free_host, host};
-		                });
-		if (!made) {
-			return made;
+		auto region = hugepage::Region::allocate(MappedArray<T, Count>::bytes);
+		if (!region) {
+			return std::unexpected(DeviceError{.reason = region.error()});
 		}
-		return call(api_.mem_host_get_device_pointer, &made->device_, host, 0U).transform([&] {
-			return std::move(*made);
+		auto mapped = MappedArray<T, Count>{std::move(*region)};
+		auto* const base = static_cast<void*>(mapped.region_.bytes().data());
+		auto const pinned = make_current().and_then([&] {
+			return call(api_.mem_host_register, base, mapped.region_.bytes().size(), host_register_portable | host_register_device_map);
+		});
+		if (!pinned) {
+			return std::unexpected(pinned.error());
+		}
+		mapped.unregister_ = api_.mem_host_unregister;
+		return call(api_.mem_host_get_device_pointer, &mapped.device_, base, 0U).transform([&] {
+			return std::move(mapped);
+		});
+	}
+
+	/**
+	 * Pins `owner`'s bytes read-only so copies read them straight over pcie, for both cards. The owner is consumed: a
+	 * refused pin releases it with the error.
+	 */
+	template<HostBytes Owner>
+	[[nodiscard]] auto pin(Owner owner) const -> core::Result<PinnedSource<Owner>, DeviceError> {
+		auto source = PinnedSource<Owner>{std::move(owner)};
+		auto const bytes = source.pinned();
+		core::invariant(!bytes.empty());
+		/* SAFETY: a read-only registration: the driver reads these bytes and never writes them. */
+		auto* const base = const_cast<std::byte*>(bytes.data());
+		auto const pinned = make_current().and_then([&] {
+			return call(api_.mem_host_register, static_cast<void*>(base), bytes.size(), host_register_portable | host_register_read_only);
+		});
+		if (!pinned) {
+			return std::unexpected(pinned.error());
+		}
+		source.unregister_ = api_.mem_host_unregister;
+		source.base_ = base;
+		return source;
+	}
+
+	/**
+	 * Copies `DeviceArray<T, Count>::bytes` of `source`'s pinned bytes, from `offset`, into `destination` on this card,
+	 * on `stream`: the weights from a pinned image mapping, or staging from mapped memory.
+	 */
+	template<Wire T, std::size_t Count, PinnedBytes Source>
+	[[nodiscard]] auto upload(Stream const& stream, DeviceArray<T, Count> destination, Source source, std::size_t offset) const
+	    -> Transfer<DeviceArray<T, Count>, Source> {
+		constexpr auto bytes = DeviceArray<T, Count>::bytes;
+		auto const pinned = source.pinned();
+		core::invariant(stream.ordinal_ == ordinal_ && destination.ordinal_ == ordinal_);
+		core::invariant(offset <= pinned.size() && pinned.size() - offset >= bytes);
+		auto const to = destination.address();
+		auto const* const from = pinned.subspan(offset, bytes).data();
+		return enqueue(stream, std::move(destination), std::move(source), [&] {
+			return call(api_.memcpy_htod_async, to, static_cast<void const*>(from), bytes, stream.handle_);
+		});
+	}
+
+	/** Copies `source` on this card into mapped host memory, on `stream`. */
+	template<Wire T, std::size_t Count>
+	[[nodiscard]] auto download(Stream const& stream, MappedArray<T, Count> destination, DeviceArray<T, Count> source) const
+	    -> Transfer<MappedArray<T, Count>, DeviceArray<T, Count>> {
+		core::invariant(stream.ordinal_ == ordinal_ && source.ordinal_ == ordinal_);
+		auto* const to = static_cast<void*>(destination.host().data());
+		auto const from = source.address();
+		return enqueue(stream, std::move(destination), std::move(source), [&] {
+			return call(api_.memcpy_dtoh_async, to, from, DeviceArray<T, Count>::bytes, stream.handle_);
+		});
+	}
+
+	/**
+	 * Copies `source` on the `peer` card into `destination` on this card, on this card's `stream`: card to card over
+	 * the nvlink path the machine was opened with, never through the host.
+	 */
+	template<Wire T, std::size_t Count>
+	[[nodiscard]] auto copy_from_peer(Stream const& stream, DeviceArray<T, Count> destination, Context const& peer,
+	                                  DeviceArray<T, Count> source) const -> Transfer<DeviceArray<T, Count>, DeviceArray<T, Count>> {
+		core::invariant(peer.ordinal_ != ordinal_ && stream.ordinal_ == ordinal_);
+		core::invariant(destination.ordinal_ == ordinal_ && source.ordinal_ == peer.ordinal_);
+		auto const to = destination.address();
+		auto const from = source.address();
+		return enqueue(stream, std::move(destination), std::move(source), [&] {
+			return call(api_.memcpy_peer_async, to, handle_, from, peer.handle_, DeviceArray<T, Count>::bytes, stream.handle_);
 		});
 	}
 
@@ -176,6 +247,24 @@ public:
 
 private:
 	Context(Api const& api, CUdevice ordinal, CUcontext handle) : api_{api}, ordinal_{ordinal}, handle_{handle} {}
+
+	/** Enqueues `copy` and its completion event; whatever fails, the buffers come back in the transfer. */
+	template<class Destination, class Source, class Copy>
+	[[nodiscard]] auto enqueue(Stream const& stream, Destination destination, Source source, Copy copy) const
+	    -> Transfer<Destination, Source> {
+		auto event = create_event();
+		auto const started = event
+		                         .and_then([&](Event const&) {
+			                         return copy();
+		                         })
+		                         .and_then([&] {
+			                         return event->record(stream);
+		                         });
+		if (!started) {
+			return Transfer<Destination, Source>{std::move(destination), std::move(source), started.error()};
+		}
+		return Transfer<Destination, Source>{std::move(destination), std::move(source), std::move(*event)};
+	}
 
 	[[nodiscard]] auto make_current() const -> core::Result<void, DeviceError> {
 		return call(api_.ctx_set_current, handle_);

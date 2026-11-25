@@ -11,3 +11,5 @@ if(ENGINE_PLATFORM STREQUAL "darwin")
 endif()
 
 engine_compile_fail(kernel_grid_exceeds_cards SOURCE crowded_kernel.cc LINK engine_device MATCH "a co-resident grid fits the cards at its budget")
+engine_test(device.transfer SOURCES transfer.test.cc LINK engine_device engine_driver_double engine_file engine_hugepage)
+engine_death_test(device.transfer_pending_aborts SOURCES transfer_pending.test.cc LINK engine_device engine_driver_double)

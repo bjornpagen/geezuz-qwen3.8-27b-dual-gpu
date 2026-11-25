@@ -63,9 +63,12 @@ public:
 		            .ctx_enable_peer_access = {.function = fake_ctx_enable_peer_access},
 		            .mem_alloc = {.function = fake_mem_alloc},
 		            .mem_free = {.function = fake_mem_free},
-		            .mem_host_alloc = {.function = fake_mem_host_alloc},
-		            .mem_free_host = {.function = fake_mem_free_host},
+		            .mem_host_register = {.function = fake_mem_host_register},
+		            .mem_host_unregister = {.function = fake_mem_host_unregister},
 		            .mem_host_get_device_pointer = {.function = fake_mem_host_get_device_pointer},
+		            .memcpy_htod_async = {.function = fake_memcpy_htod_async},
+		            .memcpy_dtoh_async = {.function = fake_memcpy_dtoh_async},
+		            .memcpy_peer_async = {.function = fake_memcpy_peer_async},
 		            .stream_create = {.function = fake_stream_create},
 		            .stream_destroy = {.function = fake_stream_destroy},
 		            .stream_wait_event = {.function = fake_stream_wait_event},
@@ -112,7 +115,7 @@ public:
 		case Kind::DeviceMemory:
 			return core::narrow<std::size_t>(std::ranges::count_if(state_->device_blocks | std::views::values, is_live));
 		case Kind::HostMemory:
-			return core::narrow<std::size_t>(std::ranges::count_if(state_->host_blocks | std::views::values, is_live));
+			return core::narrow<std::size_t>(std::ranges::count_if(state_->registrations | std::views::values, is_live));
 		case Kind::Stream:
 		case Kind::Event:
 			return core::narrow<std::size_t>(std::ranges::count_if(state_->objects, [&](Object const& object) {

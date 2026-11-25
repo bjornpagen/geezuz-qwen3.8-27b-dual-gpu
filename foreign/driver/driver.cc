@@ -9,5 +9,6 @@ export import :management;
 export import :memory;
 export import :stream;
 export import :program;
+export import :transfer;
 export import :context;
 export import :ring;

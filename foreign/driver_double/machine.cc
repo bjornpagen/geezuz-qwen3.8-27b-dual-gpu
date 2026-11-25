@@ -40,6 +40,7 @@ export struct JitRejects {
 /**
  * The machine the fake driver models. `failing_call` names the one vendor call, counted from zero across CUDA and
  * NVML in call order, that fails with the library's "unknown" status: a search over it reaches every failure path.
+ * `pending_queries` is how many times a recorded event answers "not ready" before its work counts as done.
  */
 export struct Machine {
 	int driver_version = 13030;
@@ -47,6 +48,7 @@ export struct Machine {
 	std::vector<CardModel> cards = {CardModel{}, CardModel{}};
 	std::optional<std::size_t> failing_call = std::nullopt;
 	std::variant<JitAccepts, JitRejects> jit = JitAccepts{};
+	std::size_t pending_queries = 0;
 };
 
 /** The kinds of driver resource the fake accounts for. */
@@ -69,6 +71,8 @@ export enum class Violation : std::uint8_t {
 	NoCurrentContext,
 	DestroyedCurrentContext,
 	WrongContext,
+	Unpinned,
+	OutOfBounds,
 };
 
 /** One launch as the fake driver saw it: the kernel, its geometry and the exact parameter bytes it was given. */

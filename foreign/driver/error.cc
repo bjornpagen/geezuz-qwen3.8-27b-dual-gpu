@@ -3,6 +3,7 @@ export module engine.driver:error;
 
 import std;
 import engine.core;
+import engine.hugepage;
 import :abi;
 
 namespace engine::driver {
@@ -180,7 +181,7 @@ export struct KernelSignature {
 /** Every way bringing up or using the two cards can fail. */
 export struct [[nodiscard]] DeviceError {
 	std::variant<DriverUnavailable, DriverTooOld, CardCount, WrongCard, PeerUnreachable, NotNvlink, Failure, ManagementFailure,
-	             ModuleRejected, KernelMissing, KernelSignature>
+	             ModuleRejected, KernelMissing, KernelSignature, hugepage::HugepageError>
 	    reason;
 
 	[[nodiscard]] auto retry() const -> core::Retry {

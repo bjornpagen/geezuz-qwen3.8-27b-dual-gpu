@@ -32,30 +32,32 @@ enum class Life : std::uint8_t {
 	Orphaned,
 };
 
-struct alignas(4096) Page {
-	std::array<std::byte, 4096> bytes;
-};
-
 struct ContextRecord {
 	int retains;
 };
 
+/** A device allocation; its contents exist only once a copy touches it, so planning-sized blocks cost nothing. */
 struct DeviceBlock {
 	CUdevice ordinal;
 	std::size_t bytes;
 	Life life;
+	std::vector<std::byte> contents;
 };
 
-struct HostBlock {
+/** A pinned host range: the memory is the caller's, the fake only records the pin. */
+struct Registration {
 	CUdevice ordinal;
-	std::unique_ptr<Page[]> pages;
+	std::size_t bytes;
+	unsigned int flags;
 	Life life;
 };
 
+/** A stream or an event; an event recorded answers "not ready" to its next `pending` queries. */
 struct Object {
 	Kind kind;
 	CUdevice ordinal;
 	Life life;
+	std::size_t pending;
 };
 
 struct ModuleRecord {
@@ -83,7 +85,7 @@ struct State {
 	std::optional<CUdevice> current;
 	std::map<CUdeviceptr, DeviceBlock> device_blocks;
 	CUdeviceptr next_address = 0x7f00'0000'0000;
-	std::map<void const*, HostBlock> host_blocks;
+	std::map<void const*, Registration> registrations;
 	std::deque<Object> objects;
 	std::deque<ModuleRecord> modules;
 	std::deque<FunctionRecord> functions;
@@ -165,10 +167,8 @@ auto destroy_context(CUdevice ordinal) -> void {
 	for (auto& [address, block] : machine.device_blocks) {
 		std::ignore = orphan(block, ordinal);
 	}
-	for (auto& [address, block] : machine.host_blocks) {
-		if (orphan(block, ordinal)) {
-			block.pages.reset();
-		}
+	for (auto& [address, registration] : machine.registrations) {
+		std::ignore = orphan(registration, ordinal);
 	}
 	for (auto& object : machine.objects) {
 		std::ignore = orphan(object, ordinal);
@@ -219,7 +219,7 @@ template<class Handle>
 	if (!ordinal) {
 		return Status::InvalidContext;
 	}
-	auto& object = state().objects.emplace_back(Object{.kind = kind, .ordinal = *ordinal, .life = Life::Live});
+	auto& object = state().objects.emplace_back(Object{.kind = kind, .ordinal = *ordinal, .life = Life::Live, .pending = 0});
 	*handle = reinterpret_cast<Handle>(&object);
 	return Status::Success;
 }

@@ -88,6 +88,8 @@ export enum class Status : int {
 	NotReady = 600,
 	LaunchOutOfResources = 701,
 	PeerAccessAlreadyEnabled = 704,
+	HostMemoryAlreadyRegistered = 712,
+	HostMemoryNotRegistered = 713,
 	ContextIsDestroyed = 709,
 	LaunchFailed = 719,
 	CooperativeLaunchTooLarge = 720,
@@ -115,10 +117,12 @@ export enum class FunctionAttribute : int {
 	MaxDynamicSharedSizeBytes = 8,
 };
 
-/** Flag values of `cuStreamCreate`, `cuEventCreate` and `cuMemHostAlloc`. */
+/** Flag values of `cuStreamCreate`, `cuEventCreate` and `cuMemHostRegister_v2`. */
 export inline constexpr unsigned int stream_non_blocking = 0x1;
 export inline constexpr unsigned int event_disable_timing = 0x2;
-export inline constexpr unsigned int host_alloc_device_map = 0x2;
+export inline constexpr unsigned int host_register_portable = 0x1;
+export inline constexpr unsigned int host_register_device_map = 0x2;
+export inline constexpr unsigned int host_register_read_only = 0x8;
 
 /** `nvmlReturn_t`: nvml.h's `NVML_ERROR_*` values in camel case; like `Status`, open to values not named here. */
 export enum class ManagementStatus : int {
@@ -186,9 +190,12 @@ export struct Api {
 	Entry<"cuCtxEnablePeerAccess", Status(CUcontext, unsigned int)> ctx_enable_peer_access;
 	Entry<"cuMemAlloc_v2", Status(CUdeviceptr*, std::size_t)> mem_alloc;
 	Entry<"cuMemFree_v2", Status(CUdeviceptr)> mem_free;
-	Entry<"cuMemHostAlloc", Status(void**, std::size_t, unsigned int)> mem_host_alloc;
-	Entry<"cuMemFreeHost", Status(void*)> mem_free_host;
+	Entry<"cuMemHostRegister_v2", Status(void*, std::size_t, unsigned int)> mem_host_register;
+	Entry<"cuMemHostUnregister", Status(void*)> mem_host_unregister;
 	Entry<"cuMemHostGetDevicePointer_v2", Status(CUdeviceptr*, void*, unsigned int)> mem_host_get_device_pointer;
+	Entry<"cuMemcpyHtoDAsync_v2", Status(CUdeviceptr, void const*, std::size_t, CUstream)> memcpy_htod_async;
+	Entry<"cuMemcpyDtoHAsync_v2", Status(void*, CUdeviceptr, std::size_t, CUstream)> memcpy_dtoh_async;
+	Entry<"cuMemcpyPeerAsync", Status(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, std::size_t, CUstream)> memcpy_peer_async;
 	Entry<"cuStreamCreate", Status(CUstream*, unsigned int)> stream_create;
 	Entry<"cuStreamDestroy_v2", Status(CUstream)> stream_destroy;
 	Entry<"cuStreamWaitEvent", Status(CUstream, CUevent, unsigned int)> stream_wait_event;
