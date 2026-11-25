@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// A device image the ptx gate must reject.
+.version 9.3
+.target sm_86
+.address_size 64
+
+.visible .const .align 4 .b8 engine_budget_probe[16] = {64, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 1};
+.visible .entry probe(
+	.param .u64 .ptr .align 1 probe_param_0
+)
+.maxntid 32
+.minnctapersm 1
+{
+	.reg .b32 	%r<8>;
+	mul.rn.f32 	%r3, %r1, %r2;
+	add.rn.f32 	%r5, %r3, %r4;
+	ret;
+}

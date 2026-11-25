@@ -56,8 +56,9 @@ set(ENGINE_DEVICE_FLAGS
 # engine_device_ptx(<name> SOURCE <tu.cu>)
 #
 # Compiles one device translation unit to `<build>/ptx/<name>.ptx` (one loadable image per translation unit) under
-# target `engine_ptx_<name>`. On linux the same ptx then passes `ptxas -v` with spills as errors; in the lint build
-# the translation unit also passes clang-tidy with the device flags.
+# target `engine_ptx_<name>`. The ptx then passes the static gate (cmake/ptx_gate.cmake), on linux including
+# `ptxas -v` with spills as errors; in the lint build the translation unit also passes clang-tidy with the device
+# flags.
 function(engine_device_ptx name)
 	cmake_parse_arguments(PARSE_ARGV 1 arg "" "SOURCE" "")
 	if(NOT arg_SOURCE OR arg_UNPARSED_ARGUMENTS)
@@ -74,18 +75,24 @@ function(engine_device_ptx name)
 		COMMAND_EXPAND_LISTS
 		VERBATIM
 	)
-	set(outputs "${ptx}")
+	# The static gate: rounding pinned (no .approx, no .ftz, .rn on every floating-point operation) and every kernel's
+	# occupancy stated; on linux the same ptx also passes ptxas -v, spill-free, with registers its occupancy holds.
+	set(gate "${ENGINE_PTX_DIR}/${name}.gate.stamp")
+	set(gate_arguments -DPTX=${ptx} -DSTAMP=${gate})
+	set(gate_outputs "${gate}")
 	if(ENGINE_PLATFORM STREQUAL "linux")
 		set(cubin "${ENGINE_PTX_DIR}/${name}.ptxas.cubin")
-		add_custom_command(
-			OUTPUT "${cubin}"
-			COMMAND "${ENGINE_PTXAS}" -arch=sm_${ENGINE_SM} -v --warn-on-spills --Werror -o "${cubin}" "${ptx}"
-			DEPENDS "${ptx}"
-			COMMENT "ptxas gate ${name}"
-			VERBATIM
-		)
-		list(APPEND outputs "${cubin}")
+		list(APPEND gate_arguments -DPTXAS=${ENGINE_PTXAS} -DSM=${ENGINE_SM} -DCUBIN=${cubin})
+		list(APPEND gate_outputs "${cubin}")
 	endif()
+	add_custom_command(
+		OUTPUT ${gate_outputs}
+		COMMAND "${CMAKE_COMMAND}" ${gate_arguments} -P "${PROJECT_SOURCE_DIR}/cmake/ptx_gate.cmake"
+		DEPENDS "${ptx}" "${PROJECT_SOURCE_DIR}/cmake/ptx_gate.cmake"
+		COMMENT "ptx gate ${name}"
+		VERBATIM
+	)
+	set(outputs "${ptx}" ${gate_outputs})
 	if(ENGINE_BUILD STREQUAL "lint")
 		set(stamp "${ENGINE_PTX_DIR}/${name}.tidy.stamp")
 		add_custom_command(
