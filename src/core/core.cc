@@ -55,4 +55,21 @@ export template<std::integral To, std::integral From>
 	return static_cast<To>(value);
 }
 
+/** The variant's `T` alternative as a borrow, or nullopt when it holds another: `std::get_if` without a pointer. */
+export template<class T, class... Alternatives>
+[[nodiscard]] constexpr auto alternative(std::variant<Alternatives...>& value) -> std::optional<T&> {
+	if (!std::holds_alternative<T>(value)) {
+		return std::nullopt;
+	}
+	return std::get<T>(value);
+}
+
+export template<class T, class... Alternatives>
+[[nodiscard]] constexpr auto alternative(std::variant<Alternatives...> const& value) -> std::optional<T const&> {
+	if (!std::holds_alternative<T>(value)) {
+		return std::nullopt;
+	}
+	return std::get<T>(value);
+}
+
 }

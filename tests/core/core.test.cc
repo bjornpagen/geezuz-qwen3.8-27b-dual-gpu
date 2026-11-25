@@ -48,6 +48,33 @@ template<std::integral To>
 	           std::uint64_t{std::numeric_limits<std::int64_t>::max()};
 }
 
+using Shape = std::variant<std::int32_t, std::string>;
+
+/** Over every alternative a variant can hold: the borrow exists exactly for the held one, and it is that object. */
+[[nodiscard]] auto alternative_borrows_exactly_the_held_alternative() -> bool {
+	auto holds = true;
+	for (auto shape : {Shape{std::int32_t{7}}, Shape{std::string{"seven"}}}) {
+		auto const number = engine::core::alternative<std::int32_t>(shape);
+		auto const text = engine::core::alternative<std::string>(shape);
+		holds = holds && number.has_value() == (shape.index() == 0) && text.has_value() == (shape.index() == 1);
+		if (number) {
+			*number = 8;
+			holds = holds && std::get<std::int32_t>(shape) == 8;
+		}
+		if (text) {
+			text->append("!");
+			holds = holds && std::get<std::string>(shape) == "seven!";
+		}
+		auto const& fixed = shape;
+		auto const seen = engine::core::alternative<std::string>(fixed);
+		holds = holds && seen.has_value() == text.has_value() && (!seen || *seen == "seven!");
+	}
+	return holds;
+}
+
+static_assert(
+    std::same_as<decltype(engine::core::alternative<std::string>(std::declval<Shape const&>())), std::optional<std::string const&>>);
+
 }
 
 auto main() -> int {
@@ -67,6 +94,10 @@ auto main() -> int {
 	    engine::testing::Case{
 	        .name = "narrow preserves every value that fits",
 	        .holds = narrow_round_trips_every_fitting_value(),
+	    },
+	    engine::testing::Case{
+	        .name = "alternative borrows exactly the held alternative, mutably and constly",
+	        .holds = alternative_borrows_exactly_the_held_alternative(),
 	    },
 	    engine::testing::Case{
 	        .name = "an out-of-range conversion is a permanent failure",
