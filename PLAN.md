@@ -131,11 +131,19 @@ kept as ideas and rewritten in the new style:
 
 ### toolchain
 
-- **latest stable clang/llvm** for host c++26 and cuda device code (clang's cuda mode, `--cuda-gpu-arch=sm_86`), with
-  **libc++**. no gnu compiler or runtime. dynamic linking.
-- **the system cuda toolkit**: the newest one latest stable clang supports. `PINS.md` records the pair in use.
-- **no cudart.** clang compiles the kernels to cubin, the cubin is embedded in the binary, and the host loads it
-  with the cuda driver api. the driver is the only nvidia runtime library.
+- **latest stable clang/llvm** for host c++26 and cuda device code, with **libc++** and `import std`. no gnu
+  compiler or runtime, no apple clang. dynamic linking.
+- **no cuda sdk at build time.** device translation units compile with clang in device-only mode straight to ptx:
+  `-x cuda --cuda-gpu-arch=sm_86 --cuda-device-only -nocudainc -nocudalib -S`, with the ptx isa version set
+  explicitly (the newest llvm emits for `.target sm_86`). device code includes no sdk headers: special registers,
+  shuffles, barriers and memory-order operations come from nvvm builtins or inline ptx inside named primitives in
+  `device/`; bf16 and e4m3 are our own types. the same ptx comes out on every platform.
+- **one load path, no cudart.** the ptx is embedded in the host binary with `#embed` (in `foreign/`) and loaded with
+  `cuModuleLoadData`, which jit-compiles it; the driver's compute cache keeps start-up cheap. `foreign/` declares the
+  driver-api subset it uses and `dlopen`s `libcuda.so.1` at runtime: no link-time nvidia dependency. where that load
+  fails (macos) engine start returns `DeviceError::DriverUnavailable`. `ptxas -v` runs as a static gate on the same
+  ptx wherever a cuda toolkit exists (linux). `PINS.md` records the llvm version, the ptx isa version and the minimum
+  driver that can jit it.
 - **cmake generating ninja**, presets only:
 
   | preset | purpose |
@@ -146,7 +154,9 @@ kept as ideas and rewritten in the new style:
   | `profile` | release plus the per-phase profiler |
   | `lint` | clang-tidy over the whole graph |
 
-- the configure gate rejects anything but x86_64 linux with clang, libc++ and a cuda toolkit present.
+- the configure gate accepts exactly two machines: darwin arm64 (development: everything but running kernels) and
+  x86_64 linux (production), both with latest clang and libc++. the reactor's wait backend is chosen in the build
+  graph, one per platform (kqueue on darwin, epoll on linux), never by preprocessor tests in dialect code.
 - `-std=c++26 -fno-exceptions -fno-rtti`, warnings as errors, host assertions always on.
 - `.clang-format` taken unchanged from cpp-starter.
 
@@ -168,8 +178,9 @@ copied and adapted:
 - **`src/http.cc`**: bounded http, extended with request bodies and sse streaming.
 - **`tests/compile_fail/`** and **`PINS.md`** (the ledger of the toolchain pair and deliberate deviations).
 
-dropped: reflection (`src/enums.cc` and the reflection tests), the gcc gate and gcc defect ledger, darwin/arm64 and
-`net.darwin.cc`, the static-linking and hardening policy beyond `dev`.
+dropped: reflection (`src/enums.cc` and the reflection tests), the gcc gate and gcc defect ledger, the
+static-linking and hardening policy beyond `dev`. kept: cpp-starter's darwin kqueue backend (`net.darwin.cc`) for
+development, next to the linux epoll backend.
 
 ### from idris-mlir (principles, written into AGENTS.md)
 
@@ -194,12 +205,56 @@ dropped: reflection (`src/enums.cc` and the reflection tests), the gcc gate and 
   `printf`.
 - **no runtime shape arguments.** every dimension is a template parameter or a `constexpr` from the model
   description. kernel parameters carry only runtime facts.
-- inline ptx only inside small named primitives (`cp.async`, acquire/release loads and stores, `mma.sync`, e4m3
-  conversion), each documented with why.
+- inline ptx only inside small named primitives in `device/prims/`, each documented with why, and each stating the
+  ptx isa version and sm level it needs, checked at compile time.
 - **every kernel's resource budget is a static fact**: threads, registers, shared memory (≤ 99 kb per block) and
   blocks per SM are `static_assert`ed. the build fails if `ptxas -v` reports spills or registers over budget.
 - device invariant traps exist only in `dev`.
-- one narrow typed launch function per kernel, exported upward as a module partition from `foreign/`.
+- one narrow typed launch function per kernel, exported upward as a module from `foreign/`.
+
+### device style: the newest idiom sm_86 has (hard cutover)
+
+sm_86 is the only binary target: anything built for sm_89 or later does not load on these cards. "newest style"
+means the newest ptx isa llvm emits for `.target sm_86`, every async, synchronization and cache-control feature
+ampere has, and hopper-era kernel architecture emulated where the silicon lacks it. no legacy idioms. the step-1
+baseline keeps geezuz's algorithm, but its building blocks are these primitives too.
+
+**required idioms**, each a named primitive in `device/prims/` with a microbenchmark in `bench/ubench/`:
+- **warp specialization**: producer warps own the weight stream, consumer warps own the math. roles are fixed per
+  kernel and come from the compile-time schedule.
+- **async copy**: `cp.async.cg` 16-byte transfers, completion signalled with `cp.async.mbarrier.arrive.noinc` into
+  mbarriers; `cp.async.commit_group` / `wait_group` only where an mbarrier does not fit.
+- **mbarrier inside a block**: `mbarrier.init` / `arrive` and phase-parity waits, multi-stage rings. sm_86 has no
+  `try_wait` and no `expect_tx` (both sm_90), so a wait is a `test_wait.parity` spin with `nanosleep` backoff and
+  `cp.async` completion is counted in arrivals, not bytes. no `__syncthreads` in steady state; named barriers
+  (`bar.sync id, n`) only for fixed sub-groups.
+- **l2 control**: `createpolicy.fractional` with evict_first on the weight stream, evict_last on activations, kv
+  tiles and flags; `prefetch.global.L2` for run-ahead past the shared-memory ring; `discard.global.L2` on dead
+  scratch.
+- **fragments**: `ldmatrix` (and `.trans`) from xor-swizzled shared memory with zero bank conflicts;
+  `mma.sync.m16n8k16` bf16 x bf16 to fp32; register double-buffering across k-steps (the wgmma pipeline, by hand).
+- **reductions**: `redux.sync` for integers, butterfly `shfl.sync` for floats in a fixed order (determinism).
+- **cross-card**: peer stores over nvlink; `st.release.sys` / `ld.acquire.sys` flags with `nanosleep` backoff, or
+  `red.release.sys` counters; one fence per item, never per element.
+
+**emulated, because the silicon lacks it**:
+- **tma**: producers issue the baked image's precomputed 16-byte transaction stream. the image is laid out as exactly
+  that stream, so a producer is a pointer bump plus `cp.async`, nothing else.
+- **clusters / distributed shared memory**: none. cross-SM handoff goes through l2-resident flags and buffers with an
+  explicit evict_last policy.
+- **fp8 cvt**: an exact e4m3-to-bf16 bit sequence (`prmt` / `lop3` / shifts) converting straight into mma
+  a-fragments in registers, exhaustively tested against all 256 codes.
+- **wgmma**: consumer warpgroups of 4 warps sharing one stage, register-blocked mma with the next stage's `ldmatrix`
+  overlapped.
+
+**banned**:
+- dp4a and any int8 or fp16-accumulate math path;
+- cooperative-groups `grid.sync` and atomic-counter grid barriers in the dataflow core (allowed only in the step-1
+  baseline, deleted at step 2);
+- per-phase kernel launches;
+- weight-stream loads without a cache policy;
+- unswizzled shared tiles with bank conflicts;
+- texture / surface paths, `printf`, dynamic shared allocation decided at runtime.
 
 ## 1.3 layout and the model description
 
@@ -210,7 +265,7 @@ PLAN.md            this file
 PINS.md            toolchain pair in use and deliberate deviations
 CMakeLists.txt     gate, language profile, targets
 CMakePresets.json  dev, release, asan-ubsan, profile, lint
-src/               the `engine` named module and its partitions (dialect)
+src/               one named module per component, `engine.<name>`, each its own target and directory (dialect)
 device/            cuda kernels and the model description header (quarantine)
 foreign/           cuda driver api, stdexec boundary, model-description re-export (quarantine)
 unsafe/            epoll reactor, mmap, pinned and hugepage memory (quarantine)
@@ -220,23 +275,23 @@ bench/             benchmark clients (dialect)
 data/              draft vocabulary, tokenizer and chat-format fixtures
 ```
 
-| partition | holds |
+| module | holds |
 |---|---|
-| `engine:model` | re-export of the model description: dims, layer kinds, head splits, tensor list |
-| `engine:image` | baked-image format: header with checkpoint hash, per-tensor extents; typed errors on mismatch |
-| `engine:bake` | safetensors reader, tensor-parallel split, tile layout in stream order |
-| `engine:tokenizer` | qwen byte-level bpe, special tokens, utf-8-safe streaming decode |
-| `engine:chat` | qwen3.8 chat format: system, user, assistant, tool turns, thinking, reasoning effort, tool-call parse |
-| `engine:sampling` | sampling parameters as a closed type; exact top-k / top-p / min-p / temperature; seeds |
-| `engine:kv` | paged bf16 kv pool: refcounted blocks, copy-on-write, block tables |
-| `engine:prefix` | radix tree over blocks, deltanet snapshots, lru eviction |
-| `engine:sched` | slots, admission, preemption, chunked-prefill share, row budget, turn replay |
-| `engine:device` | typed launch surface over the driver api: cards, streams, events, the resident ring |
-| `engine:pipeline` | stdexec request pipeline |
-| `engine:json`, `engine:http`, `engine:openai` | bounded json, http with bodies and sse, the openai endpoint |
+| `engine.model` | re-export of the model description: dims, layer kinds, head splits, tensor list |
+| `engine.image` | baked-image format: header with checkpoint hash, per-tensor extents; typed errors on mismatch |
+| `engine.bake` | safetensors reader, tensor-parallel split, tile layout in stream order |
+| `engine.tokenizer` | qwen byte-level bpe, special tokens, utf-8-safe streaming decode |
+| `engine.chat` | qwen3.8 chat format: system, user, assistant, tool turns, thinking, reasoning effort, tool-call parse |
+| `engine.sampling` | sampling parameters as a closed type; exact top-k / top-p / min-p / temperature; seeds |
+| `engine.kv` | paged bf16 kv pool: refcounted blocks, copy-on-write, block tables |
+| `engine.prefix` | radix tree over blocks, deltanet snapshots, lru eviction |
+| `engine.sched` | slots, admission, preemption, chunked-prefill share, row budget, turn replay |
+| `engine.device` | typed launch surface over the driver api: cards, streams, events, the resident ring |
+| `engine.pipeline` | stdexec request pipeline |
+| `engine.json`, `engine.http`, `engine.openai` | bounded json, http with bodies and sse, the openai endpoint |
 
 **one model description, held once.** `device/model.h` is the single source of every model and layout constant: plain
-`constexpr`, no macros, because device code must read it. `foreign/model.cc` re-exports it as `engine:model`. tile
+`constexpr`, no macros, because device code must read it. `foreign/model.cc` re-exports it as `engine.model`. tile
 schedules and buffer geometries are `consteval` functions over it. nothing else defines a dimension.
 
 **the baked image.** `geezuz-bake` reads the safetensors checkpoint once and writes one image per card:
@@ -389,9 +444,10 @@ estimates. step 2 is the row physics most clearly supports. long multi-slot cont
 
 ### phase a: code only (now; no gpu)
 
-**where it runs**: a linux x86_64 environment with latest clang/llvm and the cuda toolkit, such as the cloud claude
-code containers. no gpu is needed: clang compiles the device code and ptxas reports resources. macos can't host the
-cuda toolkit, so the mac is for editing only.
+**where it runs**: the development mac (darwin arm64, latest llvm and libc++, no cuda sdk). clang compiles every
+kernel to ptx for sm_86; host code builds, lints and runs its tests; the baker and the cpu reference run on the real
+checkpoint. the `ptxas -v` resource gates, the linux epoll backend and everything touching a real driver run first on
+the linux box.
 
 **done means**: `dev`, `release` and `lint` build with zero warnings, the static device gates pass, and the cpu tests
 pass. nothing claims runtime kernel correctness until phase c.
@@ -403,10 +459,10 @@ pass. nothing claims runtime kernel correctness until phase c.
 |---|---|---|
 | L0 scaffold | AGENTS.md and CLAUDE.md, the cpp-starter 80/20, cmake gate, presets, language profile, clang-tidy profiles, zones, compile-fail harness, PINS.md | — (first) |
 | L1 cull | delete everything in 1.1 with no successor yet; move what survives into the zones | L0 |
-| L2 model + image + bake | `device/model.h`, `engine:model`, `engine:image`, `engine:bake` | L0 |
-| L3 tokenizer + chat | `engine:tokenizer`, `engine:chat`, fixtures | L0 |
-| L4 server | `engine:json`, `engine:http`, `engine:openai`, `engine:pipeline`, `engine:sched` + fake-engine simulation | L0, L5 |
-| L5 kv + prefix | `engine:kv`, `engine:prefix`, ported fuzz and scenario tests | L0, L2 |
+| L2 model + image + bake | `device/model.h`, `engine.model`, `engine.image`, `engine.bake` | L0 |
+| L3 tokenizer + chat | `engine.tokenizer`, `engine.chat`, fixtures | L0 |
+| L4 server | `engine.json`, `engine.http`, `engine.openai`, `engine.pipeline`, `engine.sched` + fake-engine simulation | L0, L5 |
+| L5 kv + prefix | `engine.kv`, `engine.prefix`, ported fuzz and scenario tests | L0, L2 |
 | L6 device | e4m3/bf16 primitives, fp8 gemv/gemm, attention, deltanet, decode step 1 then step 2, prefill, driver-api loader, resident ring, static gates | L0, L2 |
 | L7 reference + harness | `geezuz-ref`, rulers, decode-path ruler, determinism tooling | L0, L2, L3 |
 
