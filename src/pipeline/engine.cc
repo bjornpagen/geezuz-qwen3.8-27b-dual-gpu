@@ -68,9 +68,20 @@ struct Waiting {
 	sched::Submission request;
 };
 
+/** Whether a scheduled request's client is still there to hear from it. */
+enum class Client : std::uint8_t {
+	Present,
+	/**
+	 * It left: the request ends at the next cycle boundary. The cycle in flight may still report its tokens, and may
+	 * end the request anyway; none of that is posted.
+	 */
+	Gone,
+};
+
 /** In the scheduler: queued, running or paused. */
 struct Scheduled {
 	sched::RequestHandle request;
+	Client client;
 };
 
 /** A request the engine holds, from its submission until the scheduler reports it finished. */
@@ -226,7 +237,7 @@ private:
 			}
 			auto submitted = scheduler_->submit(tokenizer_, std::move(held->request));
 			if (submitted) {
-				live.place = Scheduled{.request = submitted->request};
+				live.place = Scheduled{.request = submitted->request, .client = Client::Present};
 				round_.push_back({.exchange = live.exchange, .output = front_.accepted()});
 				free -= 1;
 				index += 1;
@@ -247,8 +258,9 @@ private:
 		if (found == lives_.end()) {
 			return;
 		}
-		if (auto const held = core::alternative<Scheduled>(found->place)) {
+		if (auto held = core::alternative<Scheduled>(found->place)) {
 			scheduler_->cancel(held->request);
+			held->client = Client::Gone;
 			return;
 		}
 		lives_.erase(found);
@@ -262,10 +274,11 @@ private:
 				               produce(live_of(generated.request), generated.tokens);
 			               },
 			               [](sched::Paused const& /*paused*/) {},
-			               [this](sched::Finished const& finished) {
-				               end(live_of(finished.request), finished);
+			               [this](sched::Finished& finished) {
+				               auto const request = finished.request;
+				               end(live_of(request), std::move(finished));
 				               std::erase_if(lives_, [&](Request const& live) {
-					               return holds(live, finished.request);
+					               return holds(live, request);
 				               });
 			               },
 			           },
@@ -281,6 +294,9 @@ private:
 
 	/** The request's committed tokens, in order: its grammar advances by each, and its reply turns each into outputs. */
 	auto produce(Request& live, std::span<Token const> tokens) -> void {
+		if (std::get<Scheduled>(live.place).client == Client::Gone) {
+			return;
+		}
 		for (auto const token : tokens) {
 			auto const step = live.grammar.advance(token);
 			// The cards sample under the request's masks, so every committed token is one its grammar allows.
@@ -289,13 +305,20 @@ private:
 		}
 	}
 
-	auto end(Request& live, sched::Finished const& finished) -> void {
-		// A request ends cancelled only when its client left: there is no one to tell.
-		if (finished.ending == sched::Ending::Cancelled) {
+	auto end(Request& live, sched::Finished finished) -> void {
+		if (std::get<Scheduled>(live.place).client == Client::Gone) {
 			return;
 		}
-		auto const ending = finished.ending == sched::Ending::Stop ? Ending::Stop : Ending::Length;
-		say(live, live.reply.end(tokenizer_, Finish{.ending = ending, .usage = finished.usage}));
+		std::visit(Overloaded{
+		               [](sched::Cancelled& /*cancelled*/) {
+			               // Only the engine cancels a request, and only when its client has left.
+			               core::invariant(false);
+		               },
+		               [&]<class E>(E& ended) {
+			               say(live, live.reply.end(tokenizer_, Finish{.ending = Ending{std::move(ended)}, .usage = finished.usage}));
+		               },
+		           },
+		           finished.ending);
 	}
 
 	/** Posts the round's outputs as one batch, and the status when it changed. */

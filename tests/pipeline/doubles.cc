@@ -112,7 +112,7 @@ export struct Committed {
 export struct Ended {
 	pipeline::Finish finish;
 
-	[[nodiscard]] constexpr auto operator==(Ended const&) const -> bool = default;
+	[[nodiscard]] auto operator==(Ended const&) const -> bool = default;
 };
 
 export using Output = std::variant<Accepted, Refused, Committed, Ended>;
@@ -128,7 +128,7 @@ export struct ReplyDouble {
 	}
 
 	[[nodiscard]] auto end(tokenizer::Tokenizer const& /*tokenizer*/, pipeline::Finish finish) -> std::vector<Output> {
-		return {Ended{.finish = finish}};
+		return {Ended{.finish = std::move(finish)}};
 	}
 };
 
@@ -143,7 +143,9 @@ export struct FrontDouble {
 
 	[[nodiscard]] auto prepare(tokenizer::Tokenizer const& /*tokenizer*/, Ask ask) -> pipeline::Prepared<Tag, Grammar, Reply> {
 		// Sampled, with the ask's seed as the fresh one, so the seed reaches the cards and names the script.
-		auto const params = sampling::parse(sampling::Request{.temperature = 1.0, .top_p = std::nullopt}, sampling::thinking_defaults, ask.seed);
+		auto request = sampling::Request{};
+		request.temperature = 1.0;
+		auto const params = sampling::parse(request, sampling::thinking_defaults, ask.seed);
 		core::invariant(params.has_value());
 		return {
 		    .tag = ask.tag,
@@ -255,13 +257,18 @@ public:
 		for (auto const [index, row] : std::views::enumerate(batch_->rows)) {
 			auto const at = index_of(row.rule.seed, row.position + 1);
 			auto const accepts = accepted_[core::narrow<std::size_t>(index)];
-			auto accepted = sched::Accepted{.tokens = {}, .count = accepts + 1};
-			for (auto step = std::size_t{0}; step <= accepts; ++step) {
+			// As the cards do: acceptance stops at the row's limit and at a token that ends the turn.
+			auto accepted = sched::Accepted{.tokens = {}, .count = 0};
+			for (auto step = std::size_t{0}; step <= accepts && step < row.most; ++step) {
 				auto const& mask = masks.rows[(core::narrow<std::size_t>(index) * (1 + depth)) + step];
 				auto const token = truth(row.rule.seed, at + step);
 				// Each committed token is sampled under its own verify row's mask: the grammar after the tokens before it.
 				core::invariant(mask.allows(token) && !mask.allows(forbidden(at + step)));
 				accepted.tokens[step] = token;
+				accepted.count = step + 1;
+				if (sched::ends_turn(token)) {
+					break;
+				}
 			}
 			done.rows.push_back(accepted);
 		}

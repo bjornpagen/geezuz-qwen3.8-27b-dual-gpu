@@ -88,20 +88,19 @@ concept GrammarState = std::movable<S> && requires(S& state, S const& held, Toke
 	{ state.rollback(count) } -> std::same_as<void>;
 };
 
-/** Why generation ended. A request its client abandoned ends silently and has no ending. */
-export enum class Ending : std::uint8_t {
-	/** The model ended its turn: the grammar accepted and the end token was sampled. */
-	Stop,
-	/** The budget, the context or the pool ran out. */
-	Length,
-};
+/**
+ * Why generation ended, with the exact sequence the request leaves (the prompt as it ran, then every generated token),
+ * which a stored response keeps: `Stopped` when the model ended its turn (the end-of-turn token last), `Truncated`
+ * when the budget, the context or the pool ran out. A request whose client left ends silently and has no ending.
+ */
+export using Ending = std::variant<sched::Stopped, sched::Truncated>;
 
 /** A request's end: why, and its counts (generated tokens include the one that ended the turn). */
 export struct Finish {
 	Ending ending;
 	sched::Usage usage;
 
-	[[nodiscard]] constexpr auto operator==(Finish const&) const -> bool = default;
+	[[nodiscard]] auto operator==(Finish const&) const -> bool = default;
 };
 
 /**

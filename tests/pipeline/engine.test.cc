@@ -190,7 +190,7 @@ private:
 
 /**
  * The outputs a request must have produced: accepted, then each scripted token up to the end of its turn or its
- * limit, then its finish with exact counts.
+ * limit, then its finish with exact counts and the exact sequence it leaves.
  */
 [[nodiscard]] auto expected(Job const& job) -> std::vector<Output> {
 	auto const limit = std::visit(
@@ -203,21 +203,23 @@ private:
 	    },
 	    job.ask.limit);
 	auto out = std::vector<Output>{doubles::Accepted{}};
-	auto generated = std::size_t{0};
-	auto ending = pipeline::Ending::Length;
+	auto sequence = job.ask.prompt;
+	auto stopped = false;
 	for (auto const token : job.script) {
-		if (generated == limit) {
+		if (sequence.size() - job.ask.prompt.size() == limit) {
 			break;
 		}
-		generated += 1;
+		sequence.push_back(token);
 		if (sched::ends_turn(token)) {
-			ending = pipeline::Ending::Stop;
+			stopped = true;
 			break;
 		}
 		out.emplace_back(doubles::Committed{.token = token});
 	}
-	out.emplace_back(doubles::Ended{.finish = {.ending = ending,
-	                                           .usage = {.prompt_tokens = job.ask.prompt.size(), .cached_tokens = 0, .generated_tokens = generated}}});
+	auto const usage = sched::Usage{.prompt_tokens = job.ask.prompt.size(), .cached_tokens = 0, .generated_tokens = sequence.size() - job.ask.prompt.size()};
+	auto ending = stopped ? pipeline::Ending{sched::Stopped{.sequence = std::move(sequence)}}
+	                      : pipeline::Ending{sched::Truncated{.sequence = std::move(sequence)}};
+	out.emplace_back(doubles::Ended{.finish = {.ending = std::move(ending), .usage = usage}});
 	return out;
 }
 
@@ -268,7 +270,7 @@ template<kv::Geometry G>
 	return ran && idle && bench->most_busy() == model::slots && bench->stop();
 }
 
-/** A limit ends the completion at exactly that many tokens with `Length`; a turn that ends first ends with `Stop`. */
+/** A limit truncates the completion at exactly that many tokens; a turn that ends first stops there. */
 [[nodiscard]] auto limits_end_at_length(std::uint64_t seed) -> bool {
 	auto jobs = workload(seed, 6, 12, 40, sched::AtMost{.tokens = 15});
 	auto bench = std::make_unique<Bench<roomy>>(fake::Machine{}, jobs);
