@@ -50,8 +50,8 @@ __attribute__((device)) inline void start(Machine const& machine, Grid grid) {
 	zero(machine, exchange.fixup_flags, prims::round_up(static_cast<int>(sms * schedule::flag_bytes), 16));
 	grid.sync(prims::remote_backoff);
 	if (prims::block() == 0 && prims::thread_in_block() == 0) {
-		prims::EpochWriter<prims::Scope::System>{.flag = &at<Control>(machine.params.peer_control)->peer_ready.word}.publish(1);
-		prims::EpochReader<prims::Scope::System>{.flag = &at<Control>(machine.params.control)->peer_ready.word}.await(1, prims::remote_backoff);
+		prims::EpochWriter<prims::Scope::System>{.flag = &at<Control>(machine.params.peer_control)->peer_ready.word}.publish(machine.params.launch);
+		prims::EpochReader<prims::Scope::System>{.flag = &at<Control>(machine.params.control)->peer_ready.word}.await(machine.params.launch, prims::remote_backoff);
 	}
 	grid.sync(prims::remote_backoff);
 }

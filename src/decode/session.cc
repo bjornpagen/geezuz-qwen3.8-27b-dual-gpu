@@ -5,8 +5,9 @@
 // cycle descriptor to both cards, whose kernels start streaming the body at once; it hands back the drafts each row
 // verifies, which the host needs for the grammar's masks. `publish` writes those masks into the cards' mask buffers
 // (each card's half in its own row order) and releases them; the kernels acquire them only right before they rank the
-// lm_head's rows, so the host has the whole body (~15 ms) to compute them. `complete` collects both cards' answers,
-// which must agree, and settles the ledger.
+// lm_head's rows, so the host has the whole body (~15 ms) to compute them. `try_complete` polls for both cards'
+// answers, which must agree, and settles the ledger once both are in; it never blocks, so the pipeline polls it on its
+// run loop.
 export module engine.decode:session;
 
 import std;
@@ -31,18 +32,18 @@ export using Ring = device::Ring<Descriptor, Result, decode_device::ring_slots>;
 /** Each card's mask buffer: two halves by ticket parity, each a mask per verify row in the card's row order. */
 export using MaskBuffer = device::MappedArray<decode_device::Masks, 1>;
 
-/** Bits of one card's row-order mask, in the 64-bit words the host's masks hold. */
-export inline constexpr std::size_t card_words = model::vocab_per_card / 64;
+static_assert(model::card_mask_words * 2 == decode_device::mask_words, "a host word is two of the card's words, low first");
 
-static_assert(card_words * 2 == decode_device::mask_words, "a host word is two of the card's words, low first");
+/** One card's mask of one verify row, borrowed: the card's rows in its own lm_head row order, bit r of word r / 64 allowing row r. */
+export using CardMask = std::span<std::uint64_t const, model::card_mask_words>;
 
-/** One verify row's mask: each card's rows in its own lm_head row order, bit r of word r / 64 allowing row r. */
-export using CardMasks = std::array<std::array<std::uint64_t, card_words>, model::cards>;
-
-/** The masks of a cycle's verify rows: `masks(i)` is batch row r's verify row v at i = r (1 + drafts(depth)) + v. */
+/**
+ * The masks of a cycle's verify rows: `masks(i, card)` borrows card `card`'s mask of batch row r's verify row v at
+ * i = r (1 + drafts(depth)) + v. The session copies it into the card's mask buffer and keeps no reference.
+ */
 export template<class M>
-concept MaskRows = requires(M const& masks, std::size_t index) {
-	{ masks(index) } -> std::convertible_to<CardMasks const&>;
+concept MaskRows = requires(M const& masks, std::size_t index, model::Card card) {
+	{ masks(index, card) } -> std::convertible_to<CardMask>;
 };
 
 /**
@@ -80,25 +81,104 @@ export struct HostAddresses {
 	return std::to_underlying(card);
 }
 
-/** Polls `ready` until it yields a value or `deadline` passes. */
-template<class Ready>
-[[nodiscard]] auto poll_until(std::chrono::steady_clock::time_point deadline, Ready ready) -> decltype(ready()) {
-	constexpr auto interval = std::chrono::microseconds{20};
-	for (;;) {
-		if (auto value = ready()) {
-			return value;
+/**
+ * The first place the cards' answers to `ticket` differ, over its rows (whose slots are `slots`, in row order): which
+ * slot, what of its outcome, and each card's word there. None when they agree.
+ */
+[[nodiscard]] auto disagreement(std::uint64_t ticket, std::span<kv::Slot const> slots, Result const& zero, Result const& one) -> std::optional<CardsDisagree> {
+	for (auto const [row, slot] : std::views::enumerate(slots)) {
+		auto const& left = std::span{zero.slots}[core::narrow<std::size_t>(row)];
+		auto const& right = std::span{one.slots}[core::narrow<std::size_t>(row)];
+		auto const differ = [&](Disagreement what, std::span<unsigned const> lefts, std::span<unsigned const> rights) -> std::optional<CardsDisagree> {
+			auto const [at_left, at_right] = std::ranges::mismatch(lefts, rights);
+			if (at_left == lefts.end()) {
+				return std::nullopt;
+			}
+			return CardsDisagree{.ticket = ticket,
+			                     .slot = core::narrow<std::uint32_t>(slot.index()),
+			                     .what = what,
+			                     .at = core::narrow<std::uint32_t>(at_left - lefts.begin()),
+			                     .zero = *at_left,
+			                     .one = *at_right};
+		};
+		auto found = differ(Disagreement::Accepted, std::span{&left.accepted, 1}, std::span{&right.accepted, 1});
+		if (!found) {
+			found = differ(Disagreement::Committed, left.committed, right.committed);
 		}
-		auto const now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			return std::nullopt;
+		if (!found) {
+			found = differ(Disagreement::Drafted, left.drafts, right.drafts);
 		}
-		std::this_thread::sleep_until(std::min(now + interval, deadline));
+		if (found) {
+			return found;
+		}
 	}
+	return std::nullopt;
 }
 
-[[nodiscard]] constexpr auto same_outcome(decode_device::SlotOutcome const& left, decode_device::SlotOutcome const& right) -> bool {
-	return left.accepted == right.accepted && std::ranges::equal(left.committed, right.committed) && std::ranges::equal(left.drafts, right.drafts);
-}
+/** What a ticket asks of the loops: apply commands, run the begun cycle or prompt end, or exit. */
+enum class Ask : std::uint8_t {
+	Apply,
+	Begun,
+	Exit,
+};
+
+/** A ticket waiting for room in the rings: what it asks, and for `Apply` its commands. */
+struct Outgoing {
+	Ask ask;
+	std::vector<decode_device::Command> commands;
+};
+
+/** A ticket both rings carry, waiting for both cards' answers. */
+struct Awaited {
+	Ask ask;
+	std::uint64_t ticket;
+	std::array<std::optional<Result>, model::cards> answers;
+};
+
+/** The loops serve tickets and none is begun. */
+struct Idle {};
+
+/** Whether a begun ticket's masks have been released to the cards, which wait for them before they rank. */
+enum class Masking : std::uint8_t {
+	Unpublished,
+	Published,
+};
+
+/**
+ * A cycle or prompt end is begun: its ticket, the slots it runs, its verify rows, whether its masks are out, and both
+ * cards' answers once in.
+ */
+struct Ticketed {
+	std::uint64_t ticket;
+	std::vector<kv::Slot> slots;
+	std::size_t verify_rows;
+	Masking masking;
+	std::optional<std::array<Result, model::cards>> answers;
+};
+
+/** The exit tickets are queued; the loops end once both are answered. A failure found on the way is reported then. */
+struct Stopping {
+	std::optional<DecodeError> trouble;
+};
+
+/** Both loops answered their exit: the cards run nothing of the engine's. A failure found on the way is kept. */
+struct Stopped {
+	std::optional<DecodeError> trouble;
+};
+
+/** The loops failed or were given up on; nothing more is sent to them. */
+struct Broken {
+	DecodeError error;
+};
+
+/** Where the loops stand. The begun ticket exists only while ticketed, so no call can find one where none is. */
+using LoopState = std::variant<Idle, Ticketed, Stopping, Stopped, Broken>;
+
+/** Whether the cards can be trusted with the queued commands: not after they disagreed. */
+enum class Health : std::uint8_t {
+	Healthy,
+	Suspect,
+};
 
 export class Session {
 public:
@@ -147,21 +227,12 @@ public:
 		std::ranges::copy(lower(command), std::back_inserter(commands_));
 	}
 
-	/** Applies every queued command now, in command-only tickets. */
-	[[nodiscard]] auto flush(std::chrono::steady_clock::time_point deadline) -> core::Result<void, DecodeError> {
-		for (auto const& ticket : take_commands()) {
-			if (auto applied = run_apply(ticket, deadline); !applied) {
-				return applied;
-			}
-		}
-		return {};
-	}
-
 	/**
 	 * Starts the batch's cycle on both cards, after the queued commands: all but the last ticket's worth go ahead in
-	 * command-only tickets, the rest ride with the cycle.
+	 * command-only tickets, the rest ride with the cycle. Submits what the rings have room for and returns at once;
+	 * `try_complete` submits the rest as room frees.
 	 */
-	[[nodiscard]] auto begin(sched::Batch batch, std::chrono::steady_clock::time_point deadline) -> core::Result<Pending, DecodeError> {
+	[[nodiscard]] auto begin(sched::Batch batch) -> core::Result<Pending, DecodeError> {
 		if (auto refused = check(batch)) {
 			return fail(*refused);
 		}
@@ -171,18 +242,17 @@ public:
 		for (auto const& row : pending.rows) {
 			pending.planned.push_back(ledger_.plan(row, pending.depth));
 		}
-		return post(std::move(pending), deadline);
+		return post(std::move(pending));
 	}
 
 	/**
 	 * Starts a prompt's end on both cards: the lm_head over its last row (whose final norm prefill left in the prompt
 	 * row), the sample under the row's one mask, and the mtp head's drafts from it at `depth`. `prompt` is the prompt's
-	 * last row: its slot, request, position, token and rule.
+	 * last row: its slot, request, position, token and rule. Returns at once, like `begin`.
 	 */
-	[[nodiscard]] auto begin_prompt_end(sched::Row prompt, model::DraftDepth depth, std::chrono::steady_clock::time_point deadline)
-	    -> core::Result<Pending, DecodeError> {
+	[[nodiscard]] auto begin_prompt_end(sched::Row prompt, model::DraftDepth depth) -> core::Result<Pending, DecodeError> {
 		if (prompt.position + sched::lookahead > model::max_positions) {
-			return fail(Refused{.reason = Refusal::PastContext});
+			return fail(Refused{.reason = Refusal::PastContext, .ticket = std::nullopt});
 		}
 		auto const run = decode_device::SlotRun{
 		    .slot = core::narrow<unsigned>(prompt.slot.index()),
@@ -199,120 +269,156 @@ public:
 		                    .depth = depth,
 		                    .width = 1,
 		                    .rows = {prompt},
-		                    .planned = {Planned{.run = run, .state = state, .drafts = {}}}},
-		            deadline);
-	}
-
-	/** The prompt's sampled token, which both cards must agree on; the slot then continues from it with its drafts. */
-	[[nodiscard]] auto complete_prompt_end(Pending pending, std::chrono::steady_clock::time_point deadline)
-	    -> core::Result<sched::ChunkDone, DecodeError> {
-		core::invariant(pending.work == decode_device::Work::PromptEnd && pending.rows.size() == 1);
-		auto answers = agreed(pending, deadline);
-		if (!answers) {
-			return std::unexpected(answers.error());
-		}
-		auto const& row = pending.rows.front();
-		auto const sampled = ledger_.start(row.slot, row.request, row.position, answers->slots[0], pending.depth);
-		return sched::ChunkDone{.sampled = sampled, .took = took(*answers)};
+		                    .planned = {Planned{.run = run, .state = state, .drafts = {}}}});
 	}
 
 	/**
-	 * Writes each verify row's mask into both cards' mask buffers and releases them for the cycle. Masks of draft rows
+	 * Writes each verify row's mask into both cards' mask buffers and releases them for the ticket. Masks of draft rows
 	 * past a row's drafts are not read. A mask that allows nothing would leave nothing to sample, and is refused.
 	 */
 	template<MaskRows M>
 	[[nodiscard]] auto publish(Pending const& pending, M const& masks, std::size_t count) -> core::Result<void, DecodeError> {
-		if (running_ != pending.ticket) {
-			return fail(Refused{.reason = Refusal::WrongTicket});
+		if (!begun(pending)) {
+			return fail(Refused{.reason = Refusal::WrongTicket, .ticket = pending.ticket});
 		}
 		if (count != pending.mask_count()) {
-			return fail(Refused{.reason = Refusal::MaskCount});
+			return fail(Refused{.reason = Refusal::MaskCount, .ticket = pending.ticket});
 		}
-		auto const width = 1 + model::drafts(pending.depth);
 		auto const half = decode_device::mask_half(pending.ticket);
 		auto device_row = std::size_t{0};
 		for (auto const [index, plan] : std::views::enumerate(pending.planned)) {
 			for (auto verify = std::size_t{0}; verify <= plan.run.drafts; ++verify) {
-				CardMasks const& row = masks((core::narrow<std::size_t>(index) * width) + verify);
-				auto const allows = std::ranges::any_of(row, [](auto const& card) {
+				auto const mask = (core::narrow<std::size_t>(index) * pending.width) + verify;
+				auto const row = std::array<CardMask, model::cards>{CardMask{masks(mask, model::Card::Zero)}, CardMask{masks(mask, model::Card::One)}};
+				auto const allows = std::ranges::any_of(row, [](CardMask card) {
 					return std::ranges::any_of(card, [](std::uint64_t word) {
 						return word != 0;
 					});
 				});
 				if (!allows) {
-					return fail(Refused{.reason = Refusal::EmptyMask});
+					return fail(Refused{.reason = Refusal::EmptyMask, .ticket = pending.ticket});
 				}
 				for (auto const card : device::card_pair) {
-					auto& words = masks_.at(card_index(card)).host()[0].half[half].words[device_row];
+					auto& words = std::span{std::span{masks_.at(card_index(card)).host()[0].half}[half].words}[device_row];
 					for (auto const [word, bits] : std::views::enumerate(row.at(card_index(card)))) {
 						auto const at = core::narrow<std::size_t>(word) * 2;
-						words[at] = static_cast<unsigned>(bits & 0xffff'ffffU);
-						words[at + 1] = static_cast<unsigned>(bits >> 32U);
+						std::span{words}[at] = static_cast<unsigned>(bits & 0xffff'ffffU);
+						std::span{words}[at + 1] = static_cast<unsigned>(bits >> 32U);
 					}
 				}
 				++device_row;
 			}
 		}
 		for (auto& buffer : masks_) {
-			decode_device::release_masks(buffer.host()[0].flag[half], pending.ticket);
+			decode_device::release_masks(std::span{buffer.host()[0].flag}[half], pending.ticket);
 		}
-		return {};
-	}
-
-	/** Both cards' answers to the cycle, which must agree, as the batch's outcome; the ledger moves on. */
-	[[nodiscard]] auto complete(Pending pending, std::chrono::steady_clock::time_point deadline) -> core::Result<sched::BatchDone, DecodeError> {
-		core::invariant(pending.work == decode_device::Work::Cycle);
-		auto answer = agreed(pending, deadline);
-		if (!answer) {
-			return std::unexpected(answer.error());
-		}
-		auto const& zero = *answer;
-		auto done = sched::BatchDone{.rows = {}, .took = took(zero)};
-		done.rows.reserve(pending.rows.size());
-		for (auto const [index, row] : std::views::enumerate(pending.rows)) {
-			auto const at = core::narrow<std::size_t>(index);
-			done.rows.push_back(ledger_.settle(row, pending.planned.at(at), std::span{zero.slots}[at], pending.depth));
-		}
-		return done;
-	}
-
-	/** Asks both loops to exit and waits for their acknowledgements. */
-	[[nodiscard]] auto stop(std::chrono::steady_clock::time_point deadline) -> core::Result<void, DecodeError> {
-		core::invariant(!running_.has_value());
-		std::array<std::uint64_t, model::cards> tickets{};
-		for (auto const card : device::card_pair) {
-			auto& ring = rings_.at(card_index(card));
-			auto const ticket = poll_until(deadline, [&] {
-				return ring.try_exit();
-			});
-			if (!ticket) {
-				return fail(TimedOut{.waiting = Waiting::Submit, .ticket = 0});
-			}
-			tickets.at(card_index(card)) = ticket->value;
-		}
-		for (auto const card : device::card_pair) {
-			auto& ring = rings_.at(card_index(card));
-			auto const ticket = tickets.at(card_index(card));
-			auto const answer = poll_until(deadline, [&] {
-				return ring.try_collect();
-			});
-			if (!answer) {
-				return fail(TimedOut{.waiting = Waiting::Answer, .ticket = ticket});
-			}
-			if (!std::holds_alternative<device::Exited>(*answer)) {
-				return fail(LoopGone{.ticket = ticket});
-			}
-		}
+		std::get<Ticketed>(state_).masking = Masking::Published;
 		return {};
 	}
 
 	/**
-	 * Fresh rings for the next launch of the loops, after `stop`: a ring that carried an exit ticket takes no more, and
+	 * The batch's outcome once both cards have answered every ticket ahead of it and the cycle, and agree; nullopt
+	 * while they have not. The ledger moves on with the outcome. Never blocks: the pipeline polls it on its run loop.
+	 */
+	[[nodiscard]] auto try_complete(Pending const& pending) -> std::optional<core::Result<sched::BatchDone, DecodeError>> {
+		core::invariant(pending.work == decode_device::Work::Cycle);
+		return try_agreed(pending).transform([&](core::Result<Result, DecodeError> const& answer) -> core::Result<sched::BatchDone, DecodeError> {
+			if (!answer) {
+				return std::unexpected(answer.error());
+			}
+			auto done = sched::BatchDone{.rows = {}, .took = took(*answer)};
+			done.rows.reserve(pending.rows.size());
+			for (auto const [index, row] : std::views::enumerate(pending.rows)) {
+				auto const at = core::narrow<std::size_t>(index);
+				done.rows.push_back(ledger_.settle(row, pending.planned.at(at), std::span{answer->slots}[at], pending.depth));
+			}
+			return done;
+		});
+	}
+
+	/** The prompt's sampled token, as `try_complete` for a cycle; the slot then continues from it with its drafts. */
+	[[nodiscard]] auto try_complete_prompt_end(Pending const& pending) -> std::optional<core::Result<sched::ChunkDone, DecodeError>> {
+		core::invariant(pending.work == decode_device::Work::PromptEnd && pending.rows.size() == 1);
+		return try_agreed(pending).transform([&](core::Result<Result, DecodeError> const& answer) -> core::Result<sched::ChunkDone, DecodeError> {
+			if (!answer) {
+				return std::unexpected(answer.error());
+			}
+			auto const& row = pending.rows.front();
+			auto const sampled = ledger_.start(row.slot, row.request, row.position, answer->slots[0], pending.depth);
+			return sched::ChunkDone{.sampled = sampled, .took = took(*answer)};
+		});
+	}
+
+	/**
+	 * Stops both loops with nothing begun, the one way the cards are left consistent for prefill: the first call queues
+	 * every queued pool command as command-only tickets and the exit tickets behind them, so a prefill that follows the
+	 * stop sees every block table and slot state the scheduler set up (cards caught disagreeing get no more commands).
+	 * nullopt until both loops have answered the exit; then the outcome, as often as it is asked. Never blocks.
+	 */
+	[[nodiscard]] auto try_stop() -> std::optional<core::Result<void, DecodeError>> {
+		core::invariant(!std::holds_alternative<Ticketed>(state_));
+		if (std::holds_alternative<Idle>(state_)) {
+			queue_exit(health_, std::nullopt);
+		}
+		return try_shutdown(std::chrono::steady_clock::time_point::max());
+	}
+
+	/**
+	 * Ends the loops from wherever they stand, for teardown: a begun ticket is collected (its outcome discarded, its
+	 * slots forgotten), the queued commands are sent only if the cards have not been caught disagreeing, then the exits;
+	 * stopped loops are an immediate success, broken ones their failure. Past `give_up` the loops are abandoned with
+	 * `Abandoned`. nullopt while it is still waiting. Never blocks.
+	 */
+	[[nodiscard]] auto try_shutdown(std::chrono::steady_clock::time_point give_up) -> std::optional<core::Result<void, DecodeError>> {
+		if (auto const stopped = core::alternative<Stopped>(state_)) {
+			return stopped->trouble ? core::Result<void, DecodeError>{std::unexpected(*stopped->trouble)} : core::Result<void, DecodeError>{};
+		}
+		if (auto const broken = core::alternative<Broken>(state_)) {
+			return std::unexpected(broken->error);
+		}
+		auto trouble = std::optional<DecodeError>{};
+		if (auto const ticketed = core::alternative<Ticketed>(state_)) {
+			// Masks never published would leave the cards waiting before they rank: release every row allowing every
+			// token, so the ticket runs out. Its outcome is discarded.
+			if (ticketed->masking == Masking::Unpublished) {
+				release_all(ticketed->ticket, ticketed->verify_rows);
+				ticketed->masking = Masking::Published;
+			}
+			if (auto failed = pump(); failed) {
+				return broke(*failed);
+			}
+			if (!ticketed->answers) {
+				return give_up_at(give_up, ticketed->ticket);
+			}
+			auto const& [zero, one] = *ticketed->answers;
+			if (auto disagree = disagreement(ticketed->ticket, ticketed->slots, zero, one)) {
+				health_ = Health::Suspect;
+				trouble = DecodeError{.reason = *disagree};
+			}
+			// The cards ran the ticket; the host never settled it, so what they hold for its slots is unknown here.
+			for (auto const slot : ticketed->slots) {
+				ledger_.forget(slot);
+			}
+			state_ = Idle{};
+		}
+		if (std::holds_alternative<Idle>(state_)) {
+			queue_exit(health_, std::move(trouble));
+		}
+		auto stopped = step_stopping();
+		if (!stopped) {
+			// The oldest ticket still unanswered, or the next to go out while the rings are full.
+			return give_up_at(give_up, awaited_.empty() ? submitted_ + 1 : awaited_.front().ticket);
+		}
+		return stopped;
+	}
+
+	/**
+	 * Fresh rings for the next launch of the loops, after a stop: a ring that carried an exit ticket takes no more, and
 	 * the new loops count tickets from one. The mask buffers' flags go back to zero so no stale release passes for a new
 	 * ticket.
 	 */
 	[[nodiscard]] auto renew(device::Devices const& devices) -> core::Result<void, DecodeError> {
-		core::invariant(!running_.has_value());
+		core::invariant(std::holds_alternative<Stopped>(state_) && outgoing_.empty() && awaited_.empty());
 		auto zero = Ring::create(devices.context(model::Card::Zero));
 		auto one = zero.and_then([&](Ring const&) {
 			return Ring::create(devices.context(model::Card::One));
@@ -321,6 +427,9 @@ public:
 			return fail(one.error());
 		}
 		rings_ = {std::move(*zero), std::move(*one)};
+		submitted_ = 0;
+		state_ = Idle{};
+		health_ = Health::Healthy;
 		for (auto& buffer : masks_) {
 			for (auto& flag : buffer.host()[0].flag) {
 				decode_device::release_masks(flag, 0);
@@ -339,40 +448,99 @@ public:
 	}
 
 private:
-	/** The answers of both cards to `pending`, once both are in and agree on every row. */
-	[[nodiscard]] auto agreed(Pending const& pending, std::chrono::steady_clock::time_point deadline) -> core::Result<Result, DecodeError> {
-		auto answers = collect(pending.ticket, deadline);
-		if (!answers) {
-			return std::unexpected(answers.error());
-		}
-		running_ = std::nullopt;
-		auto const& [zero, one] = *answers;
-		for (auto index = std::size_t{0}; index < pending.rows.size(); ++index) {
-			if (!same_outcome(std::span{zero.slots}[index], std::span{one.slots}[index])) {
-				return fail(CardsDisagree{.ticket = pending.ticket});
-			}
-		}
-		return zero;
-	}
+	Session(std::array<Ring, model::cards> rings, std::array<MaskBuffer, model::cards> masks)
+	    : rings_{std::move(rings)}, masks_{std::move(masks)}, descriptor_{std::make_unique<Descriptor>()}, begun_descriptor_{std::make_unique<Descriptor>()} {}
 
 	[[nodiscard]] static auto took(Result const& answer) -> std::chrono::nanoseconds {
 		return std::chrono::nanoseconds{core::narrow<std::int64_t>(answer.finished - answer.started)};
 	}
 
-	/** Posts `pending` to both cards after the queued commands: all but the last ticket's worth go ahead on their own. */
-	[[nodiscard]] auto post(Pending pending, std::chrono::steady_clock::time_point deadline) -> core::Result<Pending, DecodeError> {
-		core::invariant(!running_.has_value());
+	[[nodiscard]] auto begun(Pending const& pending) const -> bool {
+		auto const ticketed = core::alternative<Ticketed>(state_);
+		return ticketed.has_value() && ticketed->ticket == pending.ticket;
+	}
+
+	/** Verify rows a ticket runs: every row's committed token and its drafts. */
+	[[nodiscard]] static auto verify_rows(Pending const& pending) -> std::size_t {
+		auto rows = std::size_t{0};
+		for (auto const& plan : pending.planned) {
+			rows += 1U + plan.run.drafts;
+		}
+		return rows;
+	}
+
+	/** Releases `rows` masks allowing every row of both cards for `ticket`: what a ticket abandoned before its masks runs on. */
+	auto release_all(std::uint64_t ticket, std::size_t rows) -> void {
+		auto const half = decode_device::mask_half(ticket);
+		for (auto& buffer : masks_) {
+			auto& words = std::span{buffer.host()[0].half}[half].words;
+			for (auto row = std::size_t{0}; row < rows; ++row) {
+				std::ranges::fill(std::span{words}[row], ~0U);
+			}
+			decode_device::release_masks(std::span{buffer.host()[0].flag}[half], ticket);
+		}
+	}
+
+	/** The loops are broken by `error`: it is kept, and returned to every later shutdown. */
+	[[nodiscard]] auto broke(DecodeError error) -> std::optional<core::Result<void, DecodeError>> {
+		state_ = Broken{.error = error};
+		return std::unexpected(std::move(error));
+	}
+
+	[[nodiscard]] auto give_up_at(std::chrono::steady_clock::time_point give_up, std::uint64_t ticket) -> std::optional<core::Result<void, DecodeError>> {
+		if (std::chrono::steady_clock::now() < give_up) {
+			return std::nullopt;
+		}
+		return broke(DecodeError{.reason = Abandoned{.ticket = ticket}});
+	}
+
+	/** Queues the exits, behind every queued command when the cards are healthy, and none otherwise. */
+	auto queue_exit(Health health, std::optional<DecodeError> trouble) -> void {
+		auto cut = take_commands();
+		if (health == Health::Healthy) {
+			for (auto& ticket : cut) {
+				outgoing_.push_back({.ask = Ask::Apply, .commands = std::move(ticket)});
+			}
+		}
+		outgoing_.push_back({.ask = Ask::Exit, .commands = {}});
+		state_ = Stopping{.trouble = std::move(trouble)};
+	}
+
+	/** One step of a stop: done once every queued ticket, the exits last, is answered. */
+	[[nodiscard]] auto step_stopping() -> std::optional<core::Result<void, DecodeError>> {
+		if (auto failed = pump(); failed) {
+			return broke(*failed);
+		}
+		if (!outgoing_.empty() || !awaited_.empty()) {
+			return std::nullopt;
+		}
+		auto trouble = std::get<Stopping>(state_).trouble;
+		state_ = Stopped{.trouble = trouble};
+		if (trouble) {
+			return std::unexpected(*trouble);
+		}
+		return core::Result<void, DecodeError>{};
+	}
+
+	/**
+	 * Queues `pending` behind the queued commands (all but the last ticket's worth go ahead on their own) and submits
+	 * what fits. Tickets are numbered in submission order on both rings, so the begun ticket's number is known now.
+	 */
+	[[nodiscard]] auto post(Pending pending) -> core::Result<Pending, DecodeError> {
+		// Broken loops take nothing more: the failure is returned again, and only a shutdown ends them.
+		if (auto const broken = core::alternative<Broken>(state_)) {
+			return std::unexpected(broken->error);
+		}
+		core::invariant(std::holds_alternative<Idle>(state_) && outgoing_.empty());
 		auto cut = take_commands();
 		auto last = cut.empty() ? std::vector<decode_device::Command>{} : std::move(cut.back());
 		if (!cut.empty()) {
 			cut.pop_back();
 		}
-		for (auto const& ticket : cut) {
-			if (auto applied = run_apply(ticket, deadline); !applied) {
-				return std::unexpected(applied.error());
-			}
+		for (auto& ticket : cut) {
+			outgoing_.push_back({.ask = Ask::Apply, .commands = std::move(ticket)});
 		}
-		auto& descriptor = *descriptor_;
+		auto& descriptor = *begun_descriptor_;
 		descriptor = Descriptor{};
 		descriptor.work = pending.work;
 		descriptor.depth = pending.depth;
@@ -382,36 +550,139 @@ private:
 			std::span{descriptor.slots}[core::narrow<std::size_t>(index)] = plan.run;
 		}
 		std::ranges::copy(last, std::span{descriptor.command}.begin());
-		auto ticket = submit(descriptor, deadline);
-		if (!ticket) {
-			return std::unexpected(ticket.error());
+		outgoing_.push_back({.ask = Ask::Begun, .commands = {}});
+		pending.ticket = submitted_ + outgoing_.size();
+		auto slots = std::vector<kv::Slot>{};
+		for (auto const& row : pending.rows) {
+			slots.push_back(row.slot);
 		}
-		pending.ticket = *ticket;
-		running_ = *ticket;
+		state_ = Ticketed{.ticket = pending.ticket,
+		                  .slots = std::move(slots),
+		                  .verify_rows = verify_rows(pending),
+		                  .masking = Masking::Unpublished,
+		                  .answers = std::nullopt};
+		if (auto failed = pump(); failed) {
+			state_ = Broken{.error = *failed};
+			return std::unexpected(*failed);
+		}
 		return pending;
 	}
 
-	Session(std::array<Ring, model::cards> rings, std::array<MaskBuffer, model::cards> masks)
-	    : rings_{std::move(rings)}, masks_{std::move(masks)}, descriptor_{std::make_unique<Descriptor>()} {}
+	/**
+	 * Both cards' answers to the begun ticket, once every ticket ahead of it has been answered and both are in; nullopt
+	 * while any is missing. They must agree on every row; cards that do not are suspect from then on.
+	 */
+	[[nodiscard]] auto try_agreed(Pending const& pending) -> std::optional<core::Result<Result, DecodeError>> {
+		core::invariant(begun(pending));
+		if (auto failed = pump(); failed) {
+			state_ = Broken{.error = *failed};
+			return std::unexpected(*failed);
+		}
+		auto& ticketed = std::get<Ticketed>(state_);
+		if (!ticketed.answers) {
+			return std::nullopt;
+		}
+		auto const [zero, one] = *ticketed.answers;
+		auto const disagree = disagreement(pending.ticket, ticketed.slots, zero, one);
+		state_ = Idle{};
+		if (disagree) {
+			health_ = Health::Suspect;
+			return fail(*disagree);
+		}
+		return core::Result<Result, DecodeError>{zero};
+	}
+
+	/**
+	 * One non-blocking step of the ticket pipeline: submits queued tickets while both rings have room, then collects
+	 * whatever both cards have answered, oldest first. An answer to the begun ticket is kept in the ticketed state.
+	 * Returns the failure, if a loop answered a ticket with its exit or a result where an exit was due.
+	 */
+	[[nodiscard]] auto pump() -> std::optional<DecodeError> {
+		while (!outgoing_.empty() && std::ranges::all_of(rings_, [](Ring const& ring) { return ring.in_flight() < decode_device::ring_slots; })) {
+			auto const next = std::move(outgoing_.front());
+			outgoing_.pop_front();
+			auto const ticket = submit(next);
+			awaited_.push_back({.ask = next.ask, .ticket = ticket, .answers = {}});
+		}
+		while (!awaited_.empty()) {
+			auto& oldest = awaited_.front();
+			for (auto const card : device::card_pair) {
+				auto& answer = oldest.answers.at(card_index(card));
+				if (answer) {
+					continue;
+				}
+				auto const collected = rings_.at(card_index(card)).try_collect();
+				if (!collected) {
+					continue;
+				}
+				// An exit ticket is answered by the exit acknowledgement, every other by a result.
+				auto const exited = std::holds_alternative<device::Exited>(*collected);
+				if (exited != (oldest.ask == Ask::Exit)) {
+					outgoing_.clear();
+					awaited_.clear();
+					return DecodeError{.reason = LoopGone{.ticket = oldest.ticket}};
+				}
+				answer = exited ? Result{} : std::get<device::Ran<Result>>(*collected).result;
+			}
+			auto const& [zero, one] = oldest.answers;
+			if (!zero || !one) {
+				return std::nullopt;
+			}
+			if (auto const ticketed = core::alternative<Ticketed>(state_); ticketed && oldest.ask == Ask::Begun) {
+				ticketed->answers = std::array{*zero, *one};
+			}
+			awaited_.pop_front();
+		}
+		return std::nullopt;
+	}
+
+	/** Submits one ticket to both rings, which have room; both hand out the same number. */
+	[[nodiscard]] auto submit(Outgoing const& next) -> std::uint64_t {
+		auto const descriptor = [&] -> Descriptor const& {
+			if (next.ask == Ask::Begun) {
+				return *begun_descriptor_;
+			}
+			auto& apply = *descriptor_;
+			apply = Descriptor{};
+			apply.work = decode_device::Work::Apply;
+			apply.commands = core::narrow<unsigned>(next.commands.size());
+			std::ranges::copy(next.commands, std::span{apply.command}.begin());
+			return apply;
+		};
+		std::array<std::uint64_t, model::cards> tickets{};
+		for (auto const card : device::card_pair) {
+			auto& ring = rings_.at(card_index(card));
+			auto const ticket = next.ask == Ask::Exit ? ring.try_exit() : ring.try_submit(descriptor());
+			if (!ticket) {
+				// Not reached: a ticket is submitted only while both rings have room.
+				core::invariant(false);
+				std::unreachable();
+			}
+			tickets.at(card_index(card)) = ticket->value;
+		}
+		++submitted_;
+		core::invariant(tickets[0] == tickets[1] && tickets[0] == submitted_);
+		return tickets[0];
+	}
 
 	[[nodiscard]] static auto check(sched::Batch const& batch) -> std::optional<Refused> {
 		if (batch.rows.empty()) {
-			return Refused{.reason = Refusal::NoRows};
+			return Refused{.reason = Refusal::NoRows, .ticket = std::nullopt};
 		}
 		if (batch.rows.size() * (1 + model::drafts(batch.depth)) > decode_device::max_rows) {
-			return Refused{.reason = Refusal::OverBudget};
+			return Refused{.reason = Refusal::OverBudget, .ticket = std::nullopt};
 		}
 		auto const ascending = std::ranges::adjacent_find(batch.rows, [](sched::Row const& left, sched::Row const& right) {
 			return left.slot.index() >= right.slot.index();
 		});
 		if (ascending != batch.rows.end()) {
-			return Refused{.reason = Refusal::SlotOrder};
+			return Refused{.reason = Refusal::SlotOrder, .ticket = std::nullopt};
 		}
 		auto const past = std::ranges::any_of(batch.rows, [](sched::Row const& row) {
 			return row.position + sched::lookahead > model::max_positions;
 		});
 		if (past) {
-			return Refused{.reason = Refusal::PastContext};
+			return Refused{.reason = Refusal::PastContext, .ticket = std::nullopt};
 		}
 		return std::nullopt;
 	}
@@ -422,65 +693,21 @@ private:
 		return cut;
 	}
 
-	[[nodiscard]] auto run_apply(std::span<decode_device::Command const> commands, std::chrono::steady_clock::time_point deadline)
-	    -> core::Result<void, DecodeError> {
-		auto& descriptor = *descriptor_;
-		descriptor = Descriptor{};
-		descriptor.work = decode_device::Work::Apply;
-		descriptor.commands = core::narrow<unsigned>(commands.size());
-		std::ranges::copy(commands, std::span{descriptor.command}.begin());
-		return submit(descriptor, deadline).and_then([&](std::uint64_t ticket) {
-			return collect(ticket, deadline).transform([](auto const&) {});
-		});
-	}
-
-	/** Posts `descriptor` to both cards; both rings hand out tickets in lockstep, so one number names it on both. */
-	[[nodiscard]] auto submit(Descriptor const& descriptor, std::chrono::steady_clock::time_point deadline) -> core::Result<std::uint64_t, DecodeError> {
-		std::array<std::uint64_t, model::cards> tickets{};
-		for (auto const card : device::card_pair) {
-			auto& ring = rings_.at(card_index(card));
-			auto const ticket = poll_until(deadline, [&] {
-				return ring.try_submit(descriptor);
-			});
-			if (!ticket) {
-				return fail(TimedOut{.waiting = Waiting::Submit, .ticket = 0});
-			}
-			tickets.at(card_index(card)) = ticket->value;
-		}
-		core::invariant(tickets[0] == tickets[1]);
-		return tickets[0];
-	}
-
-	/** Both cards' results for `ticket`, the oldest each has outstanding. */
-	[[nodiscard]] auto collect(std::uint64_t ticket, std::chrono::steady_clock::time_point deadline)
-	    -> core::Result<std::array<Result, model::cards>, DecodeError> {
-		std::array<Result, model::cards> results{};
-		for (auto const card : device::card_pair) {
-			auto& ring = rings_.at(card_index(card));
-			auto const answer = poll_until(deadline, [&] {
-				return ring.try_collect();
-			});
-			if (!answer) {
-				return fail(TimedOut{.waiting = Waiting::Answer, .ticket = ticket});
-			}
-			auto const ran = core::alternative<device::Ran<Result>>(*answer);
-			if (!ran) {
-				return fail(LoopGone{.ticket = ticket});
-			}
-			core::invariant(ran->ticket.value == ticket);
-			results.at(card_index(card)) = ran->result;
-		}
-		return results;
-	}
-
 	std::array<Ring, model::cards> rings_;
 	std::array<MaskBuffer, model::cards> masks_;
-	/** Descriptor staging: 8.7 KB, built in place for each ticket. */
+	/** Descriptor staging, 8.7 KB each: a command-only ticket's, built as it is submitted, and the begun ticket's. */
 	std::unique_ptr<Descriptor> descriptor_;
+	std::unique_ptr<Descriptor> begun_descriptor_;
 	Ledger ledger_;
+	/** Pool commands queued for the next ticket. */
 	std::vector<decode_device::Command> commands_;
-	/** The ticket begun and not yet completed. */
-	std::optional<std::uint64_t> running_;
+	/** Tickets waiting for room in the rings, and tickets waiting for answers, each in submission order. */
+	std::deque<Outgoing> outgoing_;
+	std::deque<Awaited> awaited_;
+	/** Tickets submitted to each ring so far: the last one's number. */
+	std::uint64_t submitted_ = 0;
+	LoopState state_ = Idle{};
+	Health health_ = Health::Healthy;
 };
 
 }

@@ -160,7 +160,8 @@ struct Masks {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The control block: the words that must read zero before the kernel starts, which the host uploads zeroed.
+// The control block, zeroed once when the engine opens: a loop that exits leaves its barrier's arrivals at zero, its
+// generation may stand anywhere, and each launch meets the peer on its own epoch, so a relaunch needs no zeroing.
 
 struct alignas(128) Line {
 	unsigned long long word;
@@ -202,6 +203,11 @@ struct Params {
 	/** The resident ring's slots and the mask buffer, in mapped host memory. */
 	Address ring;
 	Address masks;
+	/**
+	 * Which launch of the loops this is, from 1: the cards meet at start by publishing it to each other, so a relaunch
+	 * needs no control block zeroed again.
+	 */
+	unsigned long long launch;
 	/** This card's rank: it chooses the card's half of the mtp fc's two inputs. */
 	unsigned card;
 	unsigned unused;

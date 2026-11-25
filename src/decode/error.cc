@@ -4,7 +4,9 @@ export module engine.decode:error;
 import std;
 import engine.core;
 import engine.device;
+import engine.file;
 import engine.image;
+import engine.model;
 
 namespace engine::decode {
 
@@ -28,6 +30,8 @@ export enum class Refusal : std::uint8_t {
 
 export struct [[nodiscard]] Refused {
 	Refusal reason;
+	/** The ticket whose masks were refused; none for a batch refused before it was numbered. */
+	std::optional<std::uint64_t> ticket;
 
 	[[nodiscard]] constexpr auto retry() const -> core::Retry {
 		switch (reason) {
@@ -46,18 +50,22 @@ export struct [[nodiscard]] Refused {
 	[[nodiscard]] constexpr auto operator==(Refused const&) const -> bool = default;
 };
 
-/** What the host was waiting for when its deadline passed. */
+/** What the bring-up was waiting for when its deadline passed. */
 export enum class Waiting : std::uint8_t {
-	/** A free ring slot to submit into. */
-	Submit,
-	/** The cards' answer to a ticket. */
-	Answer,
+	/** The copy of the card's image to the card. */
+	Weights,
+	/** The copy of the card's lm_head row-to-token table. */
+	RowTokens,
+	/** The zeroing of the card's control block. */
+	Control,
+	/** The rope table's fill. */
+	Rotations,
 };
 
-/** The deadline passed first; the ticket may still be answered later. */
+/** The bring-up's deadline passed first, waiting on `card` for `waiting`. */
 export struct [[nodiscard]] TimedOut {
+	model::Card card;
 	Waiting waiting;
-	std::uint64_t ticket;
 
 	[[nodiscard]] constexpr auto retry() const -> core::Retry {
 		return core::Retry::Transient;
@@ -66,12 +74,62 @@ export struct [[nodiscard]] TimedOut {
 	[[nodiscard]] constexpr auto operator==(TimedOut const&) const -> bool = default;
 };
 
+/** Which of the three images an image failure is about. */
+export enum class ImageOf : std::uint8_t {
+	Host,
+	CardZero,
+	CardOne,
+};
+
+/** An image could not be opened: its file could not be mapped, or its bytes were refused. */
+export struct [[nodiscard]] Unloadable {
+	ImageOf image;
+	image::ImageError error;
+
+	[[nodiscard]] constexpr auto retry() const -> core::Retry {
+		return error.retry();
+	}
+
+	[[nodiscard]] constexpr auto operator==(Unloadable const&) const -> bool = default;
+};
+
 /**
- * The two cards answered one ticket differently. Both compute the same verdict from the same merged candidates, so
- * this is a broken exchange or a broken card, never a race the engine allows.
+ * A shutdown gave up on the loops at its deadline: `ticket` (the begun one or an exit) was never answered, or, with
+ * none, every ticket was answered but a kernel never finished. The cards are in no known state, and nothing more is sent
+ * to them.
+ */
+export struct [[nodiscard]] Abandoned {
+	std::optional<std::uint64_t> ticket;
+
+	[[nodiscard]] constexpr auto retry() const -> core::Retry {
+		return core::Retry::Permanent;
+	}
+
+	[[nodiscard]] constexpr auto operator==(Abandoned const&) const -> bool = default;
+};
+
+/** What of a slot's outcome the cards answered differently. */
+export enum class Disagreement : std::uint8_t {
+	/** How many drafts the slot accepted. */
+	Accepted,
+	/** A token the slot committed. */
+	Committed,
+	/** A draft for the slot's next cycle. */
+	Drafted,
+};
+
+/**
+ * The two cards answered one ticket differently: for `slot`, its `what` at index `at` (0 for `Accepted`), card zero
+ * saying `zero` and card one `one`; the first difference, in row order. Both cards compute the same verdict from the
+ * same merged candidates, so this is a broken exchange or a broken card, never a race the engine allows.
  */
 export struct [[nodiscard]] CardsDisagree {
 	std::uint64_t ticket;
+	std::uint32_t slot;
+	Disagreement what;
+	std::uint32_t at;
+	std::uint32_t zero;
+	std::uint32_t one;
 
 	[[nodiscard]] constexpr auto retry() const -> core::Retry {
 		return core::Retry::Permanent;
@@ -93,7 +151,7 @@ export struct [[nodiscard]] LoopGone {
 
 /** Every way decoding on the cards fails. */
 export struct [[nodiscard]] DecodeError {
-	std::variant<device::DeviceError, image::ImageError, Refused, TimedOut, CardsDisagree, LoopGone> reason;
+	std::variant<device::DeviceError, Unloadable, Refused, TimedOut, Abandoned, CardsDisagree, LoopGone> reason;
 
 	[[nodiscard]] auto retry() const -> core::Retry {
 		return std::visit(
@@ -108,6 +166,158 @@ export struct [[nodiscard]] DecodeError {
 
 [[nodiscard]] auto fail(auto reason) -> std::unexpected<DecodeError> {
 	return std::unexpected(DecodeError{.reason = std::move(reason)});
+}
+
+[[nodiscard]] constexpr auto name(Refusal refusal) -> std::string_view {
+	switch (refusal) {
+	case Refusal::NoRows:
+		return "it has no rows";
+	case Refusal::OverBudget:
+		return "it has more rows than the row budget holds at its depth";
+	case Refusal::SlotOrder:
+		return "its rows are not in ascending slot order, or name a slot twice";
+	case Refusal::PastContext:
+		return "a row would write kv past the longest sequence";
+	case Refusal::MaskCount:
+		return "the masks are not one per verify row";
+	case Refusal::EmptyMask:
+		return "a verify row's mask allows no token";
+	case Refusal::WrongTicket:
+		return "the masks are for a ticket other than the one begun";
+	}
+	std::unreachable();
+}
+
+[[nodiscard]] constexpr auto name(Waiting waiting) -> std::string_view {
+	switch (waiting) {
+	case Waiting::Weights:
+		return "the copy of its image";
+	case Waiting::RowTokens:
+		return "the copy of its lm_head row-to-token table";
+	case Waiting::Control:
+		return "the zeroing of its control block";
+	case Waiting::Rotations:
+		return "the fill of the rope table";
+	}
+	std::unreachable();
+}
+
+[[nodiscard]] constexpr auto name(ImageOf image) -> std::string_view {
+	switch (image) {
+	case ImageOf::Host:
+		return "the host image";
+	case ImageOf::CardZero:
+		return "card 0's image";
+	case ImageOf::CardOne:
+		return "card 1's image";
+	}
+	std::unreachable();
+}
+
+[[nodiscard]] constexpr auto name(file::Failure failure) -> std::string_view {
+	switch (failure) {
+	case file::Failure::NotFound:
+		return "there is no file at its path";
+	case file::Failure::Permission:
+		return "the process may not read it";
+	case file::Failure::NotRegular:
+		return "its path is not a regular file";
+	case file::Failure::Empty:
+		return "the file is empty";
+	case file::Failure::Exhausted:
+		return "the process ran out of descriptors or address space mapping it";
+	case file::Failure::MapFailed:
+		return "the kernel refused to map it";
+	case file::Failure::Unreadable:
+		return "it cannot be opened or inspected";
+	}
+	std::unreachable();
+}
+
+[[nodiscard]] constexpr auto name(image::Failure failure) -> std::string_view {
+	switch (failure) {
+	case image::Failure::Truncated:
+		return "it ends before the payload its table lays out";
+	case image::Failure::Overlong:
+		return "it goes on past the payload its table lays out";
+	case image::Failure::BadMagic:
+		return "it is not a baked image";
+	case image::Failure::UnsupportedVersion:
+		return "its format version is not this engine's";
+	case image::Failure::ModelMismatch:
+		return "it was baked from another model description";
+	case image::Failure::CheckpointMismatch:
+		return "it was baked from another checkpoint";
+	case image::Failure::WrongTarget:
+		return "it was baked for another memory";
+	case image::Failure::ScheduleMismatch:
+		return "its section table is not this engine's catalog";
+	case image::Failure::DirtyPadding:
+		return "the bytes before its payload are not all zero";
+	case image::Failure::PayloadMismatch:
+		return "its payload is not the bytes the baker hashed";
+	}
+	std::unreachable();
+}
+
+[[nodiscard]] constexpr auto name(Disagreement what) -> std::string_view {
+	switch (what) {
+	case Disagreement::Accepted:
+		return "drafts accepted";
+	case Disagreement::Committed:
+		return "committed token";
+	case Disagreement::Drafted:
+		return "next draft";
+	}
+	std::unreachable();
+}
+
+struct Describe {
+	[[nodiscard]] auto operator()(device::DeviceError const& error) const -> std::string {
+		return std::format("a card failed: {}", device::describe(error));
+	}
+
+	[[nodiscard]] auto operator()(Unloadable const& unloadable) const -> std::string {
+		// The image module has no description of its own errors yet; this one names every case it has.
+		auto const file = core::alternative<file::FileError>(unloadable.error.cause);
+		if (file) {
+			return std::format("{} cannot be mapped: {}", name(unloadable.image), name(file->failure));
+		}
+		return std::format("{} is refused: {}; rebake it with this engine's geezuz-bake", name(unloadable.image),
+		                   name(std::get<image::Rejection>(unloadable.error.cause).failure));
+	}
+
+	[[nodiscard]] auto operator()(Refused const& refused) const -> std::string {
+		if (refused.ticket) {
+			return std::format("the masks for ticket {} are refused: {}", *refused.ticket, name(refused.reason));
+		}
+		return std::format("a batch is refused before it reached the cards: {}", name(refused.reason));
+	}
+
+	[[nodiscard]] auto operator()(TimedOut const& timed_out) const -> std::string {
+		return std::format("the bring-up's deadline passed on card {} waiting for {}", std::to_underlying(timed_out.card), name(timed_out.waiting));
+	}
+
+	[[nodiscard]] auto operator()(Abandoned const& abandoned) const -> std::string {
+		if (abandoned.ticket) {
+			return std::format("the decode loops were abandoned at the shutdown's deadline: ticket {} was never answered", *abandoned.ticket);
+		}
+		return "the decode loops were abandoned at the shutdown's deadline: every ticket was answered but a kernel never finished";
+	}
+
+	[[nodiscard]] auto operator()(CardsDisagree const& disagree) const -> std::string {
+		return std::format("the cards disagree on ticket {}: slot {}'s {} {} is {} on card 0 and {} on card 1", disagree.ticket, disagree.slot, name(disagree.what),
+		                   disagree.at, disagree.zero, disagree.one);
+	}
+
+	[[nodiscard]] auto operator()(LoopGone const& gone) const -> std::string {
+		return std::format("a decode loop is gone: ticket {} was answered by an exit, or an exit by a result", gone.ticket);
+	}
+};
+
+/** One sentence for an operator naming what failed and every fact it failed on: the one description of a decode error. */
+export [[nodiscard]] auto describe(DecodeError const& error) -> std::string {
+	return std::visit(Describe{}, error.reason);
 }
 
 }

@@ -38,6 +38,21 @@ auto const deadline_after = [] {
 	return std::chrono::steady_clock::now() + std::chrono::seconds{30};
 };
 
+/** Polls `poll` until it yields an outcome, as the pipeline's run loop does; a poll that never does fails as abandoned. */
+template<class Poll>
+[[nodiscard]] auto settled(Poll poll) -> std::remove_cvref_t<decltype(*poll())> {
+	auto const deadline = deadline_after();
+	for (;;) {
+		if (auto outcome = poll()) {
+			return std::move(*outcome);
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return std::unexpected(decode::DecodeError{.reason = decode::Abandoned{.ticket = 0}});
+		}
+		std::this_thread::yield();
+	}
+}
+
 [[nodiscard]] constexpr auto rule() -> engine::sampling::Rule {
 	return {.seed = 7,
 	        .filter = {.temperature = 1.0, .top_p = 1.0, .min_p = 0.0, .top_k = 1, .nucleus = engine::sampling::Nucleus::Off},
@@ -112,9 +127,12 @@ struct FakeLoop {
 
 using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, FakeLoop>;
 
+/** One verify row's masks, each card's in its own row order: what the grammar hands the pipeline. */
+using RowMasks = std::array<std::array<std::uint64_t, model::card_mask_words>, model::cards>;
+
 /** A row's mask allowing exactly `tokens`, in each card's row order. */
-[[nodiscard]] auto mask_of(std::span<decode::Token const> tokens) -> decode::CardMasks {
-	auto masks = decode::CardMasks{};
+[[nodiscard]] auto mask_of(std::span<decode::Token const> tokens) -> RowMasks {
+	auto masks = RowMasks{};
 	for (auto const token : tokens) {
 		auto const place = vocabulary::place(token);
 		masks.at(std::to_underlying(place.card)).at(place.row / 64) |= std::uint64_t{1} << (place.row % 64);
@@ -123,9 +141,12 @@ using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, Fake
 }
 
 
-/** Runs `scenario(session, seen)` with both cards' fake loops serving, then stops both loops. */
+/** How a scenario leaves the loops: shut down cleanly after it, or failed, as it checked itself. */
+enum class Ending : std::uint8_t { Clean, Failed };
+
+/** Runs `scenario(session, seen)` with both cards' fake loops serving, then shuts both loops down, ending as `ending`. */
 template<class Scenario>
-[[nodiscard]] auto with_loops(Honesty card_one, Scenario scenario) -> bool {
+[[nodiscard]] auto with_loops_ending(Honesty card_one, Ending ending, Scenario scenario) -> bool {
 	auto const driver = fake::Fake{fake::Machine{}};
 	auto devices = device::Devices::open(driver.driver());
 	if (!devices) {
@@ -140,8 +161,14 @@ template<class Scenario>
 	auto const zero = Kernel{session->addresses(Card::Zero).ring, FakeLoop{.masks = masks, .seen = seen[0], .honesty = Honesty::Truthful}};
 	auto const one = Kernel{session->addresses(Card::One).ring, FakeLoop{.masks = masks, .seen = seen[1], .honesty = card_one}};
 	auto const held = scenario(*session, seen);
-	auto const stopped = session->stop(deadline_after());
-	return held && stopped.has_value() && driver.violations().empty();
+	auto const ended = settled([&] { return session->try_shutdown(deadline_after()); });
+	return held && ended.has_value() == (ending == Ending::Clean) && driver.violations().empty();
+}
+
+/** Runs `scenario(session, seen)` with both cards' fake loops serving, then shuts both loops down cleanly. */
+template<class Scenario>
+[[nodiscard]] auto with_loops(Honesty card_one, Scenario scenario) -> bool {
+	return with_loops_ending(card_one, Ending::Clean, std::move(scenario));
 }
 
 [[nodiscard]] auto random_mask(std::mt19937_64& random) -> std::vector<decode::Token> {
@@ -153,10 +180,10 @@ template<class Scenario>
 /** One cycle's masks: the allowed tokens per mask index, and the masks they make. */
 struct CycleMasks {
 	std::vector<std::vector<decode::Token>> allowed;
-	std::vector<decode::CardMasks> masks;
+	std::vector<RowMasks> masks;
 
-	[[nodiscard]] auto operator()(std::size_t index) const -> decode::CardMasks const& {
-		return masks.at(index);
+	[[nodiscard]] auto operator()(std::size_t index, Card card) const -> decode::CardMask {
+		return masks.at(index).at(std::to_underlying(card));
 	}
 };
 
@@ -220,7 +247,7 @@ struct CycleMasks {
 				}
 				expected_replays.push_back(continues ? held->state.pending : 0U);
 			}
-			auto pending = session.begin(batch, deadline_after());
+			auto pending = session.begin(batch);
 			if (!pending) {
 				return false;
 			}
@@ -236,7 +263,7 @@ struct CycleMasks {
 			auto const width = 1 + model::drafts(batch.depth);
 			auto const rows = batch.rows;
 			auto planned = pending->planned;
-			auto done = session.complete(std::move(*pending), deadline_after());
+			auto done = settled([&] { return session.try_complete(*pending); });
 			if (!done || done->rows.size() != rows.size() || done->took != std::chrono::nanoseconds{500}) {
 				return false;
 			}
@@ -264,7 +291,7 @@ struct CycleMasks {
 	return with_loops(Honesty::Lying, [](decode::Session& session, std::array<Seen, 2>& /*seen*/) {
 		auto random = engine::testing::generator(5);
 		auto const live = std::array{std::size_t{2}};
-		auto pending = session.begin(batch_of(session, live, random), deadline_after());
+		auto pending = session.begin(batch_of(session, live, random));
 		if (!pending) {
 			return false;
 		}
@@ -273,13 +300,17 @@ struct CycleMasks {
 			return false;
 		}
 		auto const ticket = pending->ticket;
-		auto done = session.complete(std::move(*pending), deadline_after());
-		return !done && done.error() == decode::DecodeError{.reason = decode::CardsDisagree{.ticket = ticket}} && !session.ledger().held(kv::Slot::at(2));
+		auto done = settled([&] { return session.try_complete(*pending); });
+		auto const disagree = done ? std::nullopt : engine::core::alternative<decode::CardsDisagree>(done.error().reason);
+		// Card one claims one more accepted draft than card zero.
+		return disagree && disagree->ticket == ticket && disagree->slot == 2 && disagree->what == decode::Disagreement::Accepted &&
+		       disagree->one == disagree->zero + 1 && !session.ledger().held(kv::Slot::at(2));
 	});
 }
 
 [[nodiscard]] auto refused(auto const& result, decode::Refusal reason) -> bool {
-	return !result && result.error() == decode::DecodeError{.reason = decode::Refused{.reason = reason}};
+	auto const refusal = result ? std::nullopt : engine::core::alternative<decode::Refused>(result.error().reason);
+	return refusal && refusal->reason == reason;
 }
 
 /** Masks for another ticket, of the wrong count, or allowing nothing are refused, and the cycle still completes. */
@@ -287,7 +318,7 @@ struct CycleMasks {
 	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& /*seen*/) {
 		auto random = engine::testing::generator(6);
 		auto const live = std::array{std::size_t{0}, std::size_t{5}};
-		auto pending = session.begin(batch_of(session, live, random), deadline_after());
+		auto pending = session.begin(batch_of(session, live, random));
 		if (!pending) {
 			return false;
 		}
@@ -296,11 +327,11 @@ struct CycleMasks {
 		auto const wrong_ticket = refused(session.publish(stale, masks, masks.masks.size()), decode::Refusal::WrongTicket);
 		auto const wrong_count = refused(session.publish(*pending, masks, masks.masks.size() - 1), decode::Refusal::MaskCount);
 		auto const kept = masks.masks.front();
-		masks.masks.front() = decode::CardMasks{};
+		masks.masks.front() = RowMasks{};
 		auto const empty = refused(session.publish(*pending, masks, masks.masks.size()), decode::Refusal::EmptyMask);
 		masks.masks.front() = kept;
 		auto const published = session.publish(*pending, masks, masks.masks.size()).has_value();
-		auto const done = session.complete(std::move(*pending), deadline_after()).has_value();
+		auto const done = settled([&] { return session.try_complete(*pending); }).has_value();
 		return wrong_ticket && wrong_count && empty && published && done;
 	});
 }
@@ -311,17 +342,17 @@ struct CycleMasks {
 		auto const row = [](std::size_t slot, std::uint64_t position) {
 			return sched::Row{.slot = kv::Slot::at(slot), .request = {.bits = slot}, .position = position, .token = 1, .rule = rule(), .most = 1};
 		};
-		auto const empty = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {}}, deadline_after()), decode::Refusal::NoRows);
-		auto const order = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {row(3, 10), row(1, 10)}}, deadline_after()),
+		auto const empty = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {}}), decode::Refusal::NoRows);
+		auto const order = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {row(3, 10), row(1, 10)}}),
 		                           decode::Refusal::SlotOrder);
-		auto const twice = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {row(3, 10), row(3, 10)}}, deadline_after()),
+		auto const twice = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {row(3, 10), row(3, 10)}}),
 		                           decode::Refusal::SlotOrder);
 		auto rows = std::vector<sched::Row>{};
 		for (auto slot = std::size_t{0}; slot < model::slots; ++slot) {
 			rows.push_back(row(slot, 10));
 		}
-		auto const budget = refused(session.begin(sched::Batch{.depth = model::DraftDepth::Four, .rows = rows}, deadline_after()), decode::Refusal::OverBudget);
-		auto const past = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {row(0, model::max_positions - 2)}}, deadline_after()),
+		auto const budget = refused(session.begin(sched::Batch{.depth = model::DraftDepth::Four, .rows = rows}), decode::Refusal::OverBudget);
+		auto const past = refused(session.begin(sched::Batch{.depth = model::DraftDepth::One, .rows = {row(0, model::max_positions - 2)}}),
 		                          decode::Refusal::PastContext);
 		return empty && order && twice && budget && past && seen[0].cycles.empty() && seen[1].cycles.empty();
 	});
@@ -336,12 +367,12 @@ struct CycleMasks {
 		auto random = engine::testing::generator(8);
 		auto const live = std::array{std::size_t{4}};
 		// A first cycle, so slot 4 holds drafts.
-		auto first = session.begin(batch_of(session, live, random), deadline_after());
+		auto first = session.begin(batch_of(session, live, random));
 		if (!first) {
 			return false;
 		}
 		auto const first_masks = masks_for(first->mask_count(), random);
-		if (!session.publish(*first, first_masks, first_masks.masks.size()) || !session.complete(std::move(*first), deadline_after())) {
+		if (!session.publish(*first, first_masks, first_masks.masks.size()) || !settled([&] { return session.try_complete(*first); })) {
 			return false;
 		}
 		auto lowered = std::vector<dd::Command>{};
@@ -356,12 +387,12 @@ struct CycleMasks {
 		session.apply(load);
 		std::ranges::copy(decode::lower(load), std::back_inserter(lowered));
 		auto const held = session.ledger().held(kv::Slot::at(4));
-		auto pending = session.begin(batch_of(session, live, random), deadline_after());
+		auto pending = session.begin(batch_of(session, live, random));
 		if (!pending || held.has_value() || pending->planned.front().run.drafts != 0) {
 			return false;
 		}
 		auto const masks = masks_for(pending->mask_count(), random);
-		if (!session.publish(*pending, masks, masks.masks.size()) || !session.complete(std::move(*pending), deadline_after())) {
+		if (!session.publish(*pending, masks, masks.masks.size()) || !settled([&] { return session.try_complete(*pending); })) {
 			return false;
 		}
 		for (auto const& card : seen) {
@@ -391,15 +422,19 @@ struct CycleMasks {
 	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& seen) {
 		auto random = engine::testing::generator(9);
 		auto const prompt = sched::Row{.slot = kv::Slot::at(6), .request = {.bits = 3}, .position = 200, .token = 17, .rule = rule(), .most = 1};
-		auto pending = session.begin_prompt_end(prompt, model::DraftDepth::Three, deadline_after());
+		auto pending = session.begin_prompt_end(prompt, model::DraftDepth::Three);
 		if (!pending || pending->mask_count() != 1 || !pending->drafts(0).empty()) {
+			return false;
+		}
+		// The loops wait for the masks before they rank, so nothing can be answered yet: the poll says so and returns.
+		if (session.try_complete_prompt_end(*pending).has_value()) {
 			return false;
 		}
 		auto const masks = masks_for(1, random);
 		if (!session.publish(*pending, masks, 1)) {
 			return false;
 		}
-		auto const done = session.complete_prompt_end(std::move(*pending), deadline_after());
+		auto const done = settled([&] { return session.try_complete_prompt_end(*pending); });
 		auto const sampled = std::ranges::min(masks.allowed.front());
 		auto const& ran = seen[0].cycles.back();
 		if (!done || done->sampled != sampled || ran.work != dd::Work::PromptEnd || ran.live != 1 || ran.slots[0].drafts != 0 ||
@@ -407,7 +442,7 @@ struct CycleMasks {
 			return false;
 		}
 		auto const next = sched::Row{.slot = prompt.slot, .request = prompt.request, .position = 201, .token = sampled, .rule = rule(), .most = 4};
-		auto cycle = session.begin(sched::Batch{.depth = model::DraftDepth::Three, .rows = {next}}, deadline_after());
+		auto cycle = session.begin(sched::Batch{.depth = model::DraftDepth::Three, .rows = {next}});
 		if (!cycle) {
 			return false;
 		}
@@ -415,7 +450,7 @@ struct CycleMasks {
 		auto const continued = std::ranges::equal(cycle->drafts(0), drafted) && cycle->planned.front().run.replays == 0;
 		auto const cycle_masks = masks_for(cycle->mask_count(), random);
 		auto const finished = session.publish(*cycle, cycle_masks, cycle_masks.masks.size()).has_value() &&
-		                      session.complete(std::move(*cycle), deadline_after()).has_value();
+		                      settled([&] { return session.try_complete(*cycle); }).has_value();
 		return continued && finished;
 	});
 }
@@ -435,12 +470,12 @@ struct CycleMasks {
 			batch.rows.front().position = held->position;
 			batch.rows.front().token = held->token;
 		}
-		auto pending = session.begin(batch, deadline_after());
+		auto pending = session.begin(batch);
 		if (!pending) {
 			return false;
 		}
 		auto const masks = masks_for(pending->mask_count(), random);
-		if (!session.publish(*pending, masks, masks.masks.size()) || !session.complete(std::move(*pending), deadline_after())) {
+		if (!session.publish(*pending, masks, masks.masks.size()) || !settled([&] { return session.try_complete(*pending); })) {
 			return false;
 		}
 	}
@@ -461,7 +496,7 @@ struct CycleMasks {
 		auto save = kv::SaveSnapshot<kv::model_geometry>{.slot = kv::Slot::at(1), .blocks = {}};
 		std::ranges::fill(save.blocks, 5);
 		session.apply(save);
-		if (session.ledger().held(kv::Slot::at(1))->state.pending != 0 || !session.flush(deadline_after())) {
+		if (session.ledger().held(kv::Slot::at(1))->state.pending != 0 || !settled([&] { return session.try_stop(); })) {
 			return false;
 		}
 		auto const& applied = seen[0].applied.back();
@@ -469,6 +504,154 @@ struct CycleMasks {
 		return replay.action == dd::Action::Replay && replay.slot == 1 && replay.first == pending && replay.wave == 0 &&
 		       applied.size() == 1 + save.blocks.size() && applied[1].action == dd::Action::SaveSnapshotPart && applied[1].wave == 1;
 	});
+}
+
+
+/** Queues `count` table entries for the pool and returns them as the cards should see them, in order. */
+[[nodiscard]] auto queue_entries(decode::Session& session, int count, std::uint64_t first) -> std::vector<dd::Command> {
+	auto lowered = std::vector<dd::Command>{};
+	for (auto index = 0; index < count; ++index) {
+		auto const command = decode::PoolCommand{kv::SetTableEntry{
+		    .slot = kv::Slot::at(static_cast<std::size_t>(index) % model::slots), .entry = first + static_cast<std::uint64_t>(index), .block = 2}};
+		session.apply(command);
+		std::ranges::copy(decode::lower(command), std::back_inserter(lowered));
+	}
+	return lowered;
+}
+
+/** Whether both cards applied exactly `lowered`, in order, in command-only tickets. */
+[[nodiscard]] auto applied_exactly(std::array<Seen, 2> const& seen, std::span<dd::Command const> lowered) -> bool {
+	return std::ranges::all_of(seen, [&](Seen const& card) {
+		auto arrived = std::vector<dd::Command>{};
+		for (auto const& ticket : card.applied) {
+			arrived.insert(arrived.end(), ticket.begin(), ticket.end());
+		}
+		return std::ranges::equal(arrived, lowered, [](dd::Command const& left, dd::Command const& right) {
+			return left.action == right.action && left.slot == right.slot && left.first == right.first && left.second == right.second;
+		});
+	});
+}
+
+/** Runs one cycle of `slots` to its outcome. */
+[[nodiscard]] auto run_cycle(decode::Session& session, std::span<std::size_t const> slots, std::mt19937_64& random) -> bool {
+	auto pending = session.begin(batch_of(session, slots, random));
+	if (!pending) {
+		return false;
+	}
+	auto const masks = masks_for(pending->mask_count(), random);
+	return session.publish(*pending, masks, masks.masks.size()).has_value() && settled([&] { return session.try_complete(*pending); }).has_value();
+}
+
+/**
+ * Commands queued before a stop reach both cards before the loops exit, in order, in command-only tickets: a prefill
+ * that follows the stop sees every block table entry the scheduler set.
+ */
+[[nodiscard]] auto stops_apply_queued_commands() -> bool {
+	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& seen) {
+		auto const lowered = queue_entries(session, 700, 0);
+		auto const stopped = settled([&] { return session.try_stop(); });
+		return stopped.has_value() && applied_exactly(seen, lowered) && seen[0].applied.size() == 2 && seen[0].cycles.empty();
+	});
+}
+
+/** A shutdown from idle loops sends the queued commands, then the exits. */
+[[nodiscard]] auto shutdown_from_idle() -> bool {
+	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& seen) {
+		auto random = engine::testing::generator(11);
+		auto const live = std::array{std::size_t{7}};
+		if (!run_cycle(session, live, random)) {
+			return false;
+		}
+		auto const lowered = queue_entries(session, 40, 100);
+		auto const ended = settled([&] { return session.try_shutdown(deadline_after()); });
+		return ended.has_value() && applied_exactly(seen, lowered) && seen[1].cycles.size() == 1;
+	});
+}
+
+/**
+ * A shutdown with a cycle begun and its masks never published releases masks allowing everything, so the cycle runs
+ * out; its outcome is discarded and its slots forgotten, and the commands queued meanwhile still reach the cards.
+ */
+[[nodiscard]] auto shutdown_from_a_begun_cycle() -> bool {
+	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& seen) {
+		auto random = engine::testing::generator(12);
+		auto const live = std::array{std::size_t{1}, std::size_t{3}};
+		if (!run_cycle(session, live, random) || !session.ledger().held(kv::Slot::at(1))) {
+			return false;
+		}
+		auto const pending = session.begin(batch_of(session, live, random));
+		if (!pending) {
+			return false;
+		}
+		auto const lowered = queue_entries(session, 30, 200);
+		auto const ended = settled([&] { return session.try_shutdown(deadline_after()); });
+		return ended.has_value() && seen[0].cycles.size() == 2 && seen[1].cycles.size() == 2 && applied_exactly(seen, lowered) &&
+		       !session.ledger().held(kv::Slot::at(1)) && !session.ledger().held(kv::Slot::at(3));
+	});
+}
+
+/** A shutdown of stopped loops succeeds at once and sends nothing. */
+[[nodiscard]] auto shutdown_from_stopped() -> bool {
+	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& seen) {
+		if (!settled([&] { return session.try_stop(); })) {
+			return false;
+		}
+		auto const ended = session.try_shutdown(std::chrono::steady_clock::now());
+		return ended.has_value() && ended->has_value() && seen[0].applied.empty() && seen[0].cycles.empty();
+	});
+}
+
+/**
+ * A shutdown that finds the cards disagreeing on the begun cycle fails with what they disagreed on: the queued commands
+ * are not sent to suspect cards, the exits still are, and every later shutdown returns the same failure.
+ */
+[[nodiscard]] auto shutdown_fails_on_disagreeing_cards() -> bool {
+	return with_loops_ending(
+	    Honesty::Lying, Ending::Failed,
+	    [](decode::Session& session, std::array<Seen, 2>& seen) {
+		    auto random = engine::testing::generator(13);
+		    auto const live = std::array{std::size_t{5}};
+		    auto pending = session.begin(batch_of(session, live, random));
+		    if (!pending) {
+			    return false;
+		    }
+		    auto const masks = masks_for(pending->mask_count(), random);
+		    if (!session.publish(*pending, masks, masks.masks.size())) {
+			    return false;
+		    }
+		    std::ignore = queue_entries(session, 20, 300);
+		    auto const ended = settled([&] { return session.try_shutdown(deadline_after()); });
+		    auto const disagree = ended ? std::nullopt : engine::core::alternative<decode::CardsDisagree>(ended.error().reason);
+		    auto const again = session.try_shutdown(std::chrono::steady_clock::now());
+		    return disagree && disagree->ticket == pending->ticket && disagree->slot == 5 && again && !*again && again->error() == ended.error() &&
+		           seen[0].applied.empty() && seen[1].applied.empty() && !session.ledger().held(kv::Slot::at(5));
+	    });
+}
+
+/** Loops that never answer are abandoned at the shutdown's deadline, naming the ticket that went unanswered. */
+[[nodiscard]] auto silent_loops_are_abandoned() -> bool {
+	auto const driver = fake::Fake{fake::Machine{}};
+	auto devices = device::Devices::open(driver.driver());
+	if (!devices) {
+		return false;
+	}
+	auto session = decode::Session::create(*devices);
+	if (!session) {
+		return false;
+	}
+	auto random = engine::testing::generator(14);
+	auto const live = std::array{std::size_t{0}};
+	auto pending = session->begin(batch_of(*session, live, random));
+	if (!pending) {
+		return false;
+	}
+	auto const ended = session->try_shutdown(std::chrono::steady_clock::now());
+	if (!ended || *ended || ended->error() != decode::DecodeError{.reason = decode::Abandoned{.ticket = pending->ticket}}) {
+		return false;
+	}
+	// Abandoned loops take nothing more: a later batch fails with the same failure.
+	auto const later = session->begin(batch_of(*session, live, random));
+	return !later && later.error() == ended->error();
 }
 
 }
@@ -484,6 +667,12 @@ auto main() -> int {
 	    Case{.name = "pool commands reach the cards in order before the cycle", .holds = commands_go_ahead()},
 	    Case{.name = "a prompt's end samples under its mask and its drafts start the slot's decoding", .holds = prompt_end_starts_decoding()},
 	    Case{.name = "a snapshot is preceded by the replay of the slot's pending drafts", .holds = snapshots_take_the_pending_drafts()},
+	    Case{.name = "a stop applies the queued commands before the loops exit", .holds = stops_apply_queued_commands()},
+	    Case{.name = "a shutdown from idle loops sends the queued commands, then the exits", .holds = shutdown_from_idle()},
+	    Case{.name = "a shutdown runs out a begun cycle with unpublished masks and forgets its slots", .holds = shutdown_from_a_begun_cycle()},
+	    Case{.name = "a shutdown of stopped loops succeeds at once", .holds = shutdown_from_stopped()},
+	    Case{.name = "a shutdown that finds the cards disagreeing fails, skips the commands and still exits", .holds = shutdown_fails_on_disagreeing_cards()},
+	    Case{.name = "loops that never answer are abandoned at the deadline, and take nothing more", .holds = silent_loops_are_abandoned()},
 	};
 	return engine::testing::report(cases);
 }

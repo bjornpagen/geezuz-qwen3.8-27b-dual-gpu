@@ -41,6 +41,21 @@ auto const deadline_after = [] {
 	return std::chrono::steady_clock::now() + std::chrono::seconds{30};
 };
 
+/** Polls `poll` until it yields an outcome, as the pipeline's run loop does; a poll that never does fails as abandoned. */
+template<class Poll>
+[[nodiscard]] auto settled(Poll poll) -> std::remove_cvref_t<decltype(*poll())> {
+	auto const deadline = deadline_after();
+	for (;;) {
+		if (auto outcome = poll()) {
+			return std::move(*outcome);
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return std::unexpected(decode::DecodeError{.reason = decode::Abandoned{.ticket = std::nullopt}});
+		}
+		std::this_thread::yield();
+	}
+}
+
 template<image::Catalog C>
 [[nodiscard]] auto write_image(std::filesystem::path const& path, std::uint64_t seed) -> bool {
 	auto random = engine::testing::generator(seed);
@@ -109,7 +124,9 @@ using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, Exit
 		auto const lent = memories.image == one.image && memories.pool == one.pool && memories.states == one.states &&
 		                  memories.rotations == one.workspace + dd::workspace.exchange.rope_table && memories.tables == one.workspace + dd::workspace.tables &&
 		                  memories.prompt_row == one.workspace + dd::workspace.prompt;
-		if (!wired || !lent || !engine->start(deadline_after())) {
+		auto const borrowed = engine->card(Card::One);
+		auto const access = borrowed.context.ordinal() == 1 && borrowed.stream.ordinal() == 1 && engine->card(Card::Zero).stream.ordinal() == 0;
+		if (!wired || !lent || !access || !engine->start()) {
 			return false;
 		}
 		auto const launches = loops(driver);
@@ -124,14 +141,45 @@ using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, Exit
 		auto const stopped = [&] {
 			auto const loop_zero = Kernel{engine->parameters(Card::Zero).ring, Exits{}};
 			auto const loop_one = Kernel{engine->parameters(Card::One).ring, Exits{}};
-			return engine->stop(deadline_after()).has_value();
+			return settled([&] { return engine->try_stop(); }).has_value();
 		};
 		auto const first = stopped();
 		// A prefill chunk runs here, the loops gone; then they come back on fresh rings with the same memories.
 		auto const old_ring = engine->parameters(Card::Zero).ring;
-		auto const restarted = engine->start(deadline_after()).has_value() && engine->parameters(Card::Zero).ring != old_ring &&
+		auto const restarted = engine->start().has_value() && engine->parameters(Card::Zero).ring != old_ring &&
 		                       loops(driver).size() == 4 && engine->parameters(Card::Zero).workspace == zero.workspace;
 		held = launched && first && restarted && stopped();
+	}
+	return held && driver.violations().empty() && driver.nothing_live();
+}
+
+/**
+ * A shutdown ends the loops from every state: unlaunched and halted loops at once, running ones once both have answered
+ * their exits and their kernels have finished; loops that never answer fail at the deadline, and the failure is kept.
+ */
+[[nodiscard]] auto shuts_down_from_every_state(decode::Paths const& paths) -> bool {
+	auto const driver = fake::Fake{fake::Machine{}};
+	auto held = false;
+	{
+		auto engine = open(driver, paths);
+		if (!engine) {
+			return false;
+		}
+		auto const now = [] {
+			return std::chrono::steady_clock::now();
+		};
+		auto const unlaunched = engine->try_shutdown(now()) == std::optional{engine::core::Result<void, decode::DecodeError>{}};
+		auto const running = engine->start().has_value() && [&] {
+			auto const loop_zero = Kernel{engine->parameters(Card::Zero).ring, Exits{}};
+			auto const loop_one = Kernel{engine->parameters(Card::One).ring, Exits{}};
+			return settled([&] { return engine->try_shutdown(deadline_after()); }).has_value();
+		}();
+		auto const halted = engine->try_shutdown(now()) == std::optional{engine::core::Result<void, decode::DecodeError>{}};
+		// Relaunched with nothing serving the rings: the exits go unanswered until the deadline.
+		auto const silent = engine->start().has_value() ? engine->try_shutdown(now()) : std::nullopt;
+		auto const abandoned = silent && !*silent && std::holds_alternative<decode::Abandoned>(silent->error().reason);
+		auto const kept = engine->try_shutdown(now()) == silent;
+		held = unlaunched && running && halted && abandoned && kept;
 	}
 	return held && driver.violations().empty() && driver.nothing_live();
 }
@@ -142,7 +190,8 @@ using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, Exit
 	auto swapped = paths;
 	std::swap(swapped.card_zero, swapped.card_one);
 	auto const engine = open(driver, swapped);
-	auto const refused = !engine && std::holds_alternative<image::ImageError>(engine.error().reason);
+	auto const unloadable = engine ? std::nullopt : engine::core::alternative<decode::Unloadable>(engine.error().reason);
+	auto const refused = unloadable && unloadable->image == decode::ImageOf::CardZero && std::holds_alternative<image::Rejection>(unloadable->error.cause);
 	return refused && driver.nothing_live() && driver.violations().empty();
 }
 
@@ -192,6 +241,7 @@ auto main() -> int {
 	}
 	auto const cases = std::array{
 	    Case{.name = "the engine launches each card's loop with its cross-wired parameters and stops", .holds = brings_up_and_stops(*paths)},
+	    Case{.name = "a shutdown ends the loops from every state, and keeps a failure", .holds = shuts_down_from_every_state(*paths)},
 	    Case{.name = "an image for the wrong memory is refused at open", .holds = wrong_image_is_refused(*paths)},
 	    Case{.name = "every driver failure during bring-up fails cleanly", .holds = every_failure_is_clean(*paths)},
 	};

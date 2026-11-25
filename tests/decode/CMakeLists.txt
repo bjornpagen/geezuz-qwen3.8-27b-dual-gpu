@@ -9,3 +9,4 @@ engine_test(decode.session SOURCES session.test.cc
 engine_test(decode.engine SOURCES engine.test.cc
 	LINK engine_core engine_decode engine_decode_device engine_device engine_driver engine_driver_double engine_file_write engine_image
 	engine_image_synthetic engine_model)
+engine_test(decode.describe SOURCES describe.test.cc LINK engine_core engine_decode engine_device engine_file engine_image engine_model)

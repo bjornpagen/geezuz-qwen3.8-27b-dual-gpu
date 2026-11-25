@@ -81,14 +81,14 @@ struct Card {
 	std::optional<device::Event> launched;
 };
 
-/** Waits for a transfer and hands back its destination, or the copy's or the wait's failure. */
+/** Waits for a transfer and hands back its destination, or the copy's failure, or `late` past `deadline`. */
 template<class Destination, class Source>
-[[nodiscard]] auto finish(device::Transfer<Destination, Source> transfer, std::chrono::steady_clock::time_point deadline)
+[[nodiscard]] auto finish(device::Transfer<Destination, Source> transfer, std::chrono::steady_clock::time_point deadline, TimedOut late)
     -> core::Result<Destination, DecodeError> {
 	if (transfer.wait_until(deadline) == device::EventState::Pending) {
 		// The copy is still reading its source; the transfer may not be dropped while it does.
 		core::invariant(transfer.wait_until(std::chrono::steady_clock::time_point::max()) == device::EventState::Complete);
-		return fail(TimedOut{.waiting = Waiting::Answer, .ticket = 0});
+		return fail(late);
 	}
 	if (auto delivered = transfer.try_finish(); delivered.has_value()) {
 		if (!delivered->copied) {
@@ -104,19 +104,19 @@ template<class Destination, class Source>
 /** Copies a pinned staging array of `T` to a new array on the card. */
 template<device::Wire T, std::size_t Count>
 [[nodiscard]] auto upload_staged(device::Context const& context, device::Stream const& stream, device::MappedArray<T, Count> staged,
-                                 std::chrono::steady_clock::time_point deadline) -> core::Result<device::DeviceArray<T, Count>, DecodeError> {
+                                 std::chrono::steady_clock::time_point deadline, TimedOut late) -> core::Result<device::DeviceArray<T, Count>, DecodeError> {
 	auto array = context.allocate<T, Count>();
 	if (!array) {
 		return fail(array.error());
 	}
-	return finish(context.upload(stream, std::move(*array), std::move(staged), 0), deadline);
+	return finish(context.upload(stream, std::move(*array), std::move(staged), 0), deadline, late);
 }
 
 /**
  * Attention's rope table in the workspace at `table`, filled once by its own kernel, which evaluates the model's
  * rotations; decode and prefill both read it.
  */
-[[nodiscard]] auto fill_rotations(device::Context const& context, device::Stream const& stream, std::uint64_t table,
+[[nodiscard]] auto fill_rotations(device::Context const& context, model::Card card, device::Stream const& stream, std::uint64_t table,
                                   std::chrono::steady_clock::time_point deadline) -> core::Result<void, DecodeError> {
 	auto program = context.load<attn::RopeTable>();
 	auto event = program.and_then([&](auto const&) {
@@ -135,19 +135,19 @@ template<device::Wire T, std::size_t Count>
 		return fail(state.error());
 	}
 	if (*state == device::EventState::Pending) {
-		return fail(TimedOut{.waiting = Waiting::Answer, .ticket = 0});
+		return fail(TimedOut{.card = card, .waiting = Waiting::Rotations});
 	}
 	return {};
 }
 
 /** Zeroes a card's control block, the words its loop must find zero when it starts. */
-[[nodiscard]] auto zero_control(device::Context const& context, device::Stream const& stream, Control control,
+[[nodiscard]] auto zero_control(device::Context const& context, model::Card card, device::Stream const& stream, Control control,
                                 std::chrono::steady_clock::time_point deadline) -> core::Result<Control, DecodeError> {
 	auto staged = context.allocate_mapped<device_layout::Control, 1>();
 	if (!staged) {
 		return fail(staged.error());
 	}
-	return finish(context.upload(stream, std::move(control), std::move(*staged), 0), deadline);
+	return finish(context.upload(stream, std::move(control), std::move(*staged), 0), deadline, TimedOut{.card = card, .waiting = Waiting::Control});
 }
 
 /** Opens, verifies and copies one card's image, and allocates and fills the rest of the card's memories. */
@@ -156,7 +156,7 @@ template<image::Catalog C>
                              std::chrono::steady_clock::time_point deadline) -> core::Result<Card<C>, DecodeError> {
 	auto opened = image::Image<C>::open(path, checkpoint);
 	if (!opened) {
-		return fail(opened.error());
+		return fail(Unloadable{.image = card == model::Card::Zero ? ImageOf::CardZero : ImageOf::CardOne, .error = opened.error()});
 	}
 	auto stream = context.create_stream();
 	if (!stream) {
@@ -169,7 +169,7 @@ template<image::Catalog C>
 	if (!weights) {
 		return fail(weights.error());
 	}
-	auto copied = finish(context.upload(*stream, std::move(*weights), std::move(*pinned), 0), deadline);
+	auto copied = finish(context.upload(*stream, std::move(*weights), std::move(*pinned), 0), deadline, TimedOut{.card = card, .waiting = Waiting::Weights});
 	if (!copied) {
 		return std::unexpected(copied.error());
 	}
@@ -178,14 +178,19 @@ template<image::Catalog C>
 		return fail(tokens.error());
 	}
 	std::ranges::copy(vocabulary::row_tokens(card), tokens->host().begin());
-	auto row_tokens = upload_staged(context, *stream, std::move(*tokens), deadline);
+	auto row_tokens = upload_staged(context, *stream, std::move(*tokens), deadline, TimedOut{.card = card, .waiting = Waiting::RowTokens});
 	if (!row_tokens) {
 		return std::unexpected(row_tokens.error());
 	}
-	auto control = context.allocate<device_layout::Control, 1>();
-	auto workspace = control.and_then([&](auto const&) {
-		return context.allocate<std::byte, device_layout::workspace.bytes>();
-	});
+	auto allocated = context.allocate<device_layout::Control, 1>();
+	if (!allocated) {
+		return fail(allocated.error());
+	}
+	auto control = zero_control(context, card, *stream, std::move(*allocated), deadline);
+	if (!control) {
+		return std::unexpected(control.error());
+	}
+	auto workspace = context.allocate<std::byte, device_layout::workspace.bytes>();
 	auto pool = workspace.and_then([&](auto const&) {
 		return context.allocate<std::byte, model::pool_bytes>();
 	});
@@ -195,7 +200,7 @@ template<image::Catalog C>
 	if (!states) {
 		return fail(states.error());
 	}
-	if (auto rotations = fill_rotations(context, *stream, workspace->address() + device_layout::workspace.exchange.rope_table, deadline); !rotations) {
+	if (auto rotations = fill_rotations(context, card, *stream, workspace->address() + device_layout::workspace.exchange.rope_table, deadline); !rotations) {
 		return std::unexpected(rotations.error());
 	}
 	auto program = context.load<device_layout::Loop>();
@@ -220,13 +225,25 @@ template<image::Catalog Host>
 using HostImage = device::MappedArray<std::byte, image::payload_bytes<Host>>;
 
 /**
- * Where the resident loops stand. Stopped loops have used up their rings (each carried an exit ticket), so the next
- * start takes fresh ones; loops never started still have theirs.
+ * Where the resident loops stand. Halted loops used up their rings (each carried an exit ticket), so the next start
+ * takes fresh ones; unlaunched loops still have theirs. Failed loops ended on an error and their kernels have finished;
+ * abandoned loops were given up on at a deadline, and may still run. Nothing restarts either.
  */
 enum class Loops : std::uint8_t {
-	NeverStarted,
+	Unlaunched,
 	Running,
-	Stopped,
+	Halted,
+	Failed,
+	Abandoned,
+};
+
+/**
+ * One card's context and stream, borrowed from the engine for one synchronous call: valid until the engine's next
+ * non-const call, never stored.
+ */
+export struct CardAccess {
+	device::Context const& context;
+	device::Stream const& stream;
 };
 
 /**
@@ -255,7 +272,7 @@ public:
 	                               std::chrono::steady_clock::time_point deadline) -> core::Result<Engine, DecodeError> {
 		auto host_image = image::Image<typename C::Host>::open(paths.host, checkpoint);
 		if (!host_image) {
-			return fail(host_image.error());
+			return fail(Unloadable{.image = ImageOf::Host, .error = host_image.error()});
 		}
 		auto host = devices.context(model::Card::Zero).template allocate_mapped<std::byte, image::payload_bytes<typename C::Host>>();
 		if (!host) {
@@ -283,14 +300,17 @@ public:
 	      zero_{std::move(other.zero_)},
 	      one_{std::move(other.one_)},
 	      session_{std::move(other.session_)},
-	      loops_{std::exchange(other.loops_, Loops::NeverStarted)} {}
+	      loops_{std::exchange(other.loops_, Loops::Unlaunched)},
+	      launches_{other.launches_},
+	      failure_{std::move(other.failure_)} {}
 
 	auto operator=(Engine&&) noexcept -> Engine& = delete;
 	Engine(Engine const&) = delete;
 	auto operator=(Engine const&) -> Engine& = delete;
 
 	~Engine() {
-		// A loop still running reads every allocation here: it must have been stopped.
+		// A running loop reads every allocation here: it must have been shut down first. Abandoned loops may still run;
+		// the deadline that gave up on them is the caller's word that the cards are lost anyway.
 		core::invariant(loops_ != Loops::Running);
 	}
 
@@ -315,6 +335,7 @@ public:
 		    .states = own(zero_.states, one_.states),
 		    .ring = host.ring,
 		    .masks = host.masks,
+		    .launch = launches_,
 		    .card = static_cast<unsigned>(std::to_underlying(card)),
 		    .unused = 0,
 		};
@@ -322,17 +343,18 @@ public:
 
 	/**
 	 * Launches both cards' resident loops; each waits for the other before it serves its first ticket. A prefill chunk
-	 * runs between `stop` and the next `start`: the loops yield the SMs by exiting, because prefill's kernels need every
+	 * runs between a stop and the next start: the loops yield the SMs by exiting, because prefill's kernels need every
 	 * SM with their own shared memory, and a relaunch costs microseconds against a chunk's second, with no second way out
-	 * of the loop to keep.
+	 * of the loop to keep. Returns once both launches are enqueued.
 	 */
-	[[nodiscard]] auto start(std::chrono::steady_clock::time_point deadline) -> core::Result<void, DecodeError> {
-		core::invariant(loops_ != Loops::Running);
-		if (loops_ == Loops::Stopped) {
+	[[nodiscard]] auto start() -> core::Result<void, DecodeError> {
+		core::invariant(loops_ == Loops::Unlaunched || loops_ == Loops::Halted);
+		if (loops_ == Loops::Halted) {
 			if (auto renewed = session_.renew(devices_); !renewed) {
 				return renewed;
 			}
 		}
+		++launches_;
 		auto launch = [&]<image::Catalog Of>(Card<Of>& card, model::Card which) -> core::Result<void, DecodeError> {
 			auto const& context = devices_.context(which);
 			auto event = context.create_event();
@@ -348,23 +370,10 @@ public:
 			card.launched = std::move(*event);
 			return {};
 		};
-		// Both control blocks read zero before either loop starts: a loop stores into its peer's at once.
-		auto zeroed = [&]<image::Catalog Of>(Card<Of>& card, model::Card which) -> core::Result<void, DecodeError> {
-			auto cleared = zero_control(devices_.context(which), card.stream, std::move(card.control), deadline);
-			if (!cleared) {
-				return std::unexpected(cleared.error());
-			}
-			card.control = std::move(*cleared);
-			return {};
-		};
-		if (auto cleared = zeroed(zero_, model::Card::Zero).and_then([&] { return zeroed(one_, model::Card::One); }); !cleared) {
-			return cleared;
-		}
-		auto started = launch(zero_, model::Card::Zero).and_then([&] {
+		return launch(zero_, model::Card::Zero).and_then([&] {
 			loops_ = Loops::Running;
 			return launch(one_, model::Card::One);
 		});
-		return started;
 	}
 
 	/** What prefill borrows of card `card` while the loops are stopped. */
@@ -381,28 +390,29 @@ public:
 		};
 	}
 
-	[[nodiscard]] auto begin_prompt_end(sched::Row prompt, model::DraftDepth depth, std::chrono::steady_clock::time_point deadline)
-	    -> core::Result<Pending, DecodeError> {
-		core::invariant(loops_ == Loops::Running);
-		return session_.begin_prompt_end(std::move(prompt), depth, deadline);
-	}
-
-	[[nodiscard]] auto complete_prompt_end(Pending pending, std::chrono::steady_clock::time_point deadline)
-	    -> core::Result<sched::ChunkDone, DecodeError> {
-		return session_.complete_prompt_end(std::move(pending), deadline);
+	/**
+	 * Card `which`'s context and stream, borrowed for the caller's synchronous call (prefill's chunks run on them while
+	 * the loops are stopped).
+	 */
+	[[nodiscard]] auto card(model::Card which) const -> CardAccess {
+		auto const& stream = which == model::Card::Zero ? zero_.stream : one_.stream;
+		return {.context = devices_.context(which), .stream = stream};
 	}
 
 	auto apply(PoolCommand const& command) -> void {
 		session_.apply(command);
 	}
 
-	[[nodiscard]] auto flush(std::chrono::steady_clock::time_point deadline) -> core::Result<void, DecodeError> {
-		return session_.flush(deadline);
+	/** Submits the batch's cycle (and the queued commands ahead of it) and returns at once. */
+	[[nodiscard]] auto begin(sched::Batch batch) -> core::Result<Pending, DecodeError> {
+		core::invariant(loops_ == Loops::Running);
+		return session_.begin(std::move(batch));
 	}
 
-	[[nodiscard]] auto begin(sched::Batch batch, std::chrono::steady_clock::time_point deadline) -> core::Result<Pending, DecodeError> {
+	/** Submits a prompt's end (and the queued commands ahead of it) and returns at once. */
+	[[nodiscard]] auto begin_prompt_end(sched::Row prompt, model::DraftDepth depth) -> core::Result<Pending, DecodeError> {
 		core::invariant(loops_ == Loops::Running);
-		return session_.begin(std::move(batch), deadline);
+		return session_.begin_prompt_end(std::move(prompt), depth);
 	}
 
 	template<MaskRows M>
@@ -410,34 +420,74 @@ public:
 		return session_.publish(pending, masks, count);
 	}
 
-	[[nodiscard]] auto complete(Pending pending, std::chrono::steady_clock::time_point deadline) -> core::Result<sched::BatchDone, DecodeError> {
-		return session_.complete(std::move(pending), deadline);
+	/** The batch's outcome once both cards have answered; nullopt while either has not. Never blocks. */
+	[[nodiscard]] auto try_complete(Pending const& pending) -> std::optional<core::Result<sched::BatchDone, DecodeError>> {
+		return session_.try_complete(pending);
 	}
 
-	/** Ends both loops and waits until their kernels have finished, after which nothing on the cards reads the engine. */
-	[[nodiscard]] auto stop(std::chrono::steady_clock::time_point deadline) -> core::Result<void, DecodeError> {
+	/** The prompt's sampled token once both cards have answered; nullopt while either has not. Never blocks. */
+	[[nodiscard]] auto try_complete_prompt_end(Pending const& pending) -> std::optional<core::Result<sched::ChunkDone, DecodeError>> {
+		return session_.try_complete_prompt_end(pending);
+	}
+
+	/**
+	 * Stops both loops with nothing begun, after applying every queued command, so a prefill that follows sees what the
+	 * scheduler set up; done once both have exited and their kernels have finished. nullopt until then. Never blocks. A
+	 * failure leaves the loops for `try_shutdown`, the one call that ends them after an error.
+	 */
+	[[nodiscard]] auto try_stop() -> std::optional<core::Result<void, DecodeError>> {
 		core::invariant(loops_ == Loops::Running);
-		if (auto exited = session_.stop(deadline); !exited) {
+		auto exited = session_.try_stop();
+		if (!exited) {
+			return std::nullopt;
+		}
+		if (!*exited) {
 			return exited;
 		}
-		auto const finished = [&](std::optional<device::Event> const& launched) -> core::Result<void, DecodeError> {
-			if (!launched) {
-				return {};
-			}
-			auto const state = launched->wait_until(deadline);
-			if (!state) {
-				return fail(state.error());
-			}
-			if (*state == device::EventState::Pending) {
-				return fail(TimedOut{.waiting = Waiting::Answer, .ticket = 0});
-			}
-			return {};
-		};
-		if (auto both = finished(zero_.launched).and_then([&] { return finished(one_.launched); }); !both) {
-			return both;
+		auto done = finished();
+		if (done && *done) {
+			loops_ = Loops::Halted;
 		}
-		loops_ = Loops::Stopped;
-		return {};
+		return done;
+	}
+
+	/**
+	 * Ends the loops from wherever they stand, for teardown, and is the one way out after an error: never launched or
+	 * halted is an immediate success; running loops are shut down as the session's `try_shutdown` says, and then their
+	 * kernels awaited. Past `give_up` they are abandoned with `Abandoned`. A failure is kept and returned again. nullopt
+	 * while it is still waiting. Never blocks.
+	 */
+	[[nodiscard]] auto try_shutdown(std::chrono::steady_clock::time_point give_up) -> std::optional<core::Result<void, DecodeError>> {
+		switch (loops_) {
+		case Loops::Unlaunched:
+		case Loops::Halted:
+			return core::Result<void, DecodeError>{};
+		case Loops::Failed:
+		case Loops::Abandoned:
+			return std::unexpected(*failure_);
+		case Loops::Running:
+			break;
+		}
+		auto ended = session_.try_shutdown(give_up);
+		if (!ended) {
+			return std::nullopt;
+		}
+		auto done = finished();
+		if (done && *done) {
+			if (*ended) {
+				loops_ = Loops::Halted;
+				return ended;
+			}
+			return end(Loops::Failed, ended->error());
+		}
+		if (done) {
+			return end(Loops::Abandoned, done->error());
+		}
+		if (std::chrono::steady_clock::now() < give_up) {
+			return std::nullopt;
+		}
+		// The loops answered their exits (or broke) but a kernel never finished: past the deadline it is given up on.
+		return end(Loops::Abandoned, *ended ? DecodeError{.reason = Abandoned{.ticket = std::nullopt}} : ended->error());
 	}
 
 	[[nodiscard]] auto session() const -> Session const& {
@@ -448,13 +498,46 @@ private:
 	Engine(device::Devices devices, HostImage<typename C::Host> host, Card<typename C::CardZero> zero, Card<typename C::CardOne> one, Session session)
 	    : devices_{std::move(devices)}, host_{std::move(host)}, zero_{std::move(zero)}, one_{std::move(one)}, session_{std::move(session)} {}
 
+	/** The loops end as `loops`, failed with `error`, which later shutdowns return. */
+	[[nodiscard]] auto end(Loops loops, DecodeError error) -> std::optional<core::Result<void, DecodeError>> {
+		loops_ = loops;
+		failure_ = error;
+		return std::unexpected(std::move(error));
+	}
+
+	/** Success once both kernels have finished, nullopt while either runs. */
+	[[nodiscard]] auto finished() const -> std::optional<core::Result<void, DecodeError>> {
+		// A kernel has finished when the event recorded after its launch has completed.
+		auto const done = [](std::optional<device::Event> const& launched) -> std::optional<core::Result<void, DecodeError>> {
+			if (!launched) {
+				return core::Result<void, DecodeError>{};
+			}
+			auto const state = launched->query();
+			if (!state) {
+				return fail(state.error());
+			}
+			return *state == device::EventState::Pending ? std::nullopt : std::optional{core::Result<void, DecodeError>{}};
+		};
+		if (auto const zero = done(zero_.launched); !zero || !*zero) {
+			return zero;
+		}
+		if (auto const one = done(one_.launched); !one || !*one) {
+			return one;
+		}
+		return core::Result<void, DecodeError>{};
+	}
+
 	// Declared first, so it dies last: every member below lives in its contexts.
 	device::Devices devices_;
 	HostImage<typename C::Host> host_;
 	Card<typename C::CardZero> zero_;
 	Card<typename C::CardOne> one_;
 	Session session_;
-	Loops loops_ = Loops::NeverStarted;
+	Loops loops_ = Loops::Unlaunched;
+	/** Launches of the loops so far: the epoch the cards meet on at each start. */
+	std::uint64_t launches_ = 0;
+	/** Why the loops failed or were abandoned, once they have. */
+	std::optional<DecodeError> failure_;
 };
 
 /** The engine over the model's images. */
