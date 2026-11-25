@@ -89,7 +89,7 @@ inline constexpr Count workspace_bytes = 1'000'000'000;
 // replaces this figure.
 inline constexpr Count driver_reserve_bytes = Count{512} * 1024 * 1024;
 
-/** The part of the block memory left after weights, workspace and slot state that holds deltanet snapshots. */
+/** The most of the block pool deltanet snapshots may hold; kv uses every block they do not. */
 inline constexpr Share snapshot_share = {.numerator = 1, .denominator = 4};
 
 inline constexpr Count hidden = 5120;
@@ -634,47 +634,48 @@ inline constexpr Count snapshot_blocks = divide_up(slot_state_bytes, kv_block_by
 
 static_assert(rounds_to(deltanet_state_bytes_per_slot, gigabyte / 1000, 75), "deltanet state: 75 MB per slot per card");
 
-/** Each card's memory, outermost first; the kv pool is what remains, so it is derived, never chosen. */
+/**
+ * Each card's memory, outermost first. The block pool is what remains, so it is derived, never chosen. Its blocks hold
+ * kv or deltanet snapshots; snapshots may hold at most their share, kv any block they do not hold.
+ */
 struct CardMemory {
 	Count driver_reserve;
 	Count weights;
 	Count workspace;
 	Count slot_state;
-	Count snapshot_pool_blocks;
-	Count kv_pool_blocks;
+	Count pool_blocks;
 };
 
 [[nodiscard]] consteval auto plan_card_memory() -> CardMemory {
 	auto const fixed = driver_reserve_bytes + weight_bytes_per_card + workspace_bytes + slots * slot_state_bytes;
-	auto const blocks = (card_memory_bytes - fixed) / kv_block_bytes;
-	auto const snapshots = blocks * snapshot_share.numerator / snapshot_share.denominator / snapshot_blocks;
-	auto const snapshot_pool = snapshots * snapshot_blocks;
 	return {
 	    .driver_reserve = driver_reserve_bytes,
 	    .weights = weight_bytes_per_card,
 	    .workspace = workspace_bytes,
 	    .slot_state = slots * slot_state_bytes,
-	    .snapshot_pool_blocks = snapshot_pool,
-	    .kv_pool_blocks = blocks - snapshot_pool,
+	    .pool_blocks = (card_memory_bytes - fixed) / kv_block_bytes,
 	};
 }
 
 inline constexpr CardMemory card_memory = plan_card_memory();
 
-inline constexpr Count snapshot_pool_blocks = card_memory.snapshot_pool_blocks;
-/** Snapshots the pool holds at once. */
-inline constexpr Count snapshot_capacity = snapshot_pool_blocks / snapshot_blocks;
-inline constexpr Count kv_pool_blocks = card_memory.kv_pool_blocks;
-inline constexpr Count kv_pool_tokens = kv_pool_blocks * kv_block_tokens;
-inline constexpr Count kv_pool_bytes = kv_pool_blocks * kv_block_bytes;
+/** Blocks of the one pool kv and snapshots share. */
+inline constexpr Count pool_blocks = card_memory.pool_blocks;
+inline constexpr Count pool_tokens = pool_blocks * kv_block_tokens;
+inline constexpr Count pool_bytes = pool_blocks * kv_block_bytes;
 
-static_assert(card_memory.driver_reserve + card_memory.weights + card_memory.workspace + card_memory.slot_state +
-                      (card_memory.snapshot_pool_blocks + card_memory.kv_pool_blocks) * kv_block_bytes <=
+/** The most blocks snapshots may hold at once: their share of the pool, in whole snapshots. */
+inline constexpr Count snapshot_cap_blocks =
+    pool_blocks * snapshot_share.numerator / snapshot_share.denominator / snapshot_blocks * snapshot_blocks;
+
+/** Snapshots the pool holds at most. */
+inline constexpr Count snapshot_capacity = snapshot_cap_blocks / snapshot_blocks;
+
+static_assert(card_memory.driver_reserve + card_memory.weights + card_memory.workspace + card_memory.slot_state + pool_bytes <=
                   card_memory_bytes,
               "everything a card holds fits its memory");
-static_assert(snapshot_blocks <= snapshot_pool_blocks, "a snapshot fits the snapshot pool");
 static_assert(snapshot_capacity >= slots, "every slot can park its state in the prefix cache at once");
-static_assert(kv_pool_tokens >= slots * kv_block_tokens, "every slot holds at least one kv block");
+static_assert(pool_blocks >= slots, "every slot holds at least one kv block");
 
 [[nodiscard]] consteval auto row_budgets_fit_the_slots() -> bool {
 	for (auto const budget : row_budgets) {

@@ -193,14 +193,14 @@ using model::Tensor;
 	}
 	auto const per_layer = model::kv_heads_per_card * 2 * model::head_dim * sizeof(std::uint16_t);
 	return model::kv_bytes_per_token_per_card == layers * per_layer &&
-	       model::kv_pool_bytes == model::kv_pool_tokens * model::kv_bytes_per_token_per_card;
+	       model::pool_bytes == model::pool_tokens * model::kv_bytes_per_token_per_card;
 }
 
-// The pool takes every whole block the card has left: one block more would not fit.
-[[nodiscard]] auto kv_pool_takes_every_block_left() -> bool {
+// The block pool takes every whole block the card has left: one block more would not fit.
+[[nodiscard]] auto pool_takes_every_block_left() -> bool {
 	auto const memory = model::card_memory;
 	auto const fixed = memory.driver_reserve + memory.weights + memory.workspace + memory.slot_state;
-	auto const blocks = memory.snapshot_pool_blocks + memory.kv_pool_blocks;
+	auto const blocks = memory.pool_blocks;
 	return fixed + blocks * model::kv_block_bytes <= model::card_memory_bytes &&
 	       fixed + (blocks + 1) * model::kv_block_bytes > model::card_memory_bytes;
 }
@@ -250,8 +250,8 @@ auto main() -> int {
 	        .holds = kv_bytes_count_every_attention_layer(),
 	    },
 	    engine::testing::Case{
-	        .name = "the kv and snapshot pools take every whole block the card has left after its fixed contents",
-	        .holds = kv_pool_takes_every_block_left(),
+	        .name = "the block pool takes every whole block the card has left after its fixed contents",
+	        .holds = pool_takes_every_block_left(),
 	    },
 	};
 	return engine::testing::report(cases);
