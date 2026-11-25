@@ -49,6 +49,11 @@ tower). the engine computes exactly that function:
 - every matmul accumulates in fp32 on the tensor cores; the residual stream and deltanet state are fp32; the kv cache
   is bf16.
 - lm_head runs in bf16 with exact top-k and argmax merged across the two cards.
+- attention carries the softmax weights P into the PV mma losslessly: P is computed in fp32, scaled by 2^40 (exact),
+  and split into three bf16 parts, hi + mid + lo, that sum to it exactly; three PV mmas accumulate in fp32 and the
+  row sum carries the same scale. checked over every fp32 value in [0, 1]: without the scale the split loses bits
+  below p = 2^-110, with any scale from 2^38 up it is exact. the bake proves from the checkpoint's `v_proj` and norm
+  weights that |v| stays below 2^70, so the scaled fp32 accumulators cannot overflow at any context length.
 - speculative decoding verifies exactly (greedy is exact; sampling uses rejection sampling).
 - sampling parameters are exact for every value the server accepts; anything else is refused with a named error.
 - the only allowed differences are floating-point summation order and the tensor core's own fp32 accumulation, which
@@ -160,7 +165,8 @@ kept as ideas and rewritten in the new style:
   driver-api subset it uses and `dlopen`s `libcuda.so.1` at runtime: no link-time nvidia dependency. where that load
   fails (macos) engine start returns `DeviceError::DriverUnavailable`. `ptxas -v` runs as a static gate on the same
   ptx wherever a cuda toolkit exists (linux). `PINS.md` records the llvm version, the ptx isa version and the minimum
-  driver that can jit it.
+  driver that can jit it. the owner chose this over also shipping ptxas-built sass: the box runs an R610+ driver, and
+  the pinned rounding (below) keeps jit results independent of the driver.
 - **cmake generating ninja**, presets only:
 
   | preset | purpose |
@@ -345,8 +351,9 @@ facts the checkpoint fixes that the config alone does not say (read from the saf
 - `modules_to_not_convert` is not reliable (it names modules the checkpoint lacks); the headers decide the format.
 - the mtp layer is a full-attention decoder layer with its own kv: 17 kv layers per card, not 16.
 - kv blocks hold 64 positions (two 32-position split-k tiles); snapshots are capped at a quarter of the pool.
-- the kv pool size is derived, not chosen: what is left of the card after weights, workspace, slot state, snapshots
-  and the driver's reserve, divided by the kv bytes per position.
+- the block pool is derived, not chosen: what is left of the card after weights, workspace, slot state and the
+  driver's reserve, in whole blocks. kv blocks and deltanet snapshots share that one pool; snapshots are capped at a
+  quarter of it, a cap and not a reservation, so kv uses whatever snapshots don't.
 
 **the baked image.** `geezuz-bake` reads the safetensors checkpoint once and writes one image per card:
 - verifies the checkpoint hash and stamps it in the header;
@@ -433,7 +440,8 @@ grid barriers stay, so it is directly comparable to upstream.
 
 a straight port must not carry upstream's numerics outside the contract. step 1 uses the fixes from the start:
 - the fp16 state operand of upstream's chunked prefill deltanet: replaced by the recurrence (prefill, below);
-- P rounded to 16 bits before PV, in decode and prefill attention: settled by the owner's decision on P;
+- P rounded to 16 bits before PV, in decode and prefill attention: replaced by the exact scaled three-way bf16 split
+  (0.2), at no measurable decode cost and +1.6% prefill at 4k-token prompts, +12% at 32k;
 - fp16 activations and fp16-accumulate prefill gemms: culled (1.1);
 - fast-math `expf` / `logf` / `rsqrtf`: replaced by the pinned routines (1.2).
 
@@ -516,7 +524,8 @@ measured in phase b, but the gap itself is arithmetic.
     runs in production.
 - **memory thermals**: 12 of the 24 gddr6x chips sit under the xg7's passive backplate. the 110 c junction throttle is
   the binding limit, so a backplate fan is the default. nvml does not report the junction temperature on the 3090;
-  reading it needs the `gddr6` tool and `iomem=relaxed`, which is an owner decision.
+  reading it needs the `gddr6` tool and `iomem=relaxed`. the owner allows `iomem=relaxed` for the offset sweep and
+  the soak only; it comes off the kernel command line before production.
 - **host**: iommu passthrough. both slots hang off cpu0, so every pinned buffer (embedding table, rings) is
   hugepage-backed on numa node 0, and the resident loop's host thread is pinned to a cpu0 core.
 
