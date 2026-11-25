@@ -6,6 +6,25 @@
 // prove each map a bijection and the swizzle conflict-free.
 #pragma once
 
+namespace engine::device::prims {
+
+/** An m16n8k16 A operand: 4 bf16x2 registers, laid out as `fragment::a`. */
+struct AFragment {
+	unsigned reg[4];
+};
+
+/** An m16n8k16 B operand: 2 bf16x2 registers, laid out as `fragment::b`. */
+struct BFragment {
+	unsigned reg[2];
+};
+
+/** An m16n8 fp32 accumulator: 4 registers, laid out as `fragment::c`. */
+struct Accumulator {
+	float reg[4];
+};
+
+}
+
 namespace engine::device::prims::fragment {
 
 inline constexpr int lanes = 32;

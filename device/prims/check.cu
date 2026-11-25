@@ -2,7 +2,8 @@
 //
 // The primitives' self-check kernels: each runs primitives on the gpu against an oracle and reports what disagreed.
 // They are real kernels with no other job, built to ptx now and run at bring-up by the microbenchmark drivers, which
-// read their reports through `engine.prims` (the layouts in selfcheck.h). Where the device can decide correctness
+// read their reports through `engine.prims`. Every kernel takes one parameter struct, and its budget, grid and buffer
+// layouts are facts in selfcheck.h. Where the device can decide correctness
 // itself (the decode, through the mma, the fragment maps, the ring, the reductions) the report is a mismatch count;
 // where the oracle lives on the host (the tensor core's accumulation model, the host's transcendentals) the kernel
 // produces what the host compares.
@@ -14,23 +15,13 @@
 #include "prims/order.h"
 #include "prims/reduce.h"
 #include "prims/selfcheck.h"
+#include "prims/selfcheck_record.h"
 #include "prims/shared.h"
 #include "prims/sync.h"
 #include "prims/thread.h"
 #include "prims/transcendental.h"
 
 namespace engine::device::prims::selfcheck {
-
-/** Counts one comparison into `report`, keeping the first mismatches verbatim. */
-__attribute__((device)) inline void record(Report* report, bool agrees, Mismatch mismatch) {
-	count(&report->checked, 1U);
-	if (!agrees) {
-		unsigned const slot = fetch_add(&report->mismatched, 1U);
-		if (slot < kept_mismatches) {
-			report->first[slot] = mismatch;
-		}
-	}
-}
 
 /** Code `code`, with the two nan codes the baker refuses replaced by zero. */
 [[nodiscard]] constexpr auto admitted(unsigned code) -> E4m3 {
@@ -47,9 +38,6 @@ __attribute__((device)) inline void record(Report* report, bool agrees, Mismatch
 namespace check = engine::device::prims::selfcheck;
 namespace prims = engine::device::prims;
 
-inline constexpr prims::Budget decode_budget = {.threads = 256, .registers_per_thread = 64, .shared_bytes = 0, .blocks_per_sm = 1};
-static_assert(prims::check(decode_budget) == prims::Fit::Fits);
-
 // The activation exponents each warp of the mma pass multiplies the weights by: across fp32's range, every product
 // normal, so the tensor core's sum of one nonzero product is exact whatever its accumulation does.
 inline constexpr int activation_exponents[8] = {-100, -60, -20, -9, 0, 9, 40, 100};
@@ -57,12 +45,13 @@ inline constexpr int activation_exponents[8] = {-100, -60, -20, -9, 0, 9, 40, 10
 /**
  * U7, the decode: every pair of codes in every bf16x2 position decoded by `decode_word` against the exact
  * conversion; then all 256 codes as a 16 x 16 a-fragment through `mma.sync` against activations 2^j, which must
- * reproduce each value times 2^j exactly in fp32. One block of 256 threads; `report` starts zeroed.
+ * reproduce each value times 2^j exactly in fp32.
  */
-extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_decode = decode_budget;
+extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_decode = check::decode_budget;
 
-extern "C" __attribute__((global, launch_bounds(decode_budget.threads, decode_budget.blocks_per_sm))) void prims_check_decode(check::Report* report) {
+extern "C" __attribute__((global, launch_bounds(check::decode_budget.threads, check::decode_budget.blocks_per_sm))) void prims_check_decode(check::ReportParams params) {
 	using namespace engine::device::prims;
+	auto* const report = check::pointer<check::Report>(params.report);
 	unsigned const thread = thread_in_block();
 	for (unsigned partner = 0; partner < 256; ++partner) {
 		E4m3 const first_code = check::admitted(thread);
@@ -110,29 +99,20 @@ extern "C" __attribute__((global, launch_bounds(decode_budget.threads, decode_bu
 	}
 }
 
-inline constexpr prims::Budget mma_budget = {.threads = 128, .registers_per_thread = 64, .shared_bytes = 0, .blocks_per_sm = 4};
-static_assert(prims::check(mma_budget) == prims::Fit::Fits);
-inline constexpr unsigned mma_probe_blocks = 64;
-
-/** One warp's mma probe: every lane's operands as the fragment maps lay them out. */
-struct MmaProbe {
-	prims::AFragment a[32];
-	prims::BFragment b[32];
-	prims::Accumulator c[32];
-};
-
 /**
  * U6, the tensor core's accumulation: runs `mma.sync` on host-crafted probes, one per warp, and writes each D; the
  * host compares them with the reference's bit-exact model of sm_86's 8-product truncated blocks.
  */
-extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_probe_mma = mma_budget;
+extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_probe_mma = check::mma_budget;
 
-extern "C" __attribute__((global, launch_bounds(mma_budget.threads, mma_budget.blocks_per_sm))) void prims_probe_mma(MmaProbe const* probes, prims::Accumulator* results) {
+extern "C" __attribute__((global, launch_bounds(check::mma_budget.threads, check::mma_budget.blocks_per_sm))) void prims_probe_mma(check::MmaParams params) {
 	using namespace engine::device::prims;
+	auto const* const probes = check::pointer<check::MmaProbe const>(params.probes);
+	auto* const results = check::pointer<Accumulator>(params.results);
 	unsigned const lane_index = lane();
-	unsigned const probe = block() * (mma_budget.threads / 32U) + warp_in_block();
+	unsigned const probe = block() * static_cast<unsigned>(check::mma_budget.threads / 32) + warp_in_block();
 	auto const once = policy<Eviction::First>();
-	MmaProbe const& mine = probes[probe];
+	check::MmaProbe const& mine = probes[probe];
 	auto const* a_words = reinterpret_cast<Chunk const*>(&mine.a[lane_index]);
 	auto const* c_words = reinterpret_cast<Chunk const*>(&mine.c[lane_index]);
 	Chunk const a_chunk = load_constant(a_words, once);
@@ -151,27 +131,19 @@ extern "C" __attribute__((global, launch_bounds(mma_budget.threads, mma_budget.b
 	store(reinterpret_cast<Chunk*>(&results[probe * 32U + lane_index]), out, once);
 }
 
-using ActivationTile = prims::fragment::XorSwizzle<256, 16>;
+using check::ActivationTile;
 inline constexpr prims::fragment::Transpose transposes[2] = {prims::fragment::Transpose::Plain, prims::fragment::Transpose::Transposed};
-static_assert(prims::fragment::conflict_free<ActivationTile>());
-
-struct FragmentLayout {
-	alignas(128) unsigned char tile[ActivationTile::bytes];
-};
-
-inline constexpr prims::Budget fragment_budget = {.threads = 32, .registers_per_thread = 64, .shared_bytes = sizeof(FragmentLayout), .blocks_per_sm = 1};
-static_assert(prims::check(fragment_budget) == prims::Fit::Fits);
 
 /**
  * The fragment maps on the hardware: a swizzled 16 x 128 bf16 tile whose every element holds its own (row, k) tag is
  * read back with `ldmatrix.x4` and `.trans`, and every register half must hold the tag `fragment::ldmatrix` names.
- * One warp; `report` starts zeroed.
  */
-extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_fragments = fragment_budget;
+extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_fragments = check::fragment_budget;
 
-extern "C" __attribute__((global, launch_bounds(fragment_budget.threads, fragment_budget.blocks_per_sm))) void prims_check_fragments(check::Report* report) {
+extern "C" __attribute__((global, launch_bounds(check::fragment_budget.threads, check::fragment_budget.blocks_per_sm))) void prims_check_fragments(check::ReportParams params) {
 	using namespace engine::device::prims;
-	auto& layout = shared_layout<fragment_budget, FragmentLayout>();
+	auto* const report = check::pointer<check::Report>(params.report);
+	auto& layout = shared_layout<check::fragment_budget, check::FragmentLayout>();
 	SharedAddress const tile = shared_address(layout.tile);
 	unsigned const lane_index = lane();
 	// Tag of (row, k): row in the high byte, k in the low.
@@ -209,34 +181,25 @@ extern "C" __attribute__((global, launch_bounds(fragment_budget.threads, fragmen
 	}
 }
 
-inline constexpr int ring_stages = 4;
-inline constexpr unsigned ring_tile_chunks = 256;
-inline constexpr unsigned ring_tiles_per_block = 64;
-inline constexpr unsigned ring_consumer_warps = 4;
-using StageRingCheck = prims::StageRing<ring_stages, 32, ring_consumer_warps>;
-using Producer = prims::Warps<0, 1>;
-using Consumers = prims::Warps<1, ring_consumer_warps>;
-
-struct StageRingLayout {
-	StageRingCheck::Storage barriers;
-	prims::Chunk stage[ring_stages][ring_tile_chunks];
-};
-
-inline constexpr prims::Budget stage_ring_budget = {.threads = 160, .registers_per_thread = 64, .shared_bytes = sizeof(StageRingLayout), .blocks_per_sm = 1};
-static_assert(prims::check(stage_ring_budget) == prims::Fit::Fits);
-static_assert(prims::tiles<Producer, Consumers>(stage_ring_budget));
+using Producer = prims::Warps<0, check::stage_ring_producer_warps>;
+using Consumers = prims::Warps<check::stage_ring_producer_warps, check::stage_ring_consumer_warps>;
+using StageRingCheck = prims::StageRing<check::stage_ring_stages, static_cast<unsigned>(Producer::threads), static_cast<unsigned>(Consumers::count)>;
+static_assert(prims::tiles<Producer, Consumers>(check::stage_ring_budget));
+static_assert(sizeof(StageRingCheck::Storage) == sizeof(check::StageRingLayout::barriers));
 
 /**
- * U8, the ring: one producer warp streams `ring_tiles_per_block` 4 KiB tiles per block through a 4-stage ring with
- * `cp.async` + `cp.async.mbarrier.arrive.noinc`; four consumer warps wait on the full barriers' parity, check every
- * word against `ring_word`, and free the stage. `source` holds 82 blocks' tiles; `elapsed[block]` gets the consumers'
- * elapsed clocks.
+ * U8, the stage ring: one producer warp streams `stage_ring_tiles_per_block` 4 KiB tiles per block through a
+ * 4-stage ring with `cp.async` + `cp.async.mbarrier.arrive.noinc`; four consumer warps wait on the full barriers'
+ * parity, check every word against `ring_word`, and free the stage; `elapsed[block]` gets the consumers' clocks.
  */
-extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_stage_ring = stage_ring_budget;
+extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_stage_ring = check::stage_ring_budget;
 
-extern "C" __attribute__((global, launch_bounds(stage_ring_budget.threads, stage_ring_budget.blocks_per_sm))) void prims_check_stage_ring(prims::Chunk const* source, check::Report* report, unsigned long long* elapsed) {
+extern "C" __attribute__((global, launch_bounds(check::stage_ring_budget.threads, check::stage_ring_budget.blocks_per_sm))) void prims_check_stage_ring(check::StageRingParams params) {
 	using namespace engine::device::prims;
-	auto& layout = shared_layout<stage_ring_budget, StageRingLayout>();
+	auto const* const source = check::pointer<Chunk const>(params.source);
+	auto* const report = check::pointer<check::Report>(params.report);
+	auto* const elapsed = check::pointer<unsigned long long>(params.elapsed);
+	auto& layout = shared_layout<check::stage_ring_budget, check::StageRingLayout>();
 	StageRingCheck const ring = StageRingCheck::at(layout.barriers);
 	if (thread_in_block() == 0) {
 		ring.init();
@@ -244,13 +207,13 @@ extern "C" __attribute__((global, launch_bounds(stage_ring_budget.threads, stage
 	sync_block();
 	unsigned const warp = warp_in_block();
 	unsigned const lane_index = lane();
-	unsigned const first_chunk = block() * ring_tiles_per_block * ring_tile_chunks;
+	unsigned const first_chunk = block() * check::stage_ring_tiles_per_block * check::stage_ring_tile_chunks;
 	StageRingCheck::Cursor cursor = StageRingCheck::Cursor::start();
 	if (Producer::holds(warp)) {
 		WeightStream<32> stream = {.next = source + first_chunk + lane_index, .policy = policy<Eviction::First>()};
-		for (unsigned tile = 0; tile < ring_tiles_per_block; ++tile) {
+		for (unsigned tile = 0; tile < check::stage_ring_tiles_per_block; ++tile) {
 			ring.await_free(cursor, block_backoff);
-			for (unsigned chunk = lane_index; chunk < ring_tile_chunks; chunk += 32) {
+			for (unsigned chunk = lane_index; chunk < check::stage_ring_tile_chunks; chunk += 32) {
 				stream.issue(shared_address(&layout.stage[cursor.stage][chunk]));
 			}
 			ring.filled_on_copies(cursor);
@@ -261,11 +224,11 @@ extern "C" __attribute__((global, launch_bounds(stage_ring_budget.threads, stage
 	}
 	unsigned long long const start = cycles();
 	unsigned const consumer = Consumers::rank(warp) * 32 + lane_index;
-	for (unsigned tile = 0; tile < ring_tiles_per_block; ++tile) {
+	for (unsigned tile = 0; tile < check::stage_ring_tiles_per_block; ++tile) {
 		ring.await_filled(cursor, block_backoff);
-		for (unsigned chunk = consumer; chunk < ring_tile_chunks; chunk += Consumers::threads) {
+		for (unsigned chunk = consumer; chunk < check::stage_ring_tile_chunks; chunk += Consumers::threads) {
 			Chunk const got = load_shared(shared_address(&layout.stage[cursor.stage][chunk]));
-			unsigned const base = (first_chunk + tile * ring_tile_chunks + chunk) * 4;
+			unsigned const base = (first_chunk + tile * check::stage_ring_tile_chunks + chunk) * 4;
 			for (unsigned word = 0; word < 4; ++word) {
 				unsigned const expected = check::ring_word(base + word);
 				check::record(report, got.word[word] == expected, {.input = base + word, .detail = tile, .got = got.word[word], .expected = expected});
@@ -282,22 +245,19 @@ extern "C" __attribute__((global, launch_bounds(stage_ring_budget.threads, stage
 	}
 }
 
-inline constexpr prims::Budget reduce_budget = {.threads = 256, .registers_per_thread = 128, .shared_bytes = 0, .blocks_per_sm = 1};
-static_assert(prims::check(reduce_budget) == prims::Fit::Fits);
-inline constexpr unsigned reduce_trials = 256;
-
 /**
  * The reductions: per trial each lane draws a float spanning many binades; `warp_sum` must give every lane the
  * butterfly's sum evaluated in its fixed order (recomputed per lane from all 32 inputs), and `redux.sync` must agree
- * with an integer butterfly. One block; `report` starts zeroed.
+ * with an integer butterfly.
  */
-extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_reduce = reduce_budget;
+extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_reduce = check::reduce_budget;
 
-extern "C" __attribute__((global, launch_bounds(reduce_budget.threads, reduce_budget.blocks_per_sm))) void prims_check_reduce(check::Report* report) {
+extern "C" __attribute__((global, launch_bounds(check::reduce_budget.threads, check::reduce_budget.blocks_per_sm))) void prims_check_reduce(check::ReportParams params) {
 	using namespace engine::device::prims;
+	auto* const report = check::pointer<check::Report>(params.report);
 	unsigned const lane_index = lane();
-	for (unsigned trial = 0; trial < reduce_trials; ++trial) {
-		unsigned const seed = check::ring_word((warp_in_block() * reduce_trials + trial) * 32 + lane_index);
+	for (unsigned trial = 0; trial < check::reduce_trials; ++trial) {
+		unsigned const seed = check::ring_word((warp_in_block() * check::reduce_trials + trial) * 32 + lane_index);
 		// Sign, an exponent within 2^-20 .. 2^20, and a random mantissa.
 		unsigned const bits_of_input = (seed & 0x807fffffU) | ((107U + (seed >> 23U) % 41U) << 23U);
 		float const input = __builtin_bit_cast(float, bits_of_input);
@@ -357,8 +317,6 @@ extern "C" __attribute__((global, launch_bounds(reduce_budget.threads, reduce_bu
 	}
 }
 
-static_assert(prims::check(check::digest_budget) == prims::Fit::Fits);
-
 /**
  * The transcendentals on the device: every fp32 input through each function, folded per block into
  * `digests[function * digest_blocks + block]` (which start zeroed). The host folds its own evaluation of the same
@@ -366,8 +324,9 @@ static_assert(prims::check(check::digest_budget) == prims::Fit::Fits);
  */
 extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_digest_transcendentals = check::digest_budget;
 
-extern "C" __attribute__((global, launch_bounds(check::digest_budget.threads, check::digest_budget.blocks_per_sm))) void prims_digest_transcendentals(unsigned long long* digests) {
+extern "C" __attribute__((global, launch_bounds(check::digest_budget.threads, check::digest_budget.blocks_per_sm))) void prims_digest_transcendentals(check::DigestParams params) {
 	using namespace engine::device::prims;
+	auto* const digests = check::pointer<unsigned long long>(params.digests);
 	unsigned long long const run_start = (static_cast<unsigned long long>(block()) * check::digest_budget.threads + thread_in_block()) * check::digest_run;
 	unsigned long long sums[check::functions] = {};
 	for (unsigned long long offset = 0; offset < check::digest_run; ++offset) {
@@ -383,53 +342,28 @@ extern "C" __attribute__((global, launch_bounds(check::digest_budget.threads, ch
 	}
 }
 
-inline constexpr unsigned order_blocks = static_cast<unsigned>(prims::sm86.sms);
-inline constexpr unsigned order_steps = 8;
-using OrderProducers = prims::Warps<0, 2>;
-using OrderConsumers = prims::Warps<2, 2>;
-using Handoff = prims::NamedBarrier<1, 4>;
+using OrderProducers = prims::Warps<0, check::order_producer_warps>;
+using OrderConsumers = prims::Warps<check::order_producer_warps, check::order_consumer_warps>;
+using Handoff = prims::NamedBarrier<1, OrderProducers::count + OrderConsumers::count>;
+static_assert(prims::tiles<OrderProducers, OrderConsumers>(check::order_budget));
 
-static_assert(OrderProducers::threads == OrderConsumers::threads, "each consumer thread reads one producer thread's chunk");
-
-struct OrderLayout {
-	alignas(8) unsigned long long barrier;
-	prims::Chunk copied[32];
-	prims::Chunk handed[OrderProducers::threads];
-	prims::Chunk steps[order_steps][32];
-};
-
-inline constexpr prims::Budget order_budget = {.threads = 128, .registers_per_thread = 128, .shared_bytes = sizeof(OrderLayout), .blocks_per_sm = 1};
-static_assert(prims::check(order_budget) == prims::Fit::Fits);
-static_assert(prims::tiles<OrderProducers, OrderConsumers>(order_budget));
-
-/** The global memory `prims_check_order` works in, zeroed by the host before the launch. */
-struct OrderScratch {
-	unsigned arrivals;
-	unsigned counter;
-	unsigned long long generation;
-	unsigned long long gpu_flags[order_blocks];
-	unsigned long long system_flags[order_blocks];
-	prims::Chunk slots[order_blocks];
-	prims::Chunk inbox[order_blocks];
-	prims::Line scratch[order_blocks];
-	alignas(16) unsigned words[order_blocks][32];
-};
-
-extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_order = order_budget;
+extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_prims_check_order = check::order_budget;
 
 /**
  * Memory order and the remaining primitives on the hardware: one block per SM (82, co-resident), each passing a value
  * to the next block through a step-1 grid barrier, a release counter, gpu- and system-scope epoch flags and the peer
  * push protocol (aimed at this card's own memory); within a block, producer warps hand shared data to consumer warps
  * on a named barrier, a double-buffered loop sums staged chunks, and the bf16 pack and widen instructions are held
- * to their host models. `report` and `scratch` start zeroed.
+ * to their host models.
  */
-extern "C" __attribute__((global, launch_bounds(order_budget.threads, order_budget.blocks_per_sm))) void prims_check_order(OrderScratch* scratch, check::Report* report) {
+extern "C" __attribute__((global, launch_bounds(check::order_budget.threads, check::order_budget.blocks_per_sm))) void prims_check_order(check::OrderParams params) {
 	using namespace engine::device::prims;
-	auto& layout = shared_layout<order_budget, OrderLayout>();
+	auto* const scratch = check::pointer<check::OrderScratch>(params.scratch);
+	auto* const report = check::pointer<check::Report>(params.report);
+	auto& layout = shared_layout<check::order_budget, check::OrderLayout>();
 	unsigned const me = block();
-	unsigned const next = (me + 1) % order_blocks;
-	unsigned const previous = (me + order_blocks - 1) % order_blocks;
+	unsigned const next = (me + 1) % check::order_blocks;
+	unsigned const previous = (me + check::order_blocks - 1) % check::order_blocks;
 	unsigned const thread = thread_in_block();
 	unsigned const warp = warp_in_block();
 	auto const reused = policy<Eviction::Last>();
@@ -440,14 +374,14 @@ extern "C" __attribute__((global, launch_bounds(order_budget.threads, order_budg
 	if (thread == 0) {
 		store(&scratch->slots[me], mine, reused);
 	}
-	step1::GridBarrier<order_blocks>{.arrivals = &scratch->arrivals, .generation = &scratch->generation}.sync(remote_backoff);
+	step1::GridBarrier<check::order_blocks>{.arrivals = &scratch->arrivals, .generation = &scratch->generation}.sync(remote_backoff);
 	if (thread == 0) {
 		Chunk const seen = load(&scratch->slots[next], reused);
 		check::record(report, seen.word[0] == next && seen.word[3] == next * 7U, {.input = me, .detail = 1, .got = seen.word[0], .expected = next});
 
 		release_add(&scratch->counter, 1);
-		await_count(&scratch->counter, order_blocks, remote_backoff);
-		check::record(report, load_acquire(&scratch->counter) == order_blocks, {.input = me, .detail = 2, .got = load_acquire(&scratch->counter), .expected = order_blocks});
+		await_count(&scratch->counter, check::order_blocks, remote_backoff);
+		check::record(report, load_acquire(&scratch->counter) == check::order_blocks, {.input = me, .detail = 2, .got = load_acquire(&scratch->counter), .expected = check::order_blocks});
 
 		store(&scratch->slots[me], {.word = {me + 1000U, 0, 0, 0}}, reused);
 		EpochWriter<Scope::Gpu>{.flag = &scratch->gpu_flags[me]}.publish(1);
@@ -483,16 +417,16 @@ extern "C" __attribute__((global, launch_bounds(order_budget.threads, order_budg
 	// Register double buffering: the pipelined sum of staged chunks equals the plain one.
 	if (warp == 0) {
 		unsigned const lane_index = lane();
-		for (unsigned step = 0; step < order_steps; ++step) {
+		for (unsigned step = 0; step < check::order_steps; ++step) {
 			store_shared(shared_address(&layout.steps[step][lane_index]), {.word = {step, lane_index, step * lane_index, 1U}});
 		}
 		sync_warp();
 		unsigned pipelined = 0;
-		double_buffered<static_cast<int>(order_steps)>(
+		double_buffered<static_cast<int>(check::order_steps)>(
 		    [&](int step) { return load_shared(shared_address(&layout.steps[step][lane_index])); },
 		    [&](int, Chunk const& chunk) { pipelined += chunk.word[2] + chunk.word[3]; });
 		unsigned plain = 0;
-		for (unsigned step = 0; step < order_steps; ++step) {
+		for (unsigned step = 0; step < check::order_steps; ++step) {
 			plain += step * lane_index + 1U;
 		}
 		check::record(report, pipelined == plain, {.input = lane_index, .detail = 6, .got = pipelined, .expected = plain});
@@ -531,7 +465,7 @@ extern "C" __attribute__((global, launch_bounds(order_budget.threads, order_budg
 
 	// The bf16 pack and widen instructions against their models, over inputs spanning fp32.
 	for (unsigned trial = 0; trial < 64; ++trial) {
-		unsigned const seed = check::ring_word((me * order_budget.threads + thread) * 64U + trial);
+		unsigned const seed = check::ring_word((me * check::order_budget.threads + thread) * 64U + trial);
 		float const first = __builtin_bit_cast(float, seed & 0xbfffffffU);
 		float const second = __builtin_bit_cast(float, check::ring_word(seed) & 0xbfffffffU);
 		Bf16x2 const packed = pack_bf16x2(first, second);

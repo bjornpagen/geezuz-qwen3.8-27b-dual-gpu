@@ -16,21 +16,6 @@ namespace engine::device::prims {
 static_assert(available(isa::ldmatrix) && available(isa::mma_bf16));
 static_assert(available(isa::fma_bf16x2) && available(isa::integer_logic) && available(isa::byte_permute));
 
-/** An m16n8k16 A operand: 4 bf16x2 registers, laid out as `fragment::a`. */
-struct AFragment {
-	unsigned reg[4];
-};
-
-/** An m16n8k16 B operand: 2 bf16x2 registers, laid out as `fragment::b`. */
-struct BFragment {
-	unsigned reg[2];
-};
-
-/** An m16n8 fp32 accumulator: 4 registers, laid out as `fragment::c`. */
-struct Accumulator {
-	float reg[4];
-};
-
 /** Four 8x8 bf16 matrices as `ldmatrix.x4` delivers them, register j holding matrix j. */
 struct Matrices4 {
 	unsigned reg[4];

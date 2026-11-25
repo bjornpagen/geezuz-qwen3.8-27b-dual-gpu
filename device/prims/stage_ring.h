@@ -45,4 +45,11 @@ struct StageCursor {
 	[[nodiscard]] constexpr auto operator==(StageCursor const&) const -> bool = default;
 };
 
+/** The storage of a ring's barriers: a full and an empty mbarrier (8 bytes each) per stage, in the kernel's layout. */
+template<int stages>
+struct StageBarriers {
+	alignas(8) unsigned long long full[stages];
+	alignas(8) unsigned long long empty[stages];
+};
+
 }

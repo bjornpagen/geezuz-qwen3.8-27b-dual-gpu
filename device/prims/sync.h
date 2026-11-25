@@ -124,10 +124,7 @@ struct StageRing {
 	using Cursor = StageCursor<stages>;
 
 	/** The barriers' storage, a member of the kernel's shared layout. */
-	struct Storage {
-		alignas(8) unsigned long long full[stages];
-		alignas(8) unsigned long long empty[stages];
-	};
+	using Storage = StageBarriers<stages>;
 
 	SharedAddress full_base;
 	SharedAddress empty_base;

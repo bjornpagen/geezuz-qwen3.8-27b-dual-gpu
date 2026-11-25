@@ -6,6 +6,7 @@
 // global load here to reach for, and the weight stream holds its evict-first policy in its type.
 #pragma once
 
+#include "prims/chunk.h"
 #include "prims/isa.h"
 #include "prims/shared.h"
 
@@ -13,16 +14,6 @@ namespace engine::device::prims {
 
 static_assert(available(isa::cache_policy) && available(isa::l2_prefetch_size) && available(isa::l2_discard));
 static_assert(available(isa::cp_async));
-
-/** Sixteen bytes: the unit of every vector load, store and async copy. */
-struct alignas(16) Chunk {
-	unsigned word[4];
-};
-
-/** A 128-byte l2 line: the unit `discard` and `applypriority` act on. */
-struct alignas(128) Line {
-	unsigned char bytes[128];
-};
 
 /** Which l2 eviction priority a policy gives every access it carries. */
 enum class Eviction : unsigned char { First, Last, Normal };
