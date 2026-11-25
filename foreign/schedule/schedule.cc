@@ -94,6 +94,9 @@ export [[nodiscard]] constexpr auto attention_record_bytes(model::RowBudget budg
 
 /** The bytes of one slot's deltanet replay ring in the workspace, as the deltanet defines them. */
 export inline constexpr model::Count replay_ring_bytes_per_slot = engine::device::deltanet::ring_bytes_per_slot;
+
+/** The bytes of the workspace's rope table, as attention defines them. */
+export inline constexpr model::Count rope_table_bytes = engine::device::attn::rope_table_bytes;
 export using device::cycle;
 export using device::cycle_bytes;
 export using device::exchange;

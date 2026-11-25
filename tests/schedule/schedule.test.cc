@@ -602,6 +602,7 @@ struct Flow {
 		    std::pair{space.counters, schedule::max_cycle_phases * flag},
 		    std::pair{space.attention_records, schedule::attention_record_bytes(budget)},
 		    std::pair{space.replay_rings, model::slots * schedule::replay_ring_bytes_per_slot},
+		    std::pair{space.rope_table, schedule::rope_table_bytes},
 		};
 		auto end = Count{0};
 		for (auto const& [offset, bytes] : buffers) {

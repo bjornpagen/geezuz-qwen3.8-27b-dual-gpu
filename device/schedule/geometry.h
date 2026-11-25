@@ -5,6 +5,7 @@
 // in the workspace. Every geometry is a compile-time fact checked against the sm_86 limits and the model's workspace.
 #pragma once
 
+#include "attn/arithmetic.h"
 #include "attn/geometry.h"
 #include "deltanet/layout.h"
 #include "model.h"
@@ -255,6 +256,8 @@ struct Workspace {
 	Count attention_records;
 	/** Every slot's deltanet replay ring, the inputs lazy rollback replays: slot s at s times one slot's ring. */
 	Count replay_rings;
+	/** Every (position, pair) rotation of the rope, filled once at start by `attn_rope_table` and read by attention. */
+	Count rope_table;
 	Count bytes;
 };
 
@@ -274,7 +277,8 @@ inline constexpr Count workspace_alignment = 256;
 	layout.counters = align_up(layout.fixup_flags + sms * flag_bytes, workspace_alignment);
 	layout.attention_records = align_up(layout.counters + max_cycle_phases * flag_bytes, workspace_alignment);
 	layout.replay_rings = align_up(layout.attention_records + attn::record_bytes(budget), workspace_alignment);
-	layout.bytes = layout.replay_rings + model::slots * deltanet::ring_bytes_per_slot;
+	layout.rope_table = align_up(layout.replay_rings + model::slots * deltanet::ring_bytes_per_slot, workspace_alignment);
+	layout.bytes = layout.rope_table + attn::rope_table_bytes;
 	return layout;
 }
 
