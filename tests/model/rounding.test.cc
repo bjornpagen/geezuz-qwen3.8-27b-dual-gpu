@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // The rounding points' constants and fixed algorithms, each against an independent oracle: double-precision libm for
-// the rope table and rotations, exact reconstruction for the attention weight split.
+// the rope table and rotations, exact reconstruction for the attention weight split, each lane tree's order written out
+// independently, double precision for the merge of attention's groups.
 import std;
 import engine.model;
 import engine.testing;
@@ -82,13 +83,13 @@ struct RotationCheck {
 
 /** Whether the three parts are bf16 values summing exactly to `scaled`, largest first. */
 [[nodiscard]] auto split_is_exact(float scaled) -> bool {
-	auto const parts = model::split_weight(scaled);
+	auto const parts = model::attention::split_weight(scaled);
 	auto const widen = [](unsigned short bits) {
 		return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16U);
 	};
 	// Exact in double: three fp32 values of at most 24 bits within 48 binades of each other.
-	auto const sum = static_cast<double>(widen(parts.high)) + static_cast<double>(widen(parts.middle)) +
-	                 static_cast<double>(widen(parts.low));
+	auto const sum =
+	    static_cast<double>(widen(parts.high)) + static_cast<double>(widen(parts.middle)) + static_cast<double>(widen(parts.low));
 	auto const low = parts.low;
 	auto const rest = scaled - widen(parts.high) - widen(parts.middle);
 	return sum == static_cast<double>(scaled) && std::bit_cast<std::uint32_t>(rest) == static_cast<std::uint32_t>(low) << 16U;
@@ -109,6 +110,90 @@ struct RotationCheck {
 	return values;
 }
 
+/** A finite float of either sign whose exponent spans 2^±30, so sums both cancel and round. */
+[[nodiscard]] auto wild(std::mt19937_64& generator) -> float {
+	auto const value = std::normal_distribution<float>{0.0F, 1.0F}(generator);
+	return std::ldexp(value, std::uniform_int_distribution<int>{-30, 30}(generator));
+}
+
+/**
+ * Each tree against its order written out independently: every lane's fma chain from +0 over its consecutive terms,
+ * then the halving fold at the widest distance first (lane 0's butterfly), bit for bit.
+ */
+template<model::Lanes tree>
+[[nodiscard]] auto tree_is_its_order(std::uint64_t seed) -> bool {
+	auto generator = engine::testing::generator(seed);
+	for (auto trial = 0; trial < 2000; ++trial) {
+		auto x = std::array<float, tree.width>{};
+		auto y = std::array<float, tree.width>{};
+		std::ranges::generate(x, [&] {
+			return wild(generator);
+		});
+		std::ranges::generate(y, [&] {
+			return wild(generator);
+		});
+		auto level = std::vector<float>(tree.lanes);
+		auto const per = tree.width / tree.lanes;
+		for (auto lane = Count{0}; lane < tree.lanes; ++lane) {
+			auto partial = 0.0F;
+			for (auto term = lane * per; term < (lane + 1) * per; ++term) {
+				partial = std::fma(x.at(term), y.at(term), partial);
+			}
+			level.at(lane) = partial;
+		}
+		for (auto width = tree.lanes / 2; width != 0; width /= 2) {
+			for (auto lane = Count{0}; lane < width; ++lane) {
+				level.at(lane) = level.at(lane) + level.at(lane + width);
+			}
+		}
+		if (std::bit_cast<std::uint32_t>(model::lane_sum<tree>(x, y, 0)) != std::bit_cast<std::uint32_t>(level.front())) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * The merge of two groups rounds once: the group with the larger maximum is the addend, unscaled, because exp(0) is
+ * exactly 1; the result equals left + right scaled to the larger maximum, computed exactly in double and rounded once.
+ */
+[[nodiscard]] auto merge_rounds_once(std::uint64_t seed) -> bool {
+	namespace attention = model::attention;
+	auto generator = engine::testing::generator(seed);
+	auto holds = engine::device::prims::math::exp(0.0F) == 1.0F;
+	for (auto trial = 0; trial < 100'000; ++trial) {
+		auto const left_maximum = std::uniform_real_distribution<float>{-20.0F, 20.0F}(generator);
+		auto const right_maximum = trial % 7 == 0 ? left_maximum : std::uniform_real_distribution<float>{-20.0F, 20.0F}(generator);
+		auto const left = std::uniform_real_distribution<float>{0.0F, 1e12F}(generator);
+		auto const right = std::uniform_real_distribution<float>{0.0F, 1e12F}(generator);
+		auto const how = attention::merge(left_maximum, right_maximum);
+		auto const got = attention::merged(left, right, how);
+		auto const larger = std::max(left_maximum, right_maximum);
+		auto const scaled_left = how.scaled == attention::Side::Left;
+		// The double product of two floats is exact; its sum with a float rounds at most once more, far below a float ulp.
+		auto const exact = scaled_left ? static_cast<double>(left) * static_cast<double>(how.factor) + static_cast<double>(right)
+		                               : static_cast<double>(right) * static_cast<double>(how.factor) + static_cast<double>(left);
+		auto const ulp = static_cast<double>(std::nextafter(got, std::numeric_limits<float>::infinity()) - got);
+		holds = holds && how.maximum == larger && std::abs(static_cast<double>(got) - exact) <= 0.5 * ulp * (1.0 + 0x1p-20);
+		holds =
+		    holds && (left_maximum == right_maximum ? !scaled_left && how.factor == 1.0F : scaled_left == (right_maximum > left_maximum));
+	}
+	return holds;
+}
+
+/** The groups tile the chunks: 8 chunks each below position 32768, 64 from there, and `group_of` inverts `group_begin`. */
+[[nodiscard]] auto groups_tile_the_chunks() -> bool {
+	namespace attention = model::attention;
+	auto holds = attention::group_begin(0) == 0;
+	for (auto chunk = Count{0}; chunk < attention::max_chunks; ++chunk) {
+		auto const group = attention::group_of(chunk);
+		holds = holds && attention::group_begin(group) <= chunk && chunk < attention::group_begin(group + 1);
+		auto const length = attention::group_begin(group + 1) - attention::group_begin(group);
+		holds = holds && length == (chunk * attention::chunk_positions < 32768 ? Count{8} : Count{64});
+	}
+	return holds && attention::groups_seen(model::max_positions - 1) == attention::group_of(attention::max_chunks - 1) + 1;
+}
+
 }
 
 auto main() -> int {
@@ -116,7 +201,7 @@ auto main() -> int {
 	auto const rotations = check_rotations(positions);
 	auto const probes = weights(0x5eed'0002);
 	auto const scaled_exact = std::ranges::all_of(probes, [](float p) {
-		return split_is_exact(p * model::attention_weight_scale);
+		return split_is_exact(p * model::attention::weight_scale);
 	});
 	auto const unscaled_inexact_below_the_bound = std::ranges::any_of(probes, [](float p) {
 		return p < 0x1p-110F && !split_is_exact(p);
@@ -138,8 +223,8 @@ auto main() -> int {
 	        .holds = (rotations.checked - rotations.equal_to_libm_rounded) * 100'000 <= rotations.checked,
 	    },
 	    engine::testing::Case{
-	        .name = "the deltanet query scale is the fp32 nearest 128^(-1/2)",
-	        .holds = nearest(model::deltanet_query_scale, 1.0 / std::sqrt(static_cast<double>(model::key_dim))),
+	        .name = "the deltanet query divisor is the fp32 nearest sqrt(128)",
+	        .holds = nearest(model::deltanet::query_divisor, std::sqrt(static_cast<double>(model::key_dim))),
 	    },
 	    engine::testing::Case{
 	        .name = "every scaled weight in [0, 1] splits into three bf16 that sum to it exactly (seed 0x5eed0002)",
@@ -149,6 +234,16 @@ auto main() -> int {
 	        .name = "unscaled, the split is exact from 2^-110 up and loses bits below it: the scale is needed",
 	        .holds = unscaled_exact_above_the_bound && unscaled_inexact_below_the_bound,
 	    },
+	    engine::testing::Case{.name = "a hidden tile's tree is its fma chains and halving fold (seed 0x5eed0003)",
+		                      .holds = tree_is_its_order<model::hidden_tile>(0x5eed'0003)},
+	    engine::testing::Case{.name = "an attention head's tree is its fma chains and halving fold (seed 0x5eed0004)",
+		                      .holds = tree_is_its_order<model::attention_head>(0x5eed'0004)},
+	    engine::testing::Case{.name = "a deltanet vector's tree is its fma chains and halving fold (seed 0x5eed0005)",
+		                      .holds = tree_is_its_order<model::deltanet_vector>(0x5eed'0005)},
+	    engine::testing::Case{.name = "merging two groups rounds once, the larger maximum's group unscaled (seed 0x5eed0006)",
+		                      .holds = merge_rounds_once(0x5eed'0006)},
+	    engine::testing::Case{.name = "attention's groups tile the chunks, 8 below position 32768 and 64 from there",
+		                      .holds = groups_tile_the_chunks()},
 	};
 	return engine::testing::report(cases);
 }

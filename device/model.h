@@ -6,6 +6,9 @@
 // no standard headers so that it compiles unchanged as device code and inside a module purview.
 #pragma once
 
+// The rounding section's fixed algorithms are built on the engine's fixed transcendentals, which use no headers either.
+#include "prims/transcendental.h"
+
 namespace engine::model {
 
 using Count = decltype(sizeof(0));
@@ -715,11 +718,20 @@ static_assert(pool_blocks >= slots, "every slot holds at least one kv block");
 static_assert(row_budgets_fit_the_slots(), "every row budget gives each slot its committed row and no slot more than its deepest draft");
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Rounding: where the engine rounds to bf16, what stays fp32, the order of every sum, and the fixed algorithms. The
-// kernels and the cpu reference both compute exactly this, so a kernel and the reference agree bit for bit and any
-// difference between them is a bug, not noise. Every fp32 operation is ieee, rounded to nearest even, with no
-// contraction: an fma is an fma only where it is named. exp, log, rsqrt, sigmoid, silu and softplus are the engine's
-// fixed routines (`prims::math`); cos and sin are `rope::rotation` below.
+// Rounding: where the engine rounds to bf16, what stays fp32, the order of every sum, every tree, constant and fixed
+// algorithm, held here once. The kernels' arithmetic is these functions (each device header calls them), and the cpu
+// reference calls them through `engine.model`, so a kernel and the reference agree bit for bit and any difference
+// between them is a bug, not noise. Where a kernel chose a parallel mapping for its speed (a tree's lanes, attention's
+// groups of chunks, a weight product's split over the SMs), the mapping is recorded here and the reference follows it.
+//
+// Every fp32 operation is ieee, rounded to nearest even, with no contraction. Every multiply-accumulate is one fma, a
+// single rounding: where the product is exact (bf16 x bf16 in fp32) an fma and a multiply then add agree, and it is an
+// fma there too so that every accumulation reads one way. exp, log, rsqrt, sigmoid, silu and softplus are the engine's
+// fixed routines (`prims::math`); cos and sin are `rope::rotation`. The tensor core's own accumulation is not fp32's:
+// each `mma.m16n8k16` step is what `engine.mma_model` says, and an "mma chain" is a run of steps whose accumulator
+// passes from step to step.
+
+namespace fixed = device::prims::math;
 
 /** How a value is held between the operation that produces it and those that consume it. */
 enum class Precision : unsigned char {
@@ -746,49 +758,41 @@ enum class Value : unsigned char {
 	DeltanetGate,
 	/** in_proj_a's and in_proj_b's outputs: the decay's and the write strength's inputs. */
 	DeltanetDecayInput,
-	/** silu(conv(window)) per channel: q | k | v before the l2 norms. */
+	/** `deltanet::convolved`: silu(conv(window)) per channel, q | k | v before the l2 norms. */
 	DeltanetConvolved,
-	/** The l2-normalized key, and the l2-normalized query times `deltanet_query_scale`. */
+	/** The l2-normalized key, and the l2-normalized query divided by `deltanet::query_divisor`. */
 	DeltanetKeys,
-	/**
-	 * The decay exp(-(exp(A_log) * softplus(a + dt_bias))) and the write strength sigmoid(b), each operation rounded in
-	 * that order.
-	 */
+	/** `deltanet::decay` and `deltanet::write_strength`. */
 	DeltanetGates,
 	/** The recurrent state, a key_dim x value_dim matrix per value head. */
 	DeltanetState,
 	/** The state read out by the query. */
 	DeltanetCore,
-	/** norm(core) * weight * silu(z): out_proj's input. */
+	/** `deltanet::normed`: the gated norm before its gate, which the core phase hands the output phase. */
+	DeltanetNormed,
+	/** `deltanet::gated`: out_proj's input. */
 	DeltanetGated,
 	/** A matmul output summed across the cards before it is added to the residual. */
 	Partial,
-	/**
-	 * q after q_norm and rope: the scores' mma operand. Rope turns feature j (below rotary_dim / 2) with feature
-	 * j + rotary_dim / 2: x_j c - x_(j+32) s and x_(j+32) c + x_j s, each product rounded before the difference or sum;
-	 * features from rotary_dim up pass through.
-	 */
+	/** q after q_norm and rope: the scores' mma operand. */
 	Query,
 	/** k after k_norm and rope, and v: kept in the kv cache. */
 	KeyValue,
 	/** The gate half of q_proj: it only gates. */
 	AttentionGate,
-	/** q . k scaled by `attention_score_scale`. */
+	/** `attention::score`. */
 	Score,
-	/**
-	 * exp(score - m), m the largest score the row sees in the chunk; a position the row does not see weighs +0. Split
-	 * exactly into three bf16 parts at `attention_weight_scale` for the PV mmas.
-	 */
+	/** `attention::weight`, split exactly into three bf16 parts by `split_weight` for the PV mmas. */
 	AttentionWeight,
-	/** A chunk's PV sums and row sum, and their merge over chunks. */
-	AttentionChunk,
-	/** The merged attention output times sigmoid(gate), rounded once: o_proj's input. */
+	/** A group's PV sums, maximum and row sum (the decode core's records), and their merge over groups. */
+	AttentionGroup,
+	/** `attention::output`: o_proj's input. */
 	AttentionGated,
 	/** post_attention_layernorm(residual): gate_proj's and up_proj's input. */
 	MlpInput,
 	/** gate_proj's and up_proj's outputs. */
 	MlpGateUp,
-	/** silu(gate) * up: down_proj's input. */
+	/** `mlp_product`: down_proj's input. */
 	MlpProduct,
 	/**
 	 * The final norm's output: the lm_head's input, and the mtp head's hidden input at the same position (it is what a
@@ -826,11 +830,12 @@ enum class Value : unsigned char {
 	case Value::DeltanetGates:
 	case Value::DeltanetState:
 	case Value::DeltanetCore:
+	case Value::DeltanetNormed:
 	case Value::Partial:
 	case Value::AttentionGate:
 	case Value::Score:
 	case Value::AttentionWeight:
-	case Value::AttentionChunk:
+	case Value::AttentionGroup:
 	case Value::MlpGateUp:
 	case Value::Logit:
 		return Precision::Fp32;
@@ -838,18 +843,87 @@ enum class Value : unsigned char {
 	__builtin_unreachable();
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Sums over lanes.
+
 /**
- * Every sum of many fp32 terms, and its one order. "Lanes of w" is the order a warp gives: lane l takes terms
- * [l w / 32, (l + 1) w / 32), folds them in ascending order by fma from +0 (fma(x, y, partial) for a product,
- * fma(x, x, partial) for a square), and the 32 partials meet in a butterfly at distance 16, 8, 4, 2, 1, each lane
- * adding its partner's value. An mma chain is a run of `mma.m16n8k16` steps whose accumulator starts at +0 and passes
- * from step to step; each step is the sm_86 tensor core's own accumulation (`engine.mma_model` on the host).
+ * A fixed-order sum of `width` terms on `lanes` lanes of a warp: lane l folds terms [l w / lanes, (l + 1) w / lanes)
+ * in ascending order by fma from +0 (fma(x, y, partial) for a product, fma(x, x, partial) for a square), then the
+ * partials meet in a butterfly at distance lanes / 2, ..., 2, 1, each lane adding its partner's value. fp32 addition
+ * is commutative, so every lane of the butterfly ends with the same bits.
+ */
+struct Lanes {
+	Count lanes;
+	Count width;
+};
+
+[[nodiscard]] constexpr auto per_lane(Lanes tree) -> Count {
+	return tree.width / tree.lanes;
+}
+
+/** A tile of the hidden state: the residual epilogue's warp per 128-output tile, four outputs a lane. */
+inline constexpr Lanes hidden_tile = {.lanes = 32, .width = 128};
+
+/** One attention head: a row per warp, eight features a lane (a lane holds one 16-byte chunk of the bf16 row). */
+inline constexpr Lanes attention_head = {.lanes = 32, .width = head_dim};
+
+// Eight lanes of sixteen rather than a whole warp per vector: the delta rule's chains are shorter, and four state
+// columns per warp keep a lane's share of the state at sixteen registers. The deltanet kernels chose it for that speed;
+// every 128-term deltanet sum (both l2 norms, both of the recurrence's dot products, the gated norm) takes it.
+inline constexpr Lanes deltanet_vector = {.lanes = 8, .width = 128};
+
+static_assert(hidden % hidden_tile.width == 0 && key_dim == deltanet_vector.width && value_dim == deltanet_vector.width);
+
+/** One lane's fold of x_i y_i over terms [first, first + count), ascending, by fma from +0. */
+template<class X, class Y>
+[[nodiscard]] constexpr auto lane_fold(X const& x, Y const& y, Count first, Count count) -> float {
+	float partial = 0.0F;
+	for (Count term = first; term < first + count; ++term) {
+		partial = fixed::fma(x[term], y[term], partial);
+	}
+	return partial;
+}
+
+/** The butterfly over `lanes` partials: the total every lane ends with. */
+template<Count lanes, class P>
+[[nodiscard]] constexpr auto butterfly(P const& partials) -> float {
+	static_assert(lanes >= 1 && lanes <= 32 && (lanes & (lanes - 1)) == 0, "a butterfly is a power of two within a warp");
+	float level[lanes] = {};
+	for (Count lane = 0; lane < lanes; ++lane) {
+		level[lane] = partials[lane];
+	}
+	for (Count distance = lanes / 2; distance != 0; distance /= 2) {
+		float next[lanes] = {};
+		for (Count lane = 0; lane < lanes; ++lane) {
+			next[lane] = level[lane] + level[lane ^ distance];
+		}
+		for (Count lane = 0; lane < lanes; ++lane) {
+			level[lane] = next[lane];
+		}
+	}
+	return level[0];
+}
+
+/** sum x_i y_i over terms [first, first + tree.width) under `tree`. */
+template<Lanes tree, class X, class Y>
+[[nodiscard]] constexpr auto lane_sum(X const& x, Y const& y, Count first) -> float {
+	static_assert(tree.width % tree.lanes == 0);
+	float partials[tree.lanes] = {};
+	for (Count lane = 0; lane < tree.lanes; ++lane) {
+		partials[lane] = lane_fold(x, y, first + lane * per_lane(tree), per_lane(tree));
+	}
+	return butterfly<tree.lanes>(partials);
+}
+
+/**
+ * Every sum of many fp32 terms, and its one order. The lane trees and the functions named carry each order; this list
+ * says which sum takes which.
  */
 enum class Sum : unsigned char {
 	/**
 	 * Every product with a weight matrix. A phase's units (one weight tile of each tensor the phase interleaves) are
 	 * split over the SMs as `schedule::share` says, each output tile's units consecutive in ascending k. Per SM and
-	 * output element: for an e4m3 tile, an mma chain over its 8 k16 steps in ascending k, then
+	 * output element: for an e4m3 tile, an mma chain over its 8 k16 steps in ascending k from +0, then
 	 * partial = fma(chain, block scale, partial) from +0; for bf16 tiles, one mma chain over all the SM's k16 steps in
 	 * ascending k. The output tile's SM partials are added left to right in SM order, then the cards' sums card 0 +
 	 * card 1 (for an axis-1 split), then the residual + that sum (the mtp fc's sum starts the mtp residual instead).
@@ -857,56 +931,199 @@ enum class Sum : unsigned char {
 	 */
 	Weights,
 	/**
-	 * An rms norm over the hidden size: each 128-feature tile's squares in lanes of 128, then the 40 tile sums added
-	 * left to right from tile 0. The mean is sum / hidden (a division), then rsqrt(mean + eps), x * that, then
-	 * * (1 + w) (`NormScale::OnePlusWeight`, 1 + w rounded in fp32).
+	 * An rms norm over the hidden size: `hidden_squares` (each 128-feature tile under `hidden_tile`, the tile sums added
+	 * left to right from tile 0), then `rms_factor` and `one_plus_scaled`.
 	 */
 	HiddenSquares,
-	/** q_norm and k_norm: the head's 256 squares in lanes of 256, then the same steps as `HiddenSquares`. */
+	/** q_norm and k_norm: the head's squares under `attention_head`, then `rms_factor` and `one_plus_scaled`. */
 	HeadSquares,
-	/**
-	 * The deltanet l2 norms of q and k: lanes of 128; x * rsqrt(sum + `l2_norm_eps`), and the query then times
-	 * `deltanet_query_scale`.
-	 */
+	/** The deltanet l2 norms of q and k: squares under `deltanet_vector`, then `deltanet::l2_factor`. */
 	KeySquares,
-	/** The deltanet gated norm: lanes of 128; ((x * rsqrt(sum / value_dim + eps)) * w) * silu(z). */
+	/** The deltanet gated norm: squares under `deltanet_vector`, then `rms_factor` and `deltanet::normed`. */
 	ValueSquares,
 	/**
-	 * The deltanet recurrence, per value column j of a head, in fp32: S_ij = S_ij * decay for every i; memory =
-	 * sum_i S_ij k_i in lanes of 128; delta = (v_j - memory) * beta; S_ij = fma(k_i, delta, S_ij); out_j =
-	 * sum_i S_ij q_i in lanes of 128.
+	 * The deltanet recurrence, per value column j of a head: `deltanet::decayed` for every i; memory = sum_i S_ij k_i
+	 * under `deltanet_vector`; `deltanet::delta`; `deltanet::updated` for every i; out_j = sum_i S_ij q_i under
+	 * `deltanet_vector`.
 	 */
 	DeltanetProducts,
-	/** The causal convolution: fma from +0 over the four taps, oldest input first, the current one last; then silu. */
+	/** The causal convolution: `deltanet::convolved`. */
 	Convolution,
-	/** q . k: one mma chain over the head's 16 k16 steps in ascending feature order; then * the score scale. */
+	/** q . k: one mma chain over the head's 16 k16 steps in ascending feature order from +0; then `attention::score`. */
 	Scores,
-	/**
-	 * A chunk's PV sums: one mma chain over its two k16 steps of positions, ascending, each step's hi, mid and lo
-	 * parts in that order (six mmas).
-	 */
-	ChunkValues,
 	/** A chunk's row sum of its scaled weights: one per lane (position within the chunk), the butterfly alone. */
 	ChunkWeights,
 	/**
-	 * The merge of a row's chunks, in chunk order: with M the largest chunk max, each chunk's factor exp(m - M), and
-	 * output and row sum each folded by fma(chunk value, factor, total) from +0; the result is output / row sum.
+	 * A chunk's PV sums: the group's running output times the chunk's rescale (`attention::rescaled`), then one mma
+	 * chain from it over the hi parts of the chunk's two k16 steps of positions in ascending order, then the mid parts',
+	 * then the lo parts' (six mmas).
 	 */
-	ChunkMerge,
+	ChunkValues,
+	/** A group's chunks in order, by the online softmax: `attention::advance` and `attention::running_total`. */
+	GroupChunks,
+	/** A row's groups in order, the first taken as it is and each later one folded in by `attention::merged`. */
+	GroupMerge,
 };
 
+/** The sum of squares over a hidden-sized row: `Sum::HiddenSquares`. */
+template<class X>
+[[nodiscard]] constexpr auto hidden_squares(X const& x) -> float {
+	float total = lane_sum<hidden_tile>(x, x, 0);
+	for (Count tile = 1; tile < hidden / hidden_tile.width; ++tile) {
+		total = total + lane_sum<hidden_tile>(x, x, tile * hidden_tile.width);
+	}
+	return total;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Norms.
+
+/** 1 / sqrt(mean square + eps) from a sum of `width` squares; the mean is a division. */
+[[nodiscard]] constexpr auto rms_factor(float squares, Count width) -> float {
+	float const mean = squares / static_cast<float>(width);
+	return fixed::rsqrt(mean + rms_norm_eps);
+}
+
+/** A zero-centred norm's output before its rounding: (x * factor) * (1 + w), 1 + w rounded in fp32. */
+[[nodiscard]] constexpr auto one_plus_scaled(float x, float factor, float weight) -> float {
+	float const scaled = x * factor;
+	float const gain = 1.0F + weight;
+	return scaled * gain;
+}
+
+static_assert(rms_norm_scale == NormScale::OnePlusWeight && deltanet_norm_scale == NormScale::Weight);
+
+/** silu(gate) * up: `Value::MlpProduct` before its rounding. */
+[[nodiscard]] constexpr auto mlp_product(float gate, float up) -> float {
+	return fixed::silu(gate) * up;
+}
+
+static_assert(mlp_gate == Gate::Silu);
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Attention.
+
+namespace attention {
+
+/** Positions per chunk at fixed absolute positions: one per lane of the softmax warp, two per kv block. */
+inline constexpr Count chunk_positions = kv_block_tokens / 2;
+
+// Chunks are folded in groups at fixed chunk indices: eight chunks (256 positions) per group below position 32768,
+// sixty-four (2048 positions) from there. A group is the unit the decode core assigns to an SM and never splits, so a
+// row's arithmetic depends on its query, its kv and its position alone. Short groups near the start keep many SMs busy
+// on short contexts; long groups far out keep a long context's records few. The attention kernels chose the mapping;
+// it fixes the order every row's softmax is summed in.
+inline constexpr Count near_group_chunks = 8;
+inline constexpr Count near_chunks = 1024;
+inline constexpr Count far_group_chunks = 64;
+inline constexpr Count near_groups = near_chunks / near_group_chunks;
+inline constexpr Count max_chunks = max_positions / chunk_positions;
+
+static_assert(chunk_positions == 32 && kv_block_tokens == 2 * chunk_positions, "a kv block is two chunks of a warp's lanes");
+static_assert(near_chunks % near_group_chunks == 0 && (max_chunks - near_chunks) % far_group_chunks == 0, "groups tile the chunks");
+
+/** The group holding chunk `chunk`. */
+[[nodiscard]] constexpr auto group_of(Count chunk) -> Count {
+	return chunk < near_chunks ? chunk / near_group_chunks : near_groups + (chunk - near_chunks) / far_group_chunks;
+}
+
+/** The first chunk of group `group`. */
+[[nodiscard]] constexpr auto group_begin(Count group) -> Count {
+	return group < near_groups ? group * near_group_chunks : near_chunks + (group - near_groups) * far_group_chunks;
+}
+
+/** The groups a row seeing positions [0, limit] folds: every group holding a position it sees. */
+[[nodiscard]] constexpr auto groups_seen(Count limit) -> Count {
+	return group_of(limit / chunk_positions) + 1;
+}
+
 /** 1 / sqrt(head_dim), exact: the scores' scale is a power of two. */
-inline constexpr float attention_score_scale = 0x1p-4F;
+inline constexpr float score_scale = 0x1p-4F;
 
 static_assert(head_dim == 256, "the score scale is 1 / sqrt(head_dim), exactly");
 
 /**
- * The attention weights enter the PV mmas as P * 2^40 = hi + mid + lo exactly: hi keeps the top 16 bits of the fp32
- * pattern, mid the top 16 of the exact remainder, lo the exact rest, each a bf16. Without the scale the lo part of a
- * weight below 2^-110 falls under bf16's subnormal step; from 2^38 up every weight splits exactly. The row sum carries
- * the same scale, so the division cancels it.
+ * The attention weights enter the PV mmas as P * 2^40 = hi + mid + lo exactly (`split_weight`). Without the scale the
+ * lo part of a weight below 2^-110 falls under bf16's subnormal step; from 2^38 up every weight splits exactly. The
+ * row sum carries the same scale, so the division cancels it.
  */
-inline constexpr float attention_weight_scale = 0x1p40F;
+inline constexpr float weight_scale = 0x1p40F;
+
+/** The scores' mma chain scaled: `Value::Score`. */
+[[nodiscard]] constexpr auto score(float dot) -> float {
+	return dot * score_scale;
+}
+
+/** The larger of two maxima, neither a nan (a group's running maximum starts at -infinity). */
+[[nodiscard]] constexpr auto larger(float left, float right) -> float {
+	return right > left ? right : left;
+}
+
+/** A chunk's step of a group's online softmax: the new running maximum, and the rescale of what ran before. */
+struct Advance {
+	float maximum;
+	float rescale;
+};
+
+/**
+ * The step for a chunk whose visible scores' largest is `chunk_maximum`, after a running maximum `running`
+ * (-infinity at the group's first chunk, whose rescale is then +0 against a running output and total of +0).
+ */
+[[nodiscard]] constexpr auto advance(float running, float chunk_maximum) -> Advance {
+	float const maximum = larger(running, chunk_maximum);
+	return {.maximum = maximum, .rescale = fixed::exp(running - maximum)};
+}
+
+/** A visible position's scaled softmax weight under the running maximum: `Value::AttentionWeight`. */
+[[nodiscard]] constexpr auto weight(float score_value, float maximum) -> float {
+	return fixed::exp(score_value - maximum) * weight_scale;
+}
+
+/** The group's running row sum after a chunk whose weights sum (`Sum::ChunkWeights`) to `sum`. */
+[[nodiscard]] constexpr auto running_total(float total, float rescale, float sum) -> float {
+	return fixed::fma(total, rescale, sum);
+}
+
+/** A running output element before the chunk's PV mmas accumulate onto it. */
+[[nodiscard]] constexpr auto rescaled(float output, float rescale) -> float {
+	return output * rescale;
+}
+
+/** Which of two merged groups is rescaled: the one whose maximum is not the larger. */
+enum class Side : unsigned char {
+	Left,
+	Right,
+};
+
+/** How two adjacent groups merge: the merged maximum, the side rescaled, and its factor. */
+struct Merge {
+	float maximum;
+	Side scaled;
+	float factor;
+};
+
+// The group with the larger maximum has factor e^0 = 1 exactly, so it is the fma's addend and the other group's
+// product its multiply: one rounding per merged value, where scaling both sides would round three times. On a tie the
+// right group is the one multiplied, by exactly 1.
+[[nodiscard]] constexpr auto merge(float left_maximum, float right_maximum) -> Merge {
+	if (right_maximum > left_maximum) {
+		return {.maximum = right_maximum, .scaled = Side::Left, .factor = fixed::exp(left_maximum - right_maximum)};
+	}
+	return {.maximum = left_maximum, .scaled = Side::Right, .factor = fixed::exp(right_maximum - left_maximum)};
+}
+
+/** A merged output element or row sum, the earlier group on the left. */
+[[nodiscard]] constexpr auto merged(float left, float right, Merge const& how) -> float {
+	return how.scaled == Side::Left ? fixed::fma(left, how.factor, right) : fixed::fma(right, how.factor, left);
+}
+
+/** The merged output element over the row sum, gated: `Value::AttentionGated` before its rounding. */
+[[nodiscard]] constexpr auto output(float value, float total, float gate) -> float {
+	float const mean = value / total;
+	return mean * fixed::sigmoid(gate);
+}
+
+static_assert(attention_output_gate == Gate::Sigmoid);
 
 /** A scaled attention weight's parts as bf16 bit patterns, largest first; their exact sum is the weight. */
 struct WeightParts {
@@ -917,7 +1134,10 @@ struct WeightParts {
 
 inline constexpr unsigned bf16_bits = 0xffff0000U;
 
-/** The split of a scaled weight in [0, 2^40]: each part is the top 16 bits of what the larger parts leave. */
+/**
+ * The split of a scaled weight in [0, 2^40]: each part is the top 16 bits of the fp32 pattern of what the larger parts
+ * leave (a truncation, so each remainder is exact and the last part is exactly bf16).
+ */
 [[nodiscard]] constexpr auto split_weight(float scaled) -> WeightParts {
 	unsigned const high = __builtin_bit_cast(unsigned, scaled) & bf16_bits;
 	float const rest = scaled - __builtin_bit_cast(float, high);
@@ -930,11 +1150,91 @@ inline constexpr unsigned bf16_bits = 0xffff0000U;
 	};
 }
 
-/** 128^-1/2 to nearest: the deltanet query's scale after its l2 norm. */
-inline constexpr float deltanet_query_scale = 0x1.6a09e6p-4F;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The gated deltanet.
+
+namespace deltanet {
+
 inline constexpr float l2_norm_eps = 1e-6F;
 
-static_assert(key_dim == 128, "the query scale is 1 / sqrt(key_dim)");
+// The checkpoint's reference code for the recurrence (transformers' `torch_recurrent_gated_delta_rule`, the rule the
+// engine runs for decode and prefill alike) divides the normalized query by `query.shape[-1] ** 0.5`, a python float
+// that the fp32 tensor's division takes as its fp32 rounding, 8 sqrt(2) to nearest. Its chunked prefill form and the
+// fla kernels multiply by 128^-1/2 instead; the two differ in the last bit for some queries, and the engine follows
+// the recurrence.
+inline constexpr float query_divisor = 0x1.6a09e6p+3F;
+
+static_assert(key_dim == 128, "the query divisor is sqrt(key_dim)");
+
+/** One channel's convolution output for the newest of `conv_kernel` inputs: fma from +0, oldest first, then silu. */
+template<class T, class X>
+[[nodiscard]] constexpr auto convolved(T const& taps, X const& inputs) -> float {
+	float sum = 0.0F;
+	for (Count tap = 0; tap < conv_kernel; ++tap) {
+		sum = fixed::fma(taps[tap], inputs[tap], sum);
+	}
+	return fixed::silu(sum);
+}
+
+/** 1 / sqrt(sum of squares + eps), the l2 norm's factor. */
+[[nodiscard]] constexpr auto l2_factor(float squares) -> float {
+	return fixed::rsqrt(squares + l2_norm_eps);
+}
+
+/** A normalized key element. */
+[[nodiscard]] constexpr auto key(float x, float factor) -> float {
+	return x * factor;
+}
+
+/** A normalized query element. */
+[[nodiscard]] constexpr auto query(float x, float factor) -> float {
+	float const normalized = x * factor;
+	return normalized / query_divisor;
+}
+
+/** e^g, g = -e^A_log softplus(a + dt_bias): how much of the state survives the token. */
+[[nodiscard]] constexpr auto decay(float a, float a_log, float dt_bias) -> float {
+	float const shifted = a + dt_bias;
+	float const rate = fixed::exp(a_log);
+	float const step = rate * fixed::softplus(shifted);
+	return fixed::exp(-step);
+}
+
+/** sigmoid(b): how much of the token's error the state takes in. */
+[[nodiscard]] constexpr auto write_strength(float b) -> float {
+	return fixed::sigmoid(b);
+}
+
+[[nodiscard]] constexpr auto decayed(float state, float decay_value) -> float {
+	return state * decay_value;
+}
+
+/** A column's error on the token's value, scaled by the write strength. */
+[[nodiscard]] constexpr auto delta(float value, float memory, float strength) -> float {
+	float const error = value - memory;
+	return error * strength;
+}
+
+[[nodiscard]] constexpr auto updated(float state, float key_element, float column_delta) -> float {
+	return fixed::fma(key_element, column_delta, state);
+}
+
+/** The gated norm before its gate: (x * factor) * w, `Value::DeltanetNormed`. */
+[[nodiscard]] constexpr auto normed(float core, float factor, float weight) -> float {
+	float const scaled = core * factor;
+	return scaled * weight;
+}
+
+/** out_proj's input before its rounding: normed * silu(z), `Value::DeltanetGated`. */
+[[nodiscard]] constexpr auto gated(float normed_value, float z) -> float {
+	return normed_value * fixed::silu(z);
+}
+
+static_assert(deltanet_output_gate == Gate::Silu);
+
+}
 
 /**
  * The mtp head drafts as it was trained and is served: its entry at position i reads the trunk's `FinalNormed` at
@@ -945,6 +1245,9 @@ static_assert(key_dim == 128, "the query scale is 1 / sqrt(key_dim)");
  * next step reads.)
  */
 inline constexpr Count mtp_token_lead = 1;
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Rope.
 
 namespace rope {
 
@@ -961,6 +1264,9 @@ inline constexpr float inverse_frequency[rotary_dim / 2] = {
 };
 
 static_assert(rotary_dim == 64 && rope_theta == 10'000'000.0F, "the table is rope_theta's");
+
+/** The rotated feature pairs of a head: feature j turns with feature j + pairs. */
+inline constexpr Count pairs = rotary_dim / 2;
 
 /** cos and sin of one feature pair's angle at one position. */
 struct Rotation {
@@ -1011,7 +1317,8 @@ inline constexpr double round_shifter = 0x1.8p52;
 /**
  * cos and sin of the pair's angle at `position`, each the fp32 rounding of a double evaluation with an error near
  * 2^-60: a fixed sequence of ieee double operations, so every machine computes the same bits (libm's cos and sin
- * differ between platforms). The angle, at most max_positions, is reduced by pi / 2 in three parts.
+ * differ between platforms). The angle, at most max_positions, is reduced by pi / 2 in three parts. This is the only
+ * sine and cosine the engine has: attention reads it from a table the device fills by evaluating this very function.
  */
 [[nodiscard]] constexpr auto rotation(Count position, Count pair) -> Rotation {
 	double const x = static_cast<double>(angle(position, pair));
@@ -1032,6 +1339,20 @@ inline constexpr double round_shifter = 0x1.8p52;
 }
 
 static_assert(max_positions <= Count{1} << 20U, "k times the first two parts of pi / 2 stays exact");
+
+// Each rotated feature is one fma: x_j cos - x_(j+32) sin and x_(j+32) cos + x_j sin are each a two-term sum whose
+// products are inexact, so one product is fused and the other rounded first. Either choice rounds twice; the feature's
+// own cosine term is the fused one.
+
+/** Feature j of a rotated pair: x_j cos - x_(j+32) sin. */
+[[nodiscard]] constexpr auto first(float low, float high, Rotation turn) -> float {
+	return fixed::fma(low, turn.cosine, -(high * turn.sine));
+}
+
+/** Feature j + 32 of a rotated pair: x_(j+32) cos + x_j sin. */
+[[nodiscard]] constexpr auto second(float low, float high, Rotation turn) -> float {
+	return fixed::fma(high, turn.cosine, low * turn.sine);
+}
 
 }
 
