@@ -63,7 +63,7 @@ export using CUstream = CUstream_st*;
 export using CUevent = CUevent_st*;
 export using nvmlDevice_t = nvmlDevice_st*;
 
-// The vendors' C enums are int-sized: each declaration below must match that ABI width, not its value set.
+/* PIN(driver-abi-enum-size): the vendors' C enums are int-sized; these must match that width, not their value set */
 // NOLINTBEGIN(performance-enum-size)
 
 /**
