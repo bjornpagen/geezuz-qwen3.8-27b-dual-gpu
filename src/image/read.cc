@@ -105,6 +105,13 @@ public:
 		return mapping_.bytes().subspan(payload_start<C>);
 	}
 
+	/** The payload's SHA-256 as the header records it, which opening checked the payload against. */
+	[[nodiscard]] auto payload_digest() const -> sha256::Digest {
+		auto digest = sha256::Digest{};
+		std::ranges::copy(in(mapping_.bytes(), payload_digest_field), digest.bytes.begin());
+		return digest;
+	}
+
 	/** The bytes of extent `index` of the catalog. */
 	[[nodiscard]] auto bytes(std::size_t index) const -> std::span<std::byte const> {
 		auto const placement = std::span{layout<C>}[index];

@@ -20,5 +20,5 @@ add_test(NAME image.emit
 )
 set_tests_properties(image.emit PROPERTIES FIXTURES_SETUP image_specimen TIMEOUT 60)
 
-engine_test(image.file SOURCES file.test.cc LINK engine_file engine_image engine_image_synthetic)
+engine_test(image.file SOURCES file.test.cc LINK engine_file engine_image engine_image_synthetic engine_sha256)
 set_tests_properties(image.file PROPERTIES FIXTURES_REQUIRED image_specimen WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")

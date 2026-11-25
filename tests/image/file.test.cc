@@ -3,6 +3,7 @@ import std;
 import engine.file;
 import engine.image;
 import engine.image_synthetic;
+import engine.sha256;
 import engine.testing;
 
 namespace {
@@ -25,6 +26,9 @@ constexpr auto specimen_path = std::string_view{"specimen.image"};
 	}
 	auto const baked = synthetic::specimen_image();
 	if (!std::ranges::equal(opened->payload(), std::span{baked.file}.subspan(image::payload_start<SpecimenCatalog>))) {
+		return false;
+	}
+	if (opened->payload_digest() != baked.finished.payload || opened->payload_digest() != engine::sha256::digest(opened->payload())) {
 		return false;
 	}
 	auto const fixed = opened->extent<6>();
@@ -61,7 +65,7 @@ constexpr auto specimen_path = std::string_view{"specimen.image"};
 
 auto main() -> int {
 	auto const cases = std::array{
-	    engine::testing::Case{.name = "a mapped image reads back the payload and every extent", .holds = mapped_image_reads_back()},
+	    engine::testing::Case{.name = "a mapped image reads back its payload, its recorded payload digest and every extent", .holds = mapped_image_reads_back()},
 	    engine::testing::Case{.name = "a moved image still reads its extents", .holds = moved_image_still_reads()},
 	    engine::testing::Case{.name = "mapping failures and refusals reach the caller as image errors", .holds = refusals_reach_the_caller()},
 	};
