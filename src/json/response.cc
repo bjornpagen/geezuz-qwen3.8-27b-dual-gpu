@@ -3,7 +3,7 @@ export module engine.json:response;
 
 import std;
 import engine.core;
-import :read;
+import :text;
 import :write;
 
 /**

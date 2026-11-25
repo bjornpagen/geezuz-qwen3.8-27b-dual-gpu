@@ -4,7 +4,7 @@ export module engine.json:write;
 import std;
 import engine.core;
 import engine.simdjson;
-import :read;
+import :text;
 
 namespace engine::json {
 

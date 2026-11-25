@@ -4,7 +4,7 @@ export module engine.json:request;
 import std;
 import engine.core;
 import :error;
-import :read;
+import :text;
 
 /**
  * The OpenAI `/v1/chat/completions` request as the engine accepts it: the shapes a request decodes into. What a

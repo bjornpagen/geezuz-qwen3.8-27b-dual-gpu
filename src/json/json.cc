@@ -3,8 +3,15 @@ export module engine.json;
 
 export import :bounds;
 export import :error;
-export import :read;
+export import :text;
+export import :value;
+export import :containers;
+export import :reader;
 export import :write;
 export import :request;
+export import :decode_support;
+export import :decode_neutral;
+export import :decode_messages;
+export import :decode_tools;
 export import :decode;
 export import :response;
