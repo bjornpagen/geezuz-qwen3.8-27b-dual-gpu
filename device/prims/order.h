@@ -13,7 +13,7 @@
 
 namespace engine::device::prims {
 
-static_assert(available(isa::scoped_memory_order));
+static_assert(available(isa::scoped_memory_order) && available(isa::scoped_fence));
 
 /** Who must observe the ordering: the SMs of this card, or the whole system (the peer card and the host). */
 enum class Scope : unsigned char { Gpu, System };
@@ -38,6 +38,42 @@ __attribute__((device)) inline void store_release(unsigned long long* word, unsi
 		asm volatile("st.release.gpu.global.u64 [%0], %1;" : : "l"(word), "l"(value) : "memory");
 	} else {
 		asm volatile("st.release.sys.global.u64 [%0], %1;" : : "l"(word), "l"(value) : "memory");
+	}
+}
+
+// The weaker forms below exist so the cross-card flag microbenchmark can measure what release and acquire cost against
+// them: a relaxed store and load, ordered by explicit sequentially consistent fences (the fence-then-flag
+// protocol). The engine's own protocols use `store_release` and `load_acquire`, one release per item.
+
+/** A relaxed (morally strong, unordered) store of a 64-bit word at `scope`. */
+template<Scope scope>
+__attribute__((device)) inline void store_relaxed(unsigned long long* word, unsigned long long value) {
+	if constexpr (scope == Scope::Gpu) {
+		asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" : : "l"(word), "l"(value) : "memory");
+	} else {
+		asm volatile("st.relaxed.sys.global.u64 [%0], %1;" : : "l"(word), "l"(value) : "memory");
+	}
+}
+
+/** A relaxed (morally strong, unordered) load of a 64-bit word at `scope`. */
+template<Scope scope>
+[[nodiscard]] __attribute__((device)) inline auto load_relaxed(unsigned long long const* word) -> unsigned long long {
+	unsigned long long value = 0;
+	if constexpr (scope == Scope::Gpu) {
+		asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(value) : "l"(word) : "memory");
+	} else {
+		asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(word) : "memory");
+	}
+	return value;
+}
+
+/** A sequentially consistent fence at `scope`: orders this thread's accesses before it against those after. */
+template<Scope scope>
+__attribute__((device)) inline void fence_sc() {
+	if constexpr (scope == Scope::Gpu) {
+		asm volatile("fence.sc.gpu;" : : : "memory");
+	} else {
+		asm volatile("fence.sc.sys;" : : : "memory");
 	}
 }
 

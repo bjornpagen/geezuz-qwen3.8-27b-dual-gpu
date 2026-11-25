@@ -163,8 +163,10 @@ struct OrderScratch {
 	unsigned long long generation;
 	unsigned long long gpu_flags[order_blocks];
 	unsigned long long system_flags[order_blocks];
+	unsigned long long relaxed_flags[order_blocks];
 	Chunk slots[order_blocks];
 	Chunk inbox[order_blocks];
+	Chunk fenced[order_blocks];
 	Line scratch[order_blocks];
 	alignas(16) unsigned words[order_blocks][32];
 };

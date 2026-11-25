@@ -27,6 +27,7 @@ inline constexpr Isa warp_sync = {.ptx = 60, .sm = 30};
 inline constexpr Isa shuffle = {.ptx = 60, .sm = 30};
 inline constexpr Isa vote = {.ptx = 60, .sm = 30};
 inline constexpr Isa scoped_memory_order = {.ptx = 60, .sm = 70};
+inline constexpr Isa scoped_fence = {.ptx = 60, .sm = 70};
 inline constexpr Isa nanosleep = {.ptx = 63, .sm = 70};
 inline constexpr Isa ldmatrix = {.ptx = 65, .sm = 75};
 inline constexpr Isa integer_redux = {.ptx = 70, .sm = 80};

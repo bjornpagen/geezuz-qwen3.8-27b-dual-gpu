@@ -351,8 +351,8 @@ extern "C" __attribute__((device, used)) constexpr prims::Budget engine_budget_p
 
 /**
  * Memory order and the remaining primitives on the hardware: one block per SM (82, co-resident), each passing a value
- * to the next block through a step-1 grid barrier, a release counter, gpu- and system-scope epoch flags and the peer
- * push protocol (aimed at this card's own memory); within a block, producer warps hand shared data to consumer warps
+ * to the next block through a step-1 grid barrier, a release counter, gpu- and system-scope epoch flags, the peer
+ * push protocol (aimed at this card's own memory) and a relaxed flag ordered by sequentially consistent fences; within a block, producer warps hand shared data to consumer warps
  * on a named barrier, a double-buffered loop sums staged chunks, and the bf16 pack and widen instructions are held
  * to their host models.
  */
@@ -396,6 +396,19 @@ extern "C" __attribute__((global, launch_bounds(check::order_budget.threads, che
 		inbox.await(1, remote_backoff);
 		Chunk const pushed = inbox.read(previous, once);
 		check::record(report, pushed.word[2] == previous * 5U, {.input = me, .detail = 4, .got = pushed.word[2], .expected = previous * 5U});
+
+		// The fenced relaxed protocol the flag microbenchmark measures against release and acquire.
+		store(&scratch->fenced[me], mine, reused);
+		fence_sc<Scope::System>();
+		store_relaxed<Scope::System>(&scratch->relaxed_flags[me], 1);
+		unsigned sleep = remote_backoff.first_ns;
+		while (load_relaxed<Scope::System>(&scratch->relaxed_flags[previous]) < 1) {
+			nanosleep(sleep);
+			sleep = sleep * 2U < remote_backoff.ceiling_ns ? sleep * 2U : remote_backoff.ceiling_ns;
+		}
+		fence_sc<Scope::System>();
+		Chunk const fenced = load(&scratch->fenced[previous], reused);
+		check::record(report, fenced.word[1] == previous * 3U, {.input = me, .detail = 12, .got = fenced.word[1], .expected = previous * 3U});
 
 		prefetch_to_l2(&scratch->slots[me]);
 		release_priority(&scratch->scratch[me]);
