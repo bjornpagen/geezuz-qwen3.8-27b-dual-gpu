@@ -197,3 +197,20 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
   confine the deviation from "no non-const globals" to the test double
 - retire: if the driver tables ever carry a context argument (they will not while they are the vendor's own entry
   points), or if the double moves to a separate process
+
+## clang-tidy-optional-merged-record
+
+- symptom: clang-tidy 23.1.5 crashes (SIGSEGV in `clang::dataflow::TransferVisitor::VisitMemberExpr`, under
+  `bugprone-unchecked-optional-access`'s dataflow) on a function that holds a `std::optional` and reads a field of a
+  class whose one header definition reaches the unit through two imported modules: `device/model.h` is exported from
+  `engine.model`'s purview and also included in `engine.schedule`'s global module fragment. a crash, not a finding:
+  the lint gate fails with a stack dump.
+- sites: `src/bake/bound.cc` (`FiniteCodesView`, `widest_row`): the e4m3 codes are parsed once into a view that
+  carries their finiteness, so the function reading `model::Shape` / `Range` fields holds no optional. any dialect unit
+  importing both `engine.model` and `engine.schedule` keeps optionals out of functions that read model-struct fields.
+- reproducer: a header `struct Range { Count begin; Count length; }`; module A `export extern "C++" { #include }` of
+  it; module B including it in its global module fragment with `export using model::Range;`; a unit importing std, A
+  and B whose function holds a `std::optional<uint8_t>` and returns `range.begin`. exit 139 with both imports, 0 with
+  only A.
+- retire: when clang-tidy no longer crashes on the reproducer (the parse-once shape stays; the rule for other units
+  goes)
