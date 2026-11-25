@@ -2,6 +2,16 @@
 engine_test(prims.budget SOURCES budget.test.cc LINK engine_prims)
 engine_test(prims.tile SOURCES tile.test.cc LINK engine_prims)
 engine_test(prims.numeric SOURCES numeric.test.cc LINK engine_prims)
+# The transcendentals are proven over all 2^32 inputs, too many for one deadline: one executable, one ctest case per
+# function and eighth of the inputs, run in parallel.
+add_executable(engine_test_prims.transcendental transcendental.test.cc)
+target_link_libraries(engine_test_prims.transcendental PRIVATE engine_testing engine_language_profile engine_prims)
+foreach(function IN ITEMS exp log rsqrt sigmoid silu softplus)
+	foreach(shard RANGE 7)
+		add_test(NAME prims.transcendental.${function}.${shard} COMMAND engine_test_prims.transcendental ${function} ${shard})
+		set_tests_properties(prims.transcendental.${function}.${shard} PROPERTIES TIMEOUT 120)
+	endforeach()
+endforeach()
 
 # The ptx gate rejects each thing it exists to reject: a test passes only when the gate fails with that finding.
 foreach(fixture IN ITEMS unrounded approximate flushed unbounded undeclared mismatched fused)

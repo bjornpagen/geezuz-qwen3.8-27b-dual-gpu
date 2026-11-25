@@ -14,6 +14,7 @@ export extern "C++" {
 #include "prims/fragment.h"
 #include "prims/numeric.h"
 #include "prims/tile.h"
+#include "prims/transcendental.h"
 }
 
 namespace engine::prims {
