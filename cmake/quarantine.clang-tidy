@@ -1,0 +1,36 @@
+---
+# The quarantine profile: device/, foreign/, unsafe/. These zones exist to hold raw pointers, ABI casts, C APIs,
+# headers and inline ptx at a boundary, so this profile does not flag those; it looks for real correctness,
+# lifetime, concurrency and performance defects in boundary code. Dialect bans are not encoded here.
+InheritParentConfig: false
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -bugprone-reserved-identifier,
+  concurrency-*,
+  misc-definitions-in-headers,
+  misc-misplaced-const,
+  misc-redundant-expression,
+  misc-static-assert,
+  misc-unused-using-decls,
+  modernize-use-nullptr,
+  performance-*,
+  portability-*,
+  -portability-avoid-pragma-once,
+  readability-container-size-empty,
+  readability-misleading-indentation
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'
+ExcludeHeaderFilterRegex: '(^|/)(build|_deps)/|(^|/)(libc\+\+|include/c\+\+)/'
+SystemHeaders: false
+FormatStyle: file
+
+CheckOptions:
+  bugprone-unchecked-optional-access.IgnoreValueCalls: 'true'
+  bugprone-unused-return-value.AllowCastToVoid: 'false'
+  bugprone-unused-return-value.CheckedReturnTypes: '^::std::expected$;^::std::optional$;^::std::error_code$'
+...

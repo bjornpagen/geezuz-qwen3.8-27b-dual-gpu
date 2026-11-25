@@ -1,0 +1,80 @@
+---
+# The dialect profile: src/, apps/, tests/, bench/. It enforces the dialect's bans where an AST check can hold them,
+# and looks for real defects. device/, foreign/ and unsafe/ carry the quarantine profile instead (their .clang-tidy
+# links to cmake/quarantine.clang-tidy). A finding is a build failure; suppressions do not exist in dialect code.
+#
+# PIN(stdexec-analyzer-stack-escape): the static analyzer reads stdexec's operation states, which hold their own
+# receivers by design, as stack addresses escaping; every translation unit that composes senders trips it. See
+# PINS.md.
+InheritParentConfig: false
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  cert-dcl58-cpp,
+  cert-err33-c,
+  cert-msc50-cpp,
+  cert-msc51-cpp,
+  clang-analyzer-*,
+  -clang-analyzer-core.StackAddressEscape,
+  concurrency-*,
+  cppcoreguidelines-avoid-c-arrays,
+  cppcoreguidelines-avoid-goto,
+  cppcoreguidelines-avoid-non-const-global-variables,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-missing-std-forward,
+  cppcoreguidelines-no-malloc,
+  cppcoreguidelines-owning-memory,
+  cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  cppcoreguidelines-pro-type-const-cast,
+  cppcoreguidelines-pro-type-cstyle-cast,
+  cppcoreguidelines-pro-type-reinterpret-cast,
+  cppcoreguidelines-pro-type-union-access,
+  cppcoreguidelines-pro-type-vararg,
+  cppcoreguidelines-rvalue-reference-param-not-moved,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-virtual-class-destructor,
+  fuchsia-default-arguments-declarations,
+  fuchsia-multiple-inheritance,
+  fuchsia-virtual-inheritance,
+  google-explicit-constructor,
+  hicpp-exception-baseclass,
+  misc-*,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
+  -misc-use-anonymous-namespace,
+  modernize-*,
+  -modernize-use-nodiscard,
+  performance-*,
+  portability-*,
+  readability-avoid-const-params-in-decls,
+  readability-container-size-empty,
+  readability-duplicate-include,
+  readability-else-after-return,
+  readability-inconsistent-declaration-parameter-name,
+  readability-make-member-function-const,
+  readability-misleading-indentation,
+  readability-redundant-*,
+  readability-simplify-boolean-expr,
+  readability-static-accessed-through-instance,
+  readability-use-std-min-max
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'
+ExcludeHeaderFilterRegex: '(^|/)(build|_deps)/|(^|/)(libc\+\+|include/c\+\+)/'
+SystemHeaders: false
+FormatStyle: file
+
+CheckOptions:
+  bugprone-unchecked-optional-access.IgnoreValueCalls: 'true'
+  bugprone-unused-return-value.AllowCastToVoid: 'false'
+  bugprone-unused-return-value.CheckedReturnTypes: '^::std::expected$;^::std::optional$;^::std::error_code$'
+  misc-const-correctness.AnalyzeValues: 'true'
+  misc-const-correctness.WarnPointersAsValues: 'false'
+  modernize-use-std-print.ReplacementPrintFunction: 'std::print'
+  modernize-use-std-print.ReplacementPrintlnFunction: 'std::println'
+  modernize-use-trailing-return-type.TransformLambdas: 'none'
+  performance-move-const-arg.CheckTriviallyCopyableMove: 'false'
+...
