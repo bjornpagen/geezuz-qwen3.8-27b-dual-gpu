@@ -9,6 +9,7 @@
 #include "deltanet/layout.h"
 #include "deltanet/math.h"
 #include "prims/budget.h"
+#include "prims/stage_ring.h"
 
 namespace engine::device::deltanet {
 
@@ -50,24 +51,25 @@ struct Stage {
 	alignas(128) unsigned char bytes[stage_bytes];
 };
 
-/** Every event's prepared inputs: the convolved q | k | v, the normalized query and key, each head's gates. */
+/** Every event's prepared inputs: the normalized query and key, the convolved values, each head's gates. */
 struct Events {
-	alignas(16) Bf16 convolved[max_events][group_channels];
-	alignas(16) float keys[max_events][dim];
+	/** Each event's query and key: convolved in natural order, then normalized in place into `vector_element<Column>` order. */
 	alignas(16) float queries[max_events][dim];
+	alignas(16) float keys[max_events][dim];
+	/** Each event's convolved values of the group's heads. */
+	alignas(16) float values[max_events][group * dim];
 	Gates gates[max_events][group];
 };
 
-/** The rows' core outputs, rounded to bf16, head by head. */
+/** The rows' core outputs, fp32, head by head. */
 struct RowOutputs {
-	alignas(16) Bf16 values[max_rows][group * dim];
+	alignas(16) float values[max_rows][group * dim];
 };
 
 struct DecodeShared {
 	Stage stages[state_stages];
 	/** The ring's full and empty mbarriers, one each per stage. */
-	alignas(8) unsigned long long full[state_stages];
-	alignas(8) unsigned long long empty[state_stages];
+	prims::StageBarriers<state_stages> ring;
 	/** Completes when every preparer warp has filled `events`. */
 	alignas(8) unsigned long long prepared;
 	Events events;
@@ -103,11 +105,13 @@ static_assert(prefill_block_tokens <= prefill_preparer_threads / Column::lanes, 
 
 /** One block of prompt tokens for one value head: prepared inputs, then the chain's outputs. */
 struct TokenBlock {
-	alignas(16) Bf16 convolved[prefill_block_tokens][3 * dim];
-	alignas(16) float keys[prefill_block_tokens][dim];
+	/** Each token's query and key: convolved in natural order, then normalized in place into `vector_element<Column>` order. */
 	alignas(16) float queries[prefill_block_tokens][dim];
+	alignas(16) float keys[prefill_block_tokens][dim];
+	/** Each token's convolved values of the block's head. */
+	alignas(16) float values[prefill_block_tokens][dim];
 	Gates gates[prefill_block_tokens];
-	alignas(16) Bf16 outputs[prefill_block_tokens][dim];
+	alignas(16) float outputs[prefill_block_tokens][dim];
 };
 
 struct PrefillShared {

@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The gated deltanet's arithmetic, one token at a time, as the checkpoint's model code defines it, operation for
-// operation: the short causal convolution and its silu, the l2 normalization of queries and keys, the decay and beta
-// gates, the delta rule over one column of the fp32 state, and the gated rms norm. Pure constexpr, compiled by the
-// device and the host alike: the kernels, the host's fp32 emulation and the tests compute with these very definitions,
-// and both sides build with contraction off, so every product here is rounded before the sum it enters.
+// The gated deltanet's arithmetic as the kernels lay it on their lanes. Every rounding point, sum order and fixed
+// algorithm is the model description's (`model::deltanet`, `model::deltanet_vector`, the norms); this header only says
+// which lane holds which elements, so the kernels, the host's emulation and the tests compute with the model's very
+// definitions. Everything between in_proj_qkv's bf16 output and the gated output is fp32: the convolution and its
+// silu, the normalized queries and keys, the gates, the state, the core's output and its norm.
 //
-// Where the model rounds to bf16 (its activations are bf16 tensors), so does this: the convolution's output and its
-// silu, beta, the core's output before the norm, the normalized value and its product with the norm weight, and the
-// gated output. Everything else is fp32: the state, the normalized queries and keys, the decay.
-//
-// Every 128-element sum (a column's projections onto k and q, the squares under each norm) is one fixed tree: `lanes`
-// lanes each sum their consecutive `per_lane` products in order, then a butterfly at distances lanes / 2, ..., 1 adds
-// each lane's partner to its own total. fp32 addition is commutative, so every lane ends with the same bits.
+// Every 128-element sum (a column's projections onto k and q, the squares under each norm) is the model's
+// `deltanet_vector` tree: eight lanes each fold their sixteen consecutive products by fma, then a butterfly at
+// distances 4, 2, 1 adds each lane's partner to its own total.
 #pragma once
 
 #include "model.h"
@@ -45,32 +41,18 @@ struct Tree {
 	static_assert(per_lane % 4 == 0, "a lane's elements are whole 16-byte chunks");
 };
 
-/**
- * The engine's tree: eight lanes per column, sixteen elements each. Shorter chains than a whole warp per column, and
- * four columns per warp keep a lane's share of the state at sixteen registers.
- */
-using Column = Tree<8>;
+/** The engine's tree: the model's `deltanet_vector`. The probe also times a whole warp per column, never shipped. */
+using Column = Tree<static_cast<int>(model::deltanet_vector.lanes)>;
 
-/** The model's l2 normalization of queries and keys adds this under the square root. */
-inline constexpr float l2_norm_eps = 1e-6F;
+static_assert(Column::lanes * Column::per_lane == static_cast<int>(model::deltanet_vector.width));
 
-/** The model divides normalized queries by sqrt(key_dim), taken in fp32: 8 sqrt(2) rounded once. */
-inline constexpr float query_divisor = 0x1.6a09e6p+3F;
-
-static_assert(query_divisor * query_divisor > 127.99998F && query_divisor * query_divisor < 128.00002F);
-
-/** fl(a[0] b[0]) + fl(a[1] b[1]) + ... in order: one lane's share of a dot product. */
+/** One lane's share of a dot product: the model's fold of its elements. */
 template<int n>
 [[nodiscard]] constexpr auto partial_dot(float const (&a)[n], float const (&b)[n]) -> float {
-	float total = a[0] * b[0];
-	for (int m = 1; m < n; ++m) {
-		float const product = a[m] * b[m];
-		total = total + product;
-	}
-	return total;
+	return model::lane_fold(a, b, 0, n);
 }
 
-/** One butterfly step: a lane's total and its partner's. */
+/** One butterfly step on the device: a lane's total and its partner's, as `model::butterfly` adds them. */
 [[nodiscard]] constexpr auto combine(float own, float partner) -> float {
 	return own + partner;
 }
@@ -78,24 +60,7 @@ template<int n>
 /** The tree's total of `lanes` partial sums: what every lane of the group holds after the butterfly. */
 template<int lanes>
 [[nodiscard]] constexpr auto tree_sum(float const (&partials)[lanes]) -> float {
-	float values[lanes] = {};
-#pragma unroll
-	for (int lane = 0; lane < lanes; ++lane) {
-		values[lane] = partials[lane];
-	}
-#pragma unroll
-	for (unsigned distance = static_cast<unsigned>(lanes) / 2U; distance != 0; distance /= 2U) {
-		float next[lanes] = {};
-#pragma unroll
-		for (unsigned lane = 0; lane < static_cast<unsigned>(lanes); ++lane) {
-			next[lane] = combine(values[lane], values[lane ^ distance]);
-		}
-#pragma unroll
-		for (int lane = 0; lane < lanes; ++lane) {
-			values[lane] = next[lane];
-		}
-	}
-	return values[0];
+	return model::butterfly<static_cast<model::Count>(lanes)>(partials);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -106,97 +71,71 @@ struct Four {
 	Bf16 element[4];
 };
 
-/**
- * One channel's convolution output for the newest of four inputs, and its silu. The weight's tap t multiplies the
- * input t positions after the oldest. bf16 products are exact in fp32, so only the sum's order (oldest first) and the
- * two roundings to bf16 are choices. Taps and inputs come by value so that the device keeps them in registers.
- */
-[[nodiscard]] constexpr auto convolve(Four taps, Four inputs) -> Bf16 {
-	float total = widen(taps.element[0]) * widen(inputs.element[0]);
-	for (int tap = 1; tap < 4; ++tap) {
-		float const product = widen(taps.element[tap]) * widen(inputs.element[tap]);
-		total = total + product;
-	}
-	Bf16 const convolved = round_to_bf16(total);
-	return round_to_bf16(prims::math::silu(widen(convolved)));
-}
-
 static_assert(model::conv_kernel == 4, "the convolution reads its window of three and the new input");
+
+/** One channel's convolution output for the newest of four inputs, and its silu (`model::deltanet::convolved`). */
+[[nodiscard]] constexpr auto convolve(Four taps, Four inputs) -> float {
+	float const weights[4] = {widen(taps.element[0]), widen(taps.element[1]), widen(taps.element[2]), widen(taps.element[3])};
+	float const values[4] = {widen(inputs.element[0]), widen(inputs.element[1]), widen(inputs.element[2]), widen(inputs.element[3])};
+	return model::deltanet::convolved(weights, values);
+}
 
 /** What one token gives one value head's recurrence besides its vectors. */
 struct Gates {
-	/** e^g, g = -e^A_log softplus(a + dt_bias): how much of the state survives the token. */
+	/** `model::deltanet::decay`: how much of the state survives the token. */
 	float decay;
-	/** sigmoid(b), a bf16 activation widened: how much of the token's error the state takes in. */
+	/** `model::deltanet::write_strength`: how much of the token's error the state takes in. */
 	float beta;
 };
 
-[[nodiscard]] constexpr auto gates(Bf16 a, Bf16 b, Bf16 a_log, Bf16 dt_bias) -> Gates {
-	float const shifted = widen(a) + widen(dt_bias);
-	float const rate = prims::math::exp(widen(a_log));
-	float const step = rate * prims::math::softplus(shifted);
-	float const g = -step;
-	return {.decay = prims::math::exp(g), .beta = widen(round_to_bf16(prims::math::sigmoid(widen(b))))};
+/** The gates from in_proj_a's and in_proj_b's fp32 outputs and the head's stored A_log and dt_bias. */
+[[nodiscard]] constexpr auto gates(float a, float b, Bf16 a_log, Bf16 dt_bias) -> Gates {
+	return {.decay = model::deltanet::decay(a, widen(a_log), widen(dt_bias)), .beta = model::deltanet::write_strength(b)};
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The l2 normalization of queries and keys, by one lane of a tree.
 
-/** A lane's share of the sum of squares of its widened bf16 elements. */
+/** A lane's share of the sum of squares of its elements. */
 template<int n>
 [[nodiscard]] constexpr auto partial_squares(float const (&x)[n]) -> float {
 	return partial_dot(x, x);
 }
 
-/** 1 / sqrt(sum of squares + eps), the l2 norm's scale. */
-[[nodiscard]] constexpr auto l2_scale(float sum_squares) -> float {
-	float const shifted = sum_squares + l2_norm_eps;
-	return prims::math::rsqrt(shifted);
-}
-
 /** Which vector of a token a normalization makes, which decides its last step. */
 enum class Role : unsigned char {
-	/** Normalized, then divided by sqrt(key_dim). */
+	/** Normalized, then divided by `model::deltanet::query_divisor`. */
 	Query,
 	/** Normalized. */
 	Key,
 };
 
+/** The lane's elements normalized by the vector's l2 factor, as `role` finishes them. */
 template<int n>
-constexpr void normalize(float (&x)[n], float scale, Role role) {
+constexpr void normalize(float (&x)[n], float squares, Role role) {
+	float const factor = model::deltanet::l2_factor(squares);
 	for (int m = 0; m < n; ++m) {
-		float const normalized = x[m] * scale;
-		x[m] = role == Role::Query ? normalized / query_divisor : normalized;
+		x[m] = role == Role::Query ? model::deltanet::query(x[m], factor) : model::deltanet::key(x[m], factor);
 	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The delta rule over one state column, by one lane holding `n` of its rows. Per token, with d the decay:
-//   S <- d S;  kv = S^T k;  delta = (v - kv) beta;  S <- S + k delta^T;  o = S^T q.
-// In the model each product is its own tensor and each sum a reduction over the key dimension, so here each product
-// rounds before its sum, and each reduction is the tree.
+// The delta rule over one state column, by one lane holding `n` of its rows (`model::Sum::DeltanetProducts`).
 
 /** Decays the lane's rows and returns its share of the column's projection onto k. */
 template<int n>
 [[nodiscard]] constexpr auto decay_and_project(float (&state)[n], float const (&key)[n], float decay) -> float {
 	for (int m = 0; m < n; ++m) {
-		state[m] = state[m] * decay;
+		state[m] = model::deltanet::decayed(state[m], decay);
 	}
 	return partial_dot(state, key);
 }
 
-/** The column's error on the token's value, scaled by beta. */
-[[nodiscard]] constexpr auto delta(float value, float projected, float beta) -> float {
-	float const error = value - projected;
-	return error * beta;
-}
-
-/** Adds k delta to the lane's rows. */
+/** Adds k delta to the lane's rows, one fma each. */
 template<int n>
 constexpr void update(float (&state)[n], float const (&key)[n], float column_delta) {
 	for (int m = 0; m < n; ++m) {
-		float const step = key[m] * column_delta;
-		state[m] = state[m] + step;
+		state[m] = model::deltanet::updated(state[m], key[m], column_delta);
 	}
 }
 
@@ -206,29 +145,28 @@ template<int n>
 	return partial_dot(state, query);
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-// The gated rms norm over one head's output. The model rounds the core's output to bf16, normalizes it in fp32, rounds,
-// multiplies by the stored weight (applied as w, not 1 + w) in bf16, and multiplies that by silu(z) in fp32.
+using model::deltanet::delta;
 
-static_assert(model::deltanet_norm_scale == model::NormScale::Weight, "the deltanet norm applies w itself");
-static_assert(model::deltanet_output_gate == model::Gate::Silu, "the deltanet output gate is silu(z)");
+// ---------------------------------------------------------------------------------------------------------------------
+// The gated rms norm over one head's output (`model::Sum::ValueSquares`). The core phase leaves the normalized,
+// weighted output in fp32; the output phase gates it by silu(z) and rounds once, as out_proj's input.
 
 /** 1 / sqrt(mean square + eps) over one head's 128 outputs, from the tree's sum of their squares. */
-[[nodiscard]] constexpr auto norm_scale(float sum_squares) -> float {
-	float const mean = sum_squares / static_cast<float>(dim);
-	float const shifted = mean + model::rms_norm_eps;
-	return prims::math::rsqrt(shifted);
+[[nodiscard]] constexpr auto norm_scale(float squares) -> float {
+	return model::rms_factor(squares, dim);
 }
 
-/** One normalized output: the head's norm scale and the norm weight applied, rounded as the model rounds. */
-[[nodiscard]] constexpr auto normalized(Bf16 output, float scale, Bf16 weight) -> Bf16 {
-	Bf16 const scaled = round_to_bf16(widen(output) * scale);
-	return round_to_bf16(widen(weight) * widen(scaled));
+/** One normalized output: the head's norm factor and the norm weight applied (`model::deltanet::normed`). */
+[[nodiscard]] constexpr auto normalized(float output, float scale, Bf16 weight) -> float {
+	return model::deltanet::normed(output, scale, widen(weight));
 }
 
-/** out_proj's input: the normalized output times silu(z). The output phase applies it while staging its input. */
-[[nodiscard]] constexpr auto gated(Bf16 normalized_output, Bf16 z) -> Bf16 {
-	return round_to_bf16(widen(normalized_output) * prims::math::silu(widen(z)));
+/** out_proj's input: the normalized output times silu(z), rounded once. The output phase applies it while staging. */
+[[nodiscard]] constexpr auto gated(float normed_output, float z) -> Bf16 {
+	return round_to_bf16(model::deltanet::gated(normed_output, z));
 }
+
+static_assert(model::precision(model::Value::DeltanetNormed) == model::Precision::Fp32);
+static_assert(model::precision(model::Value::DeltanetGated) == model::Precision::Bf16);
 
 }

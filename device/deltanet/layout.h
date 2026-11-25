@@ -169,14 +169,15 @@ inline constexpr int max_replays = max_drafts;
 inline constexpr int max_events = max_replays + max_rows;
 
 /**
- * One draft's raw inputs for one key head's group: in_proj_qkv's outputs on the group's channels, then in_proj_a's and
- * in_proj_b's outputs for its value heads, padded to a chunk.
+ * One draft's raw inputs for one key head's group: in_proj_qkv's bf16 outputs on the group's channels, then in_proj_a's
+ * outputs for its value heads and in_proj_b's, fp32 (`model::Value::DeltanetDecayInput`), padded to whole chunks.
  */
-inline constexpr int entry_gate_halves = 2 * group;
-inline constexpr int entry_chunks = group_chunks + 1;
+inline constexpr int entry_gate_floats = 2 * group;
+inline constexpr int entry_gate_chunks = (entry_gate_floats + 3) / 4;
+inline constexpr int entry_chunks = group_chunks + entry_gate_chunks;
 inline constexpr Count entry_bytes = Count{entry_chunks} * 16;
 
-static_assert(entry_gate_halves <= bf16_per_chunk, "a group's gate inputs fit one chunk");
+static_assert(model::precision(model::Value::DeltanetDecayInput) == model::Precision::Fp32);
 
 /** Byte offset of entry `entry` of key head `key_head`'s ring of deltanet layer `layer`, in a slot's ring. */
 [[nodiscard]] constexpr auto ring_offset(int layer, int key_head, int entry) -> Count {
@@ -187,12 +188,12 @@ inline constexpr Count ring_bytes_per_slot = Count{layers} * key_heads * max_dra
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The activations the core reads and writes, one row per token (verify row or prompt token), as the projections leave
-// them: in_proj_qkv's outputs in card channel order; in_proj_a's and in_proj_b's outputs one 32-bit word per value
-// head, a in the low half and b in the high; and the normalized core output, value heads in order.
+// them: in_proj_qkv's bf16 outputs in card channel order; in_proj_a's and in_proj_b's fp32 outputs, a then b per value
+// head; and the core's normalized, weighted fp32 output (`model::Value::DeltanetNormed`), value heads in order.
 
 inline constexpr Count qkv_row_bytes = Count{channels} * sizeof(Bf16);
-inline constexpr Count gate_row_bytes = Count{value_heads} * 4;
-inline constexpr Count output_row_bytes = Count{value_features} * sizeof(Bf16);
+inline constexpr Count gate_row_bytes = Count{value_heads} * 2 * sizeof(float);
+inline constexpr Count output_row_bytes = Count{value_features} * sizeof(float);
 
 /**
  * A device allocation holding T, as a kernel's parameters carry it: the pointer it is on the card. The host never
@@ -219,8 +220,10 @@ struct Weights {
 /** The activation rows a launch reads and writes. */
 struct Rows {
 	Address<Bf16 const> qkv;
-	Address<unsigned const> gates;
-	Address<Bf16> outputs;
+	/** [rows][value heads][2]: a, then b. */
+	Address<float const> gates;
+	/** [rows][value features]. */
+	Address<float> outputs;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------

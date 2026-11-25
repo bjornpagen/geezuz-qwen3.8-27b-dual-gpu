@@ -15,11 +15,11 @@ namespace fx = engine::deltanet_fixtures;
 
 struct Run {
 	dn::LayerBuffers memory;
-	std::vector<dn::Bf16> outputs;
+	std::vector<float> outputs;
 };
 
 [[nodiscard]] auto decoded(fx::WeightsStore const& weights, dn::LayerBuffers memory, std::span<fx::Token const> tokens) -> Run {
-	auto outputs = std::vector<dn::Bf16>{};
+	auto outputs = std::vector<float>{};
 	for (auto const& token : tokens) {
 		auto rows = fx::RowsStore{};
 		rows.push(token);
@@ -32,7 +32,7 @@ struct Run {
 /** The prompt cut into chunks of `lengths`, each placed after `offset` unrelated rows. */
 [[nodiscard]] auto prefilled(fx::WeightsStore const& weights, dn::LayerBuffers memory, std::span<fx::Token const> tokens,
                              std::span<std::uint32_t const> lengths, fx::Generator& generator) -> Run {
-	auto outputs = std::vector<dn::Bf16>{};
+	auto outputs = std::vector<float>{};
 	auto committed = dn::Committed{.tokens = 0};
 	auto taken = std::size_t{0};
 	for (auto const length : lengths) {

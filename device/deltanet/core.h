@@ -129,45 +129,45 @@ __attribute__((device)) inline void store_lane(float* vector, unsigned r, float 
 	}
 }
 
-/** Column lane `r`'s 16 consecutive bf16 elements of a 128-element row in shared memory, widened. */
-__attribute__((device)) inline void load_widened(Bf16 const* row, unsigned r, float (&values)[Column::per_lane]) {
+/** Column lane `r`'s 16 consecutive fp32 elements of a 128-element vector in natural order in shared memory. */
+__attribute__((device)) inline void load_natural(float const* vector, unsigned r, float (&values)[Column::per_lane]) {
 #pragma unroll
-	for (int half = 0; half < 2; ++half) {
-		int const offset = Column::per_lane * static_cast<int>(r) + bf16_per_chunk * half;
-		Chunk const loaded = prims::load_shared(prims::shared_address(row + offset));
+	for (int chunk = 0; chunk < Column::chunks; ++chunk) {
+		Chunk const loaded = prims::load_shared(prims::shared_address(vector + (Count(Column::per_lane) * r + Count(4) * Count(chunk))));
 #pragma unroll
-		for (int index = 0; index < bf16_per_chunk; ++index) {
-			values[bf16_per_chunk * half + index] = widen(element(loaded, index));
+		for (int word = 0; word < 4; ++word) {
+			values[chunk * 4 + word] = __builtin_bit_cast(float, loaded.word[word]);
 		}
 	}
 }
 
 /**
- * Normalizes one query or key: the group's 8 lanes read the convolved bf16 vector `source`, and write it normalized
- * (fp32, `vector_element<Column>` order) to `target`. Every lane of the warp runs it, `active` or not, because the
+ * Normalizes one query or key in place: the group's 8 lanes read the convolved vector in natural order, and write it
+ * normalized in `vector_element<Column>` order over it. Every lane reads before the butterfly and writes after it, so
+ * no lane overwrites what another has yet to read. Every lane of the warp runs it, `active` or not, because the
  * butterfly needs the whole warp.
  */
-__attribute__((device, always_inline)) inline void normalize_vector(Bf16 const* source, float* target, Role role, bool active, unsigned r) {
+__attribute__((device, always_inline)) inline void normalize_vector(float* vector, Role role, bool active, unsigned r) {
 	float values[Column::per_lane] = {};
 	if (active) {
-		load_widened(source, r, values);
+		load_natural(vector, r, values);
 	}
 	float const total = group_sum<Column>(partial_squares(values));
-	normalize(values, l2_scale(total), role);
+	normalize(values, total, role);
 	if (active) {
-		store_lane<Column>(target, r, values);
+		store_lane<Column>(vector, r, values);
 	}
 }
 
 /**
- * Normalizes one head's output row for one token and writes it: the group's lanes read the bf16 core outputs
- * `outputs` (128, shared memory), apply the gated norm's scale and weight, and store 16 elements each to `target`.
+ * Normalizes one head's output row for one token and writes it: the group's lanes read the fp32 core outputs
+ * `outputs` (128, shared memory), apply the gated norm's scale and weight, and store 16 fp32 elements each to `target`.
  */
-__attribute__((device, always_inline)) inline void normalize_output(Bf16 const* outputs, Bf16 const* weight, Bf16* target, bool active,
+__attribute__((device, always_inline)) inline void normalize_output(float const* outputs, Bf16 const* weight, float* target, bool active,
                                                                     unsigned r, prims::Policy<Eviction::Last> reused) {
 	float values[Column::per_lane] = {};
 	if (active) {
-		load_widened(outputs, r, values);
+		load_natural(outputs, r, values);
 	}
 	float const scale = norm_scale(group_sum<Column>(partial_squares(values)));
 	if (!active) {
@@ -177,12 +177,15 @@ __attribute__((device, always_inline)) inline void normalize_output(Bf16 const* 
 	for (int half = 0; half < 2; ++half) {
 		int const first = Column::per_lane * static_cast<int>(r) + bf16_per_chunk * half;
 		Chunk const weights = prims::load(chunk_at(weight, Count(first) * sizeof(Bf16)), reused);
-		Bf16 result[bf16_per_chunk] = {};
+		float result[bf16_per_chunk] = {};
 #pragma unroll
 		for (int index = 0; index < bf16_per_chunk; ++index) {
-			result[index] = normalized(round_to_bf16(values[bf16_per_chunk * half + index]), scale, element(weights, index));
+			result[index] = normalized(values[bf16_per_chunk * half + index], scale, element(weights, index));
 		}
-		prims::store(chunk_at(target, Count(first) * sizeof(Bf16)), pack(result), reused);
+#pragma unroll
+		for (int chunk = 0; chunk < 2; ++chunk) {
+			prims::store(chunk_at(target, (Count(first) + Count(4 * chunk)) * sizeof(float)), pack(result, chunk), reused);
+		}
 	}
 }
 
@@ -206,16 +209,41 @@ struct Taps {
 	return taps;
 }
 
-/** The convolution of eight channels over their four newest inputs, oldest first. */
+/** The convolution of eight channels over their four newest inputs, oldest first: two chunks of fp32. */
+struct Convolved {
+	Chunk half[2];
+};
+
 [[nodiscard]] __attribute__((device, always_inline)) inline auto convolve_chunk(Taps const& taps, Chunk oldest, Chunk older, Chunk newer,
-                                                                                Chunk newest) -> Chunk {
-	Bf16 out[bf16_per_chunk] = {};
+                                                                                Chunk newest) -> Convolved {
+	float out[bf16_per_chunk] = {};
 #pragma unroll
 	for (int index = 0; index < bf16_per_chunk; ++index) {
 		Four const inputs = {.element = {element(oldest, index), element(older, index), element(newer, index), element(newest, index)}};
 		out[index] = convolve(taps.channel[index], inputs);
 	}
-	return pack(out);
+	return {.half = {pack(out, 0), pack(out, 1)}};
+}
+
+/** Stores a convolved chunk's eight fp32 at `target` in shared memory. */
+__attribute__((device, always_inline)) inline void store_convolved(float* target, Convolved const& values) {
+	prims::store_shared(prims::shared_address(target), values.half[0]);
+	prims::store_shared(prims::shared_address(target + 4), values.half[1]);
+}
+
+/**
+ * Where the convolution of a group's channel chunk `u` lands among a token's vectors: chunks of the query, of the
+ * key, then of the values, each 8 consecutive fp32.
+ */
+[[nodiscard]] __attribute__((device)) inline auto convolved_target(float* queries, float* keys, float* values, int u) -> float* {
+	constexpr int vector_chunks = dim / bf16_per_chunk;
+	if (u < vector_chunks) {
+		return queries + Count(bf16_per_chunk) * Count(u);
+	}
+	if (u < 2 * vector_chunks) {
+		return keys + Count(bf16_per_chunk) * Count(u - vector_chunks);
+	}
+	return values + Count(bf16_per_chunk) * Count(u - 2 * vector_chunks);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -225,7 +253,7 @@ using StateRing = prims::StageRing<state_stages, warp_threads, consumer_warps>;
 
 /** The ring over a decode block's stages and barriers. */
 [[nodiscard]] __attribute__((device)) inline auto state_ring(DecodeShared& shared) -> StateRing {
-	return {.full_base = prims::shared_address(shared.full), .empty_base = prims::shared_address(shared.empty)};
+	return StateRing::at(shared.ring);
 }
 
 /** The shared-window address of chunk `chunk` of stage `stage`. */
@@ -290,9 +318,11 @@ __attribute__((device, always_inline)) inline void prepare_events(Item const& it
 	int const events_count = item.replays + item.rows;
 	Chunk* const window = chunk_at(item.image, window_offset(item.layer, item.key_head));
 	Bf16 const* const qkv = at(rows.qkv);
-	unsigned const* const gate_rows = at(rows.gates);
+	/* SAFETY: the gate rows are fp32 words as `Rows` lays them out. */
+	auto const* const gate_rows = reinterpret_cast<unsigned const*>(at(rows.gates));
 
-	Bf16 gate_inputs[entry_gate_halves] = {};
+	// a for each of the group's heads, then b for each.
+	float gate_inputs[entry_gate_chunks * 4] = {};
 	int const event_of_gates = static_cast<int>(index) - group_chunks;
 	if (static_cast<int>(index) < group_chunks) {
 		int const u = static_cast<int>(index);
@@ -317,8 +347,8 @@ __attribute__((device, always_inline)) inline void prepare_events(Item const& it
 #pragma unroll
 		for (int event = 0; event < max_events; ++event) {
 			if (event < events_count) {
-				Chunk const out = convolve_chunk(taps, sequence[event], sequence[event + 1], sequence[event + 2], sequence[event + 3]);
-				prims::store_shared(prims::shared_address(&events.convolved[event][Count(u) * bf16_per_chunk]), out);
+				Convolved const out = convolve_chunk(taps, sequence[event], sequence[event + 1], sequence[event + 2], sequence[event + 3]);
+				store_convolved(convolved_target(events.queries[event], events.keys[event], events.values[event], u), out);
 			}
 			// The committed token is the first row: the window after it is the stored window.
 			if (event == item.replays) {
@@ -336,18 +366,22 @@ __attribute__((device, always_inline)) inline void prepare_events(Item const& it
 	} else if (event_of_gates >= 0 && event_of_gates < events_count) {
 		int const event = event_of_gates;
 		if (event < item.replays) {
-			Chunk const stored = prims::load(chunk_at(item.ring, ring_offset(item.layer, item.key_head, event)) + group_chunks, once);
 #pragma unroll
-			for (int half = 0; half < entry_gate_halves; ++half) {
-				gate_inputs[half] = element(stored, half);
+			for (int chunk = 0; chunk < entry_gate_chunks; ++chunk) {
+				Chunk const stored =
+				    prims::load(chunk_at(item.ring, ring_offset(item.layer, item.key_head, event)) + group_chunks + chunk, once);
+#pragma unroll
+				for (int word = 0; word < 4; ++word) {
+					gate_inputs[chunk * 4 + word] = __builtin_bit_cast(float, stored.word[word]);
+				}
 			}
 		} else {
 			Count const row = Count(item.first_row + event - item.replays);
 #pragma unroll
 			for (int head = 0; head < group; ++head) {
-				unsigned const word = prims::load_word(gate_rows + row * value_heads + Count(group * item.key_head + head), reused);
-				gate_inputs[head] = {.bits = static_cast<unsigned short>(word & 0xffffU)};
-				gate_inputs[group + head] = {.bits = static_cast<unsigned short>(word >> 16U)};
+				Count const pair = (row * value_heads + Count(group * item.key_head + head)) * 2;
+				gate_inputs[head] = __builtin_bit_cast(float, prims::load_word(gate_rows + pair, reused));
+				gate_inputs[group + head] = __builtin_bit_cast(float, prims::load_word(gate_rows + pair + 1, reused));
 			}
 		}
 #pragma unroll
@@ -358,16 +392,16 @@ __attribute__((device, always_inline)) inline void prepare_events(Item const& it
 				      load_half(at(weights.dt_bias), value_head, reused));
 		}
 	}
-	// Every replay's ring entry has been read before any draft's entry is written over it.
+	// Every replay's ring entry has been read before any draft's entry is written over it, and every convolution is in
+	// place before the normalizations read it.
 	Barrier::sync();
 	if (event_of_gates > item.replays && event_of_gates < events_count) {
-		Bf16 halves[bf16_per_chunk] = {};
 #pragma unroll
-		for (int half = 0; half < entry_gate_halves; ++half) {
-			halves[half] = gate_inputs[half];
+		for (int chunk = 0; chunk < entry_gate_chunks; ++chunk) {
+			prims::store(chunk_at(item.ring, ring_offset(item.layer, item.key_head, event_of_gates - item.replays - 1)) + group_chunks +
+			                 chunk,
+			             pack(gate_inputs, chunk), once);
 		}
-		prims::store(chunk_at(item.ring, ring_offset(item.layer, item.key_head, event_of_gates - item.replays - 1)) + group_chunks,
-		             pack(halves), once);
 	}
 	// Two vectors per event, one per group of eight lanes.
 	unsigned const r = index % 8;
@@ -379,8 +413,7 @@ __attribute__((device, always_inline)) inline void prepare_events(Item const& it
 		bool const active = vector < 2 * events_count;
 		Role const role = vector % 2 == 0 ? Role::Query : Role::Key;
 		int const safe_event = active ? event : 0;
-		float* const target = role == Role::Query ? events.queries[safe_event] : events.keys[safe_event];
-		normalize_vector(&events.convolved[safe_event][role == Role::Query ? 0 : dim], target, role, active, r);
+		normalize_vector(role == Role::Query ? events.queries[safe_event] : events.keys[safe_event], role, active, r);
 	}
 	prims::sync_warp();
 	if (prims::lane() == 0) {
@@ -428,7 +461,7 @@ __attribute__((device, always_inline)) inline void consume_state(Item const& ite
 			float key[Column::per_lane] = {};
 			load_lane<Column>(events.keys[event], r, key);
 			Gates const gate = events.gates[event][head];
-			float const value = widen(events.convolved[event][2 * dim + head * dim + column]);
+			float const value = events.values[event][head * dim + column];
 			float const projected = group_sum<Column>(decay_and_project(state, key, gate.decay));
 			update(state, key, delta(value, projected, gate.beta));
 			if (event >= item.replays) {
@@ -436,7 +469,7 @@ __attribute__((device, always_inline)) inline void consume_state(Item const& ite
 				load_lane<Column>(events.queries[event], r, query);
 				float const output = group_sum<Column>(read(state, query));
 				if (r == 0) {
-					outputs.values[event - item.replays][head * dim + column] = round_to_bf16(output);
+					outputs.values[event - item.replays][head * dim + column] = output;
 				}
 			}
 			if (event == item.replays) {
@@ -458,7 +491,7 @@ __attribute__((device, always_inline)) inline void normalize_rows(Item const& it
 	bool const active = pair < item.rows * group;
 	int const row = active ? pair / group : 0;
 	int const head = pair % group;
-	Bf16* const target = at(rows.outputs) + Count(item.first_row + row) * value_features + Count(group * item.key_head + head) * dim;
+	float* const target = at(rows.outputs) + Count(item.first_row + row) * value_features + Count(group * item.key_head + head) * dim;
 	normalize_output(&outputs.values[row][Count(head) * dim], at(weights.norm), target, active, r, reused);
 }
 

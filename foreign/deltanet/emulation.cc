@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The deltanet kernels emulated on the host in fp32, in the device's own order: the same arithmetic functions, the same
-// lanes holding the same elements, the same butterfly over each 128-element sum, and the same reads and writes of the
-// device layouts. On the cards, a kernel run on generated inputs must reproduce these bits exactly; here, the tests hold
-// these bits to the model's arithmetic in float64, and to each other across decode, replay and prefill.
+// The deltanet kernels emulated on the host in fp32, in the device's own order: the same arithmetic functions (the
+// model description's, through the device header), the same lanes holding the same elements, the same butterfly over
+// each 128-element sum, and the same reads and writes of the device layouts. On the cards, a kernel run on generated
+// inputs must reproduce these bits exactly; here, the tests hold these bits to the model's arithmetic in float64, to the
+// cpu reference bit for bit, and to each other across decode, replay and prefill.
 export module engine.deltanet:emulation;
 
 import std;
@@ -18,7 +19,7 @@ export struct LayerMemory {
 	std::span<float> state;
 	/** Each key head group's window rows, oldest first, each the group's channels. */
 	std::span<Bf16> window;
-	/** Each key head group's ring entries. */
+	/** Each key head group's ring entries, as 16-bit halves of the device's little-endian words. */
 	std::span<Bf16> ring;
 };
 
@@ -59,17 +60,16 @@ export struct LayerWeights {
 export struct Activations {
 	/** [rows][channels]. */
 	std::span<Bf16 const> qkv;
-	/** [rows][value heads]: a in the low half, b in the high. */
-	std::span<std::uint32_t const> gates;
-	/** [rows][value features]. */
-	std::span<Bf16> outputs;
+	/** [rows][value heads][2]: a, then b. */
+	std::span<float const> gates;
+	/** [rows][value features]: the core's normalized, weighted outputs. */
+	std::span<float> outputs;
 };
 
 using Lane = std::array<float, Column::per_lane>;
 /** A group's value features, and a value head's query, key and value channels. */
 constexpr auto group_columns = std::size_t{group} * std::size_t{dim};
 constexpr auto head_columns = std::size_t{3} * std::size_t{dim};
-using Lanes = std::array<Lane, Column::lanes>;
 /** A 128-element fp32 vector in natural order. */
 export using Vector = std::array<float, dim>;
 
@@ -78,9 +78,9 @@ export using Vector = std::array<float, dim>;
 }
 
 /** Tree lane `r`'s elements of a natural-order vector. */
-[[nodiscard]] auto slice(Vector const& vector, int r) -> Lane {
+[[nodiscard]] auto slice(std::span<float const, dim> vector, int r) -> Lane {
 	auto lane = Lane{};
-	std::ranges::copy(std::span{vector}.subspan(index(r * Column::per_lane), Column::per_lane), lane.begin());
+	std::ranges::copy(vector.subspan(index(r * Column::per_lane), Column::per_lane), lane.begin());
 	return lane;
 }
 
@@ -102,27 +102,24 @@ template<class Share>
 	return tree_sum(partials);
 }
 
-/** A convolved bf16 query or key normalized as the device's eight-lane group does it. */
-export [[nodiscard]] auto normalized_vector(std::span<Bf16 const, dim> source, Role role) -> Vector {
-	auto lanes = Lanes{};
-	for (auto r = 0; r < Column::lanes; ++r) {
-		for (auto m = 0; m < Column::per_lane; ++m) {
-			lanes.at(index(r)).at(index(m)) = widen(source[index(r * Column::per_lane + m)]);
-		}
-	}
+/** A lane's squares of its slice of a natural-order vector. */
+[[nodiscard]] auto lane_squares(std::span<float const, dim> vector, int r) -> float {
+	float values[Column::per_lane] = {};
+	std::ranges::copy(slice(vector, r), std::begin(values));
+	return partial_squares(values);
+}
+
+/** A convolved query or key normalized as the device's eight-lane group does it, in natural order. */
+export [[nodiscard]] auto normalized_vector(std::span<float const, dim> source, Role role) -> Vector {
 	float const total = grouped([&](int r) {
-		float values[Column::per_lane] = {};
-		std::ranges::copy(lanes.at(index(r)), std::begin(values));
-		return partial_squares(values);
+		return lane_squares(source, r);
 	});
-	float const scale = l2_scale(total);
 	auto result = Vector{};
 	for (auto r = 0; r < Column::lanes; ++r) {
 		float values[Column::per_lane] = {};
-		std::ranges::copy(lanes.at(index(r)), std::begin(values));
-		normalize(values, scale, role);
-		auto const first = r * Column::per_lane;
-		std::ranges::copy(values, result.begin() + first);
+		std::ranges::copy(slice(source, r), std::begin(values));
+		normalize(values, total, role);
+		std::ranges::copy(values, std::span{result}.subspan(index(r * Column::per_lane)).begin());
 	}
 	return result;
 }
@@ -167,15 +164,10 @@ void store_column(std::span<float> head, int column, ColumnState const& state) {
 }
 
 /** One head's outputs for one token, normalized and weighted as the device's eight-lane group does it. */
-export void normalize_head(std::span<Bf16 const, dim> outputs, std::span<Bf16 const> weight, std::span<Bf16, dim> target) {
-	float const total = grouped([&](int r) {
-		float values[Column::per_lane] = {};
-		for (auto m = 0; m < Column::per_lane; ++m) {
-			values[m] = widen(outputs[index(r * Column::per_lane + m)]);
-		}
-		return partial_squares(values);
-	});
-	float const scale = norm_scale(total);
+export void normalize_head(std::span<float const, dim> outputs, std::span<Bf16 const> weight, std::span<float, dim> target) {
+	float const scale = norm_scale(grouped([&](int r) {
+		return lane_squares(outputs, r);
+	}));
 	for (auto feature = 0; feature < dim; ++feature) {
 		target[index(feature)] = normalized(outputs[index(feature)], scale, weight[index(feature)]);
 	}
@@ -207,21 +199,48 @@ using GroupRow = std::array<Bf16, group_channels>;
 	return result;
 }
 
-/** a then b for each value head of a group, as a ring entry holds them. */
-using GateInputs = std::array<Bf16, entry_gate_halves>;
+/** a for each value head of a group, then b for each, as a ring entry holds them (padded to whole chunks). */
+using GateInputs = std::array<float, std::size_t{entry_gate_chunks} * 4>;
 
 [[nodiscard]] auto projected_gates(Activations const& rows, int row, int key_head) -> GateInputs {
 	auto result = GateInputs{};
 	for (auto head = 0; head < group; ++head) {
-		auto const word = rows.gates[index(row * value_heads + group * key_head + head)];
-		result.at(index(head)) = {.bits = static_cast<std::uint16_t>(word & 0xffffU)};
-		result.at(index(group + head)) = {.bits = static_cast<std::uint16_t>(word >> 16U)};
+		auto const pair = index((row * value_heads + group * key_head + head) * 2);
+		result.at(index(head)) = rows.gates[pair];
+		result.at(index(group + head)) = rows.gates[pair + 1];
 	}
 	return result;
 }
 
+/** A ring entry's gate inputs: fp32 words after the channels, each its low half first. */
+[[nodiscard]] auto entry_gates(std::span<Bf16 const> entry) -> GateInputs {
+	auto result = GateInputs{};
+	for (auto word = std::size_t{0}; word < result.size(); ++word) {
+		auto const low = std::uint32_t{entry[group_channels + 2 * word].bits};
+		auto const high = std::uint32_t{entry[group_channels + 2 * word + 1].bits};
+		result.at(word) = std::bit_cast<float>(low | (high << 16U));
+	}
+	return result;
+}
+
+void store_entry_gates(std::span<Bf16> entry, GateInputs const& gates_in) {
+	for (auto word = std::size_t{0}; word < gates_in.size(); ++word) {
+		auto const bits = std::bit_cast<std::uint32_t>(gates_in.at(word));
+		entry[group_channels + 2 * word] = {.bits = static_cast<std::uint16_t>(bits & 0xffffU)};
+		entry[group_channels + 2 * word + 1] = {.bits = static_cast<std::uint16_t>(bits >> 16U)};
+	}
+}
+
 [[nodiscard]] auto head_state(LayerMemory const& memory, int value_head) -> std::span<float> {
 	return memory.state.subspan(index(value_head * head_floats), index(head_floats));
+}
+
+/** Channel `local` of the group convolved for the event whose four newest inputs are rows [event, event + 4) of `sequence`. */
+[[nodiscard]] auto convolve_local(LayerWeights const& weights, std::span<GroupRow const> sequence, int event, int key_head, int local)
+    -> float {
+	auto const inputs = Four{.element = {sequence[index(event)].at(index(local)), sequence[index(event + 1)].at(index(local)),
+	                                     sequence[index(event + 2)].at(index(local)), sequence[index(event + 3)].at(index(local))}};
+	return convolve(taps(weights.conv, card_channel(key_head, local)), inputs);
 }
 
 /**
@@ -249,21 +268,16 @@ export void decode(LayerWeights const& weights, LayerMemory const& memory, Activ
 				auto copy = GroupRow{};
 				std::ranges::copy(entry.first<group_channels>(), copy.begin());
 				sequence.push_back(copy);
-				auto inputs = GateInputs{};
-				std::ranges::copy(entry.subspan<group_channels, entry_gate_halves>(), inputs.begin());
-				gate_inputs.push_back(inputs);
+				gate_inputs.push_back(entry_gates(entry));
 			} else {
 				sequence.push_back(projected_row(rows, first_row + event - replays, key_head));
 				gate_inputs.push_back(projected_gates(rows, first_row + event - replays, key_head));
 			}
 		}
-		auto convolved = std::vector<GroupRow>(index(events));
+		auto convolved = std::vector<std::array<float, group_channels>>(index(events));
 		for (auto event = 0; event < events; ++event) {
 			for (auto local = 0; local < group_channels; ++local) {
-				auto const inputs =
-				    Four{.element = {sequence.at(index(event)).at(index(local)), sequence.at(index(event + 1)).at(index(local)),
-					                 sequence.at(index(event + 2)).at(index(local)), sequence.at(index(event + 3)).at(index(local))}};
-				convolved.at(index(event)).at(index(local)) = convolve(taps(weights.conv, card_channel(key_head, local)), inputs);
+				convolved.at(index(event)).at(index(local)) = convolve_local(weights, sequence, event, key_head, local);
 			}
 		}
 		for (auto row = 0; row < window_rows; ++row) {
@@ -272,8 +286,7 @@ export void decode(LayerWeights const& weights, LayerMemory const& memory, Activ
 		for (auto event = replays + 1; event < events; ++event) {
 			auto const entry = ring_entry(memory, key_head, event - replays - 1);
 			std::ranges::copy(sequence.at(index(window_rows + event)), entry.begin());
-			std::ranges::copy(gate_inputs.at(index(event)), entry.begin() + group_channels);
-			std::ranges::fill(entry.subspan(group_channels + entry_gate_halves), Bf16{.bits = 0});
+			store_entry_gates(entry, gate_inputs.at(index(event)));
 		}
 		auto queries = std::vector<Vector>{};
 		auto keys = std::vector<Vector>{};
@@ -291,17 +304,17 @@ export void decode(LayerWeights const& weights, LayerMemory const& memory, Activ
 			}
 			event_gates.push_back(per_head);
 		}
-		auto outputs = std::vector<std::array<Bf16, group_columns>>(std::size_t{work.rows});
+		auto outputs = std::vector<std::array<float, group_columns>>(std::size_t{work.rows});
 		for (auto head = 0; head < group; ++head) {
 			auto const state = head_state(memory, group * key_head + head);
 			for (auto column = 0; column < dim; ++column) {
 				auto lanes = load_column(state, column);
 				for (auto event = 0; event < events; ++event) {
-					auto const value = widen(convolved.at(index(event)).at(index(2 * dim + head * dim + column)));
+					auto const value = convolved.at(index(event)).at(index(2 * dim + head * dim + column));
 					auto const output =
 					    step(lanes, keys.at(index(event)), queries.at(index(event)), value, event_gates.at(index(event)).at(index(head)));
 					if (event >= replays) {
-						outputs.at(index(event - replays)).at(index(head * dim + column)) = round_to_bf16(output);
+						outputs.at(index(event - replays)).at(index(head * dim + column)) = output;
 					}
 					if (event == replays) {
 						store_column(state, column, lanes);
@@ -348,14 +361,11 @@ export void prefill(LayerWeights const& weights, LayerMemory const& memory, Acti
 			columns.push_back(load_column(state, column));
 		}
 		for (auto token = 0; token < tokens; ++token) {
-			auto convolved = std::array<Bf16, head_columns>{};
+			auto convolved = std::array<float, head_columns>{};
 			for (auto part = 0; part < 3; ++part) {
 				for (auto offset = 0; offset < dim; ++offset) {
-					auto const local = locals.at(index(part)) + offset;
-					auto const inputs =
-					    Four{.element = {sequence.at(index(token)).at(index(local)), sequence.at(index(token + 1)).at(index(local)),
-						                 sequence.at(index(token + 2)).at(index(local)), sequence.at(index(token + 3)).at(index(local))}};
-					convolved.at(index(part * dim + offset)) = convolve(taps(weights.conv, card_channel(key_head, local)), inputs);
+					convolved.at(index(part * dim + offset)) =
+					    convolve_local(weights, sequence, token, key_head, locals.at(index(part)) + offset);
 				}
 			}
 			auto const query = normalized_vector(std::span{convolved}.first<dim>(), Role::Query);
@@ -363,10 +373,10 @@ export void prefill(LayerWeights const& weights, LayerMemory const& memory, Acti
 			auto const inputs = projected_gates(rows, first_row + token, key_head);
 			auto const gate = gates(inputs.at(index(head)), inputs.at(index(group + head)), weights.a_log[index(value_head)],
 			                        weights.dt_bias[index(value_head)]);
-			auto outputs = std::array<Bf16, dim>{};
+			auto outputs = std::array<float, dim>{};
 			for (auto column = 0; column < dim; ++column) {
-				auto const value = widen(convolved.at(index(2 * dim + column)));
-				outputs.at(index(column)) = round_to_bf16(step(columns.at(index(column)), key, query, value, gate));
+				auto const value = convolved.at(index(2 * dim + column));
+				outputs.at(index(column)) = step(columns.at(index(column)), key, query, value, gate);
 			}
 			normalize_head(outputs, weights.norm,
 			               rows.outputs.subspan(index((first_row + token) * value_features + value_head * dim)).first<dim>());

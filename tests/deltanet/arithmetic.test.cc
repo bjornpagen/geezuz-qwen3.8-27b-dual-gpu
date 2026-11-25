@@ -2,7 +2,7 @@
 //
 // The deltanet's fp32 arithmetic against the model's in float64. Each check's tolerance is derived from the fixed fp32
 // operation order, never fitted: unit roundoff u = 2^-24, gamma_n = n u / (1 - n u) for a sum whose terms pass n
-// roundings, the shared transcendentals' proven ulp bounds, and bf16's unit roundoff 2^-8 where the model rounds.
+// roundings, and the shared transcendentals' proven ulp bounds. Every value here is fp32: the model rounds none to bf16.
 //
 // The recurrence's bound is carried token by token. On a state column s the exact update is s -> d (I - beta k k^T) s +
 // beta v k, which never grows a difference when 0 <= d <= 1 and 0 <= beta |k|^2 <= 2; so the gap between the fp32 and
@@ -11,6 +11,7 @@
 import std;
 import engine.deltanet;
 import engine.deltanet_fixtures;
+import engine.model;
 import engine.testing;
 
 namespace {
@@ -19,7 +20,6 @@ namespace dn = engine::deltanet;
 namespace fx = engine::deltanet_fixtures;
 
 constexpr double unit = 0x1p-24;
-constexpr double bf16_unit = 0x1p-8;
 constexpr double ulp = 0x1p-23;
 /** The float64 chains' own rounding, 2^-29 of the fp32 bound, and the subnormal floor, folded into the comparison. */
 constexpr double slack = 1.0 + 0x1p-20;
@@ -43,11 +43,11 @@ constexpr double floor = 0x1p-120;
 	}));
 }
 
-/** A normalized query or key, as the device makes it from a convolved bf16 vector. */
+/** A normalized query or key, as the device makes it from a convolved fp32 vector. */
 [[nodiscard]] auto unit_vector(fx::Generator& generator, dn::Role role) -> dn::Vector {
-	auto convolved = std::array<dn::Bf16, dn::dim>{};
+	auto convolved = std::array<float, dn::dim>{};
 	std::ranges::generate(convolved, [&] {
-		return fx::bf16(fx::normal(generator, 1.0F));
+		return fx::normal(generator, 1.0F);
 	});
 	return dn::normalized_vector(convolved, role);
 }
@@ -154,8 +154,8 @@ template<class T>
 }
 
 /**
- * The convolution and its silu against float64: the sum of four exact products rounds at most three times, then the
- * model rounds to bf16, takes silu (2.5 ulp, slope at most 1.1), and rounds to bf16 again.
+ * The convolution and its silu against float64: the fma fold of four exact products rounds at most three times, then
+ * silu adds 2.5 ulp (its slope is at most 1.1); both stay fp32.
  */
 [[nodiscard]] auto convolution_within_bound(std::uint64_t seed) -> bool {
 	auto generator = engine::testing::generator(seed);
@@ -172,12 +172,10 @@ template<class T>
 			exact += product;
 			magnitude += std::abs(product);
 		}
-		auto const got = wide(dn::widen(dn::convolve(taps, inputs)));
+		auto const got = wide(dn::convolve(taps, inputs));
 		auto const summed = gamma(3) * magnitude;
-		auto const convolved = (std::abs(exact) + summed) * (1.0 + bf16_unit);
-		auto const argument = summed + bf16_unit * convolved;
-		auto const activated = std::abs(silu(exact)) + 1.1 * argument;
-		auto const bound = 1.1 * argument + 2.5 * ulp * activated + bf16_unit * (activated + 2.5 * ulp * activated);
+		auto const activated = std::abs(silu(exact)) + 1.1 * summed;
+		auto const bound = 1.1 * summed + 2.5 * ulp * activated;
 		holds = holds && within(got, silu(exact), bound);
 	}
 	return holds;
@@ -185,19 +183,19 @@ template<class T>
 
 /**
  * The gates against float64. decay = e^g: the shift rounds once, e^A_log is within an ulp, softplus within two (slope
- * at most 1), the product rounds once, and e^g adds an ulp and multiplies g's error by e^g. beta: sigmoid within 2.5 ulp,
- * then the model's bf16 rounding.
+ * at most 1), the product rounds once, and e^g adds an ulp and multiplies g's error by e^g. beta: sigmoid within 2.5
+ * ulp. a and b are in_proj_a's and in_proj_b's fp32 outputs.
  */
 [[nodiscard]] auto gates_within_bound(std::uint64_t seed) -> bool {
 	auto generator = engine::testing::generator(seed);
 	auto holds = true;
 	for (auto sample = 0; sample < 200'000; ++sample) {
-		auto const a = random_bf16(generator, 2.0F);
-		auto const b = random_bf16(generator, 3.0F);
+		auto const a = fx::normal(generator, 2.0F);
+		auto const b = fx::normal(generator, 3.0F);
 		auto const a_log = fx::bf16(std::log(fx::uniform(generator, 0.01F, 16.0F)));
 		auto const dt_bias = fx::bf16(fx::uniform(generator, -4.0F, 4.0F));
 		auto const got = dn::gates(a, b, a_log, dt_bias);
-		auto const shifted = wide(dn::widen(a)) + wide(dn::widen(dt_bias));
+		auto const shifted = wide(a) + wide(dn::widen(dt_bias));
 		auto const rate = std::exp(wide(dn::widen(a_log)));
 		auto const softplus = std::log1p(std::exp(shifted));
 		auto const g = -rate * softplus;
@@ -205,8 +203,8 @@ template<class T>
 		auto const g_error = rate * ulp * softplus + rate * (1.0 + ulp) * softplus_error + unit * std::abs(g) * (1.0 + 4.0 * ulp);
 		auto const decay = std::exp(g);
 		auto const decay_bound = decay * (std::expm1(g_error) + ulp * std::exp(g_error));
-		auto const sigmoid = 1.0 / (1.0 + std::exp(-wide(dn::widen(b))));
-		auto const beta_bound = 2.5 * ulp * sigmoid + bf16_unit * sigmoid * (1.0 + 2.5 * ulp);
+		auto const sigmoid = 1.0 / (1.0 + std::exp(-wide(b)));
+		auto const beta_bound = 2.5 * ulp * sigmoid;
 		holds = holds && within(wide(got.decay), decay, decay_bound) && within(wide(got.beta), sigmoid, beta_bound);
 	}
 	return holds;
@@ -214,49 +212,49 @@ template<class T>
 
 /**
  * The l2 normalization and the gated norm, as the device's eight-lane groups compute them, against float64. The sum of
- * squares passes the tree's 19 roundings, then eps's addition; rsqrt is within 0.51 ulp and halves the sum's relative
- * error; each product or quotient rounds once, and a query's divisor is sqrt(128) rounded to fp32. The gated norm also
- * divides by 128 exactly, and the model rounds twice to bf16.
+ * squares passes the tree's 19 roundings (each lane's sixteen fmas, then three butterfly additions), then eps's
+ * addition; rsqrt is within 0.51 ulp and halves the sum's relative error; each product or quotient rounds once, and a
+ * query's divisor is sqrt(128) rounded to fp32. The gated norm also divides by 128, and its two products round once each.
  */
 [[nodiscard]] auto norms_within_bound(std::uint64_t seed) -> bool {
 	auto generator = engine::testing::generator(seed);
 	constexpr int depth = dn::Column::per_lane - 1 + 3;
+	constexpr auto l2_eps = wide(engine::model::deltanet::l2_norm_eps);
 	auto holds = true;
 	for (auto sample = 0; sample < 2'000; ++sample) {
 		auto const deviation = std::exp2(fx::uniform(generator, -12.0F, 6.0F));
-		auto inputs = std::array<dn::Bf16, dn::dim>{};
+		auto inputs = std::array<float, dn::dim>{};
 		auto squares = 0.0;
 		for (auto& input : inputs) {
-			input = random_bf16(generator, deviation);
-			squares += wide(dn::widen(input)) * wide(dn::widen(input));
+			input = fx::normal(generator, deviation);
+			squares += wide(input) * wide(input);
 		}
-		auto const relative = gamma(depth + 1) * squares / (squares + wide(dn::l2_norm_eps)) + unit;
+		auto const relative = gamma(depth + 1) * squares / (squares + l2_eps) + unit;
 		auto const scale_error = 0.5 * relative + 0.51 * ulp;
 		for (auto const role : {dn::Role::Query, dn::Role::Key}) {
 			auto const normalized = dn::normalized_vector(inputs, role);
 			auto const divisor = role == dn::Role::Query ? std::sqrt(128.0) : 1.0;
 			auto const roundings = role == dn::Role::Query ? 3.0 : 1.0;
 			for (auto element = std::size_t{0}; element < dn::dim; ++element) {
-				auto const expected = wide(dn::widen(inputs.at(element))) / std::sqrt(squares + wide(dn::l2_norm_eps)) / divisor;
+				auto const expected = wide(inputs.at(element)) / std::sqrt(squares + l2_eps) / divisor;
 				auto const bound = std::abs(expected) * (scale_error * (1.0 + scale_error) + roundings * unit) * 1.01;
 				holds = holds && within(wide(normalized.at(element)), expected, bound);
 			}
 		}
 		auto const mean = squares / dn::dim;
-		auto const mean_relative = gamma(depth + 1) * mean / (mean + wide(1e-6F)) + unit;
+		auto const mean_relative = gamma(depth + 1) * mean / (mean + wide(1e-6F)) + 2.0 * unit;
 		auto const norm_error = 0.5 * mean_relative + 0.51 * ulp;
 		auto const expected_scale = 1.0 / std::sqrt(mean + wide(1e-6F));
 		auto weights = std::array<dn::Bf16, dn::dim>{};
 		std::ranges::generate(weights, [&] {
 			return fx::bf16(fx::uniform(generator, 0.5F, 1.5F));
 		});
-		auto outputs = std::array<dn::Bf16, dn::dim>{};
+		auto outputs = std::array<float, dn::dim>{};
 		dn::normalize_head(inputs, weights, outputs);
 		for (auto element = std::size_t{0}; element < dn::dim; ++element) {
-			auto const expected = wide(dn::widen(inputs.at(element))) * expected_scale * wide(dn::widen(weights.at(element)));
-			auto const bound = std::abs(expected) * ((norm_error + unit) * (1.0 + bf16_unit) + bf16_unit) * (1.0 + bf16_unit) +
-			                   bf16_unit * std::abs(expected);
-			holds = holds && within(wide(dn::widen(outputs.at(element))), expected, bound * 1.01);
+			auto const expected = wide(inputs.at(element)) * expected_scale * wide(dn::widen(weights.at(element)));
+			auto const bound = std::abs(expected) * (norm_error * (1.0 + norm_error) + 2.0 * unit) * 1.01;
+			holds = holds && within(wide(outputs.at(element)), expected, bound);
 		}
 	}
 	return holds;

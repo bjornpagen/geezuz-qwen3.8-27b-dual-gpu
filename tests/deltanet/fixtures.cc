@@ -68,10 +68,10 @@ export [[nodiscard]] auto random_layer(Generator& generator) -> dn::LayerBuffers
 	return buffers;
 }
 
-/** One token's projections: in_proj_qkv's channels, and a | b per value head. */
+/** One token's projections: in_proj_qkv's bf16 channels, and a, b per value head in fp32. */
 export struct Token {
 	std::vector<dn::Bf16> qkv;
-	std::vector<std::uint32_t> gates;
+	std::vector<float> gates;
 };
 
 export [[nodiscard]] auto random_token(Generator& generator) -> Token {
@@ -80,9 +80,8 @@ export [[nodiscard]] auto random_token(Generator& generator) -> Token {
 		token.qkv.push_back(bf16(normal(generator, 1.0F)));
 	}
 	for (auto head = 0; head < dn::value_heads; ++head) {
-		auto const a = bf16(normal(generator, 1.5F));
-		auto const b = bf16(normal(generator, 2.0F));
-		token.gates.push_back(std::uint32_t{a.bits} | (std::uint32_t{b.bits} << 16U));
+		token.gates.push_back(normal(generator, 1.5F));
+		token.gates.push_back(normal(generator, 2.0F));
 	}
 	return token;
 }
@@ -90,8 +89,8 @@ export [[nodiscard]] auto random_token(Generator& generator) -> Token {
 /** Activation rows, owned: tokens appended in row order, and room for their outputs. */
 export struct RowsStore {
 	std::vector<dn::Bf16> qkv;
-	std::vector<std::uint32_t> gates;
-	std::vector<dn::Bf16> outputs;
+	std::vector<float> gates;
+	std::vector<float> outputs;
 
 	void push(Token const& token) {
 		qkv.insert(qkv.end(), token.qkv.begin(), token.qkv.end());
@@ -104,7 +103,7 @@ export struct RowsStore {
 	}
 
 	/** Row `row`'s outputs. */
-	[[nodiscard]] auto output(std::size_t row) const -> std::span<dn::Bf16 const> {
+	[[nodiscard]] auto output(std::size_t row) const -> std::span<float const> {
 		return std::span{outputs}.subspan(row * static_cast<std::size_t>(dn::value_features), static_cast<std::size_t>(dn::value_features));
 	}
 };
@@ -112,6 +111,12 @@ export struct RowsStore {
 export [[nodiscard]] auto same_bits(std::span<dn::Bf16 const> left, std::span<dn::Bf16 const> right) -> bool {
 	return std::ranges::equal(left, right, [](dn::Bf16 a, dn::Bf16 b) {
 		return a.bits == b.bits;
+	});
+}
+
+export [[nodiscard]] auto same_bits(std::span<float const> left, std::span<float const> right) -> bool {
+	return std::ranges::equal(left, right, [](float a, float b) {
+		return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b);
 	});
 }
 

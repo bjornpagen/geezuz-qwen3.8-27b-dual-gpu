@@ -84,7 +84,7 @@ __attribute__((device, always_inline)) inline void prepare_blocks(Chunked const&
 			int const token = vector_group;
 			bool const active = token < block_tokens(chunk, done);
 			Count const row = Count(chunk.first_row) + Count(done) * prefill_block_tokens + Count(active ? token : 0);
-			Bf16* const target = at(rows.outputs) + row * value_features + Count(chunk.value_head) * dim;
+			float* const target = at(rows.outputs) + row * value_features + Count(chunk.value_head) * dim;
 			normalize_output(tokens.outputs[active ? token : 0], at(weights.norm), target, active, r, reused);
 		}
 		if (block >= blocks) {
@@ -96,17 +96,18 @@ __attribute__((device, always_inline)) inline void prepare_blocks(Chunked const&
 			for (int token = 0; token < count; ++token) {
 				Chunk const newest = prims::load(
 				    chunk_at(at(rows.qkv), (first + Count(token)) * qkv_row_bytes + Count(first_channel) * sizeof(Bf16)), reused);
-				prims::store_shared(prims::shared_address(&tokens.convolved[token][Count(u) * bf16_per_chunk]),
-				                    convolve_chunk(taps, oldest, older, newer, newest));
+				store_convolved(convolved_target(tokens.queries[token], tokens.keys[token], tokens.values[token], u),
+				                convolve_chunk(taps, oldest, older, newer, newest));
 				oldest = older;
 				older = newer;
 				newer = newest;
 			}
 		} else if (gates_a_token && gate_token < count) {
-			unsigned const word =
-			    prims::load_word(at(rows.gates) + (first + Count(gate_token)) * value_heads + Count(chunk.value_head), reused);
-			tokens.gates[gate_token] = gates({.bits = static_cast<unsigned short>(word & 0xffffU)},
-			                                 {.bits = static_cast<unsigned short>(word >> 16U)}, a_log, dt_bias);
+			/* SAFETY: the gate rows are fp32 words as `Rows` lays them out. */
+			auto const* const gate_rows = reinterpret_cast<unsigned const*>(at(rows.gates));
+			Count const pair = ((first + Count(gate_token)) * value_heads + Count(chunk.value_head)) * 2;
+			tokens.gates[gate_token] = gates(__builtin_bit_cast(float, prims::load_word(gate_rows + pair, reused)),
+			                                 __builtin_bit_cast(float, prims::load_word(gate_rows + pair + 1, reused)), a_log, dt_bias);
 		}
 		PrefillBarrier::sync();
 		for (int base = 0; base < 2 * prefill_block_tokens; base += groups) {
@@ -114,8 +115,7 @@ __attribute__((device, always_inline)) inline void prepare_blocks(Chunked const&
 			bool const active = vector < 2 * count;
 			int const token = active ? vector / 2 : 0;
 			Role const role = vector % 2 == 0 ? Role::Query : Role::Key;
-			float* const target = role == Role::Query ? tokens.queries[token] : tokens.keys[token];
-			normalize_vector(&tokens.convolved[token][role == Role::Query ? 0 : dim], target, role, active, r);
+			normalize_vector(role == Role::Query ? tokens.queries[token] : tokens.keys[token], role, active, r);
 		}
 		prims::sync_warp();
 		if (prims::lane() == 0) {
@@ -160,12 +160,12 @@ __attribute__((device, always_inline)) inline void chain_blocks(Chunked const& c
 #pragma unroll
 			for (int quad = 0; quad < quads_per_chain_warp; ++quad) {
 				int const column = (warp * quads_per_chain_warp + quad) * State::unit_columns + column_in_quad;
-				float const value = widen(tokens.convolved[token][2 * dim + column]);
+				float const value = tokens.values[token][column];
 				float const projected = group_sum<Column>(decay_and_project(state[quad], key, gate.decay));
 				update(state[quad], key, delta(value, projected, gate.beta));
 				float const output = group_sum<Column>(read(state[quad], query));
 				if (r == 0) {
-					tokens.outputs[token][column] = round_to_bf16(output);
+					tokens.outputs[token][column] = output;
 				}
 			}
 		}

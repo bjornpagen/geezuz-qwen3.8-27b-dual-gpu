@@ -16,8 +16,8 @@ namespace fx = engine::deltanet_fixtures;
 
 /** The plain slot: every token of `sequence` in its own cycle; returns each position's outputs. */
 [[nodiscard]] auto plain_outputs(fx::WeightsStore const& weights, dn::LayerBuffers start, std::span<fx::Token const> sequence)
-    -> std::vector<std::vector<dn::Bf16>> {
-	auto outputs = std::vector<std::vector<dn::Bf16>>{};
+    -> std::vector<std::vector<float>> {
+	auto outputs = std::vector<std::vector<float>>{};
 	auto settled = dn::settled({.tokens = 0});
 	for (auto const& token : sequence) {
 		auto rows = fx::RowsStore{};
