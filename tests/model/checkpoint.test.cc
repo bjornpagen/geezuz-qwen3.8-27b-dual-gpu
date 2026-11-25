@@ -180,6 +180,7 @@ struct Checkpoint {
 		case model::Split::Columns:
 		case model::Split::DeltanetChannels:
 		case model::Split::HiddenPair:
+		case model::Split::Vocabulary:
 			return total == whole;
 		}
 		std::unreachable();

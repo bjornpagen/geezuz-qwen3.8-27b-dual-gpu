@@ -102,6 +102,11 @@ inline constexpr Share snapshot_share = {.numerator = 1, .denominator = 4};
 
 inline constexpr Count hidden = 5120;
 inline constexpr Count vocab = 248'320;
+
+// lm_head has a row for every id below `vocab`, but the tokenizer has tokens only below this: the rows above are
+// padding. No tokenizer emits or decodes a padding id, so none is ever sampled, by the engine or the reference: their
+// logits take no part in top-k, argmax or the softmax.
+inline constexpr Count sampled_vocabulary = 248'077;
 inline constexpr Count ffn = 17'408;
 inline constexpr Count max_positions = 262'144;
 inline constexpr float rms_norm_eps = 1e-6F;
@@ -204,6 +209,7 @@ inline constexpr Gate deltanet_output_gate = Gate::Silu;
 inline constexpr Count draft_vocab = 32'768;
 
 static_assert(trunk_layers_of(Mixer::LinearAttention) + trunk_layers_of(Mixer::FullAttention) == trunk_layers);
+static_assert(draft_vocab <= sampled_vocabulary && sampled_vocabulary <= vocab, "every draft id is a token, every token a row");
 static_assert(query_heads % kv_heads == 0, "grouped-query attention");
 static_assert(value_heads % key_heads == 0, "every value head reads one key head");
 static_assert(rotary_dim * partial_rotary.denominator == head_dim * partial_rotary.numerator, "whole rotary features");
@@ -278,6 +284,12 @@ enum class Split : unsigned char {
 	DeltanetChannels,
 	/** Axis 1 as two hidden-wide inputs (normalized embedding | normalized hidden state), each halved. */
 	HiddenPair,
+	/**
+	 * Axis 0 is the vocabulary, permuted before it is halved: card c's rows are every second draft id from the c-th,
+	 * then every second other id from the c-th, each in ascending order (`engine.vocabulary` holds the map). A card
+	 * holds no range of token ids, so its shard has no ranges; only its row count is a range fact.
+	 */
+	Vocabulary,
 };
 
 struct Shape {
@@ -311,7 +323,7 @@ inline constexpr Tensor inventory[] = {
     // Untied: the embedding and lm_head are separate tensors. The embedding stays in host memory.
     {"model.language_model.embed_tokens.weight", matrix(vocab, hidden), Scope::Model, Format::Bf16, Split::Host},
     {"model.language_model.norm.weight", vector(hidden), Scope::Model, Format::Bf16, Split::Replicated},
-    {"lm_head.weight", matrix(vocab, hidden), Scope::Model, Format::Bf16, Split::Rows},
+    {"lm_head.weight", matrix(vocab, hidden), Scope::Model, Format::Bf16, Split::Vocabulary},
 
     {"fc.weight", matrix(hidden, 2 * hidden), Scope::Mtp, Format::Bf16, Split::HiddenPair},
     {"pre_fc_norm_embedding.weight", vector(hidden), Scope::Mtp, Format::Bf16, Split::Replicated},
@@ -396,6 +408,7 @@ struct Sections {
 	case Split::Host:
 	case Split::Rows:
 	case Split::DeltanetChannels:
+	case Split::Vocabulary:
 		return 0;
 	case Split::Columns:
 	case Split::HiddenPair:
@@ -408,6 +421,7 @@ struct Sections {
 	auto const whole = tensor.shape.extents[split_axis(tensor.split)];
 	switch (tensor.split) {
 	case Split::Host:
+	case Split::Vocabulary:
 		return {.count = 0, .lengths = {0, 0, 0}};
 	case Split::Replicated:
 	case Split::Rows:
@@ -454,7 +468,8 @@ struct Sections {
 [[nodiscard]] constexpr auto card_shape(Tensor const& tensor, Count card) -> Shape {
 	auto const part = shard(tensor, card);
 	auto shape = tensor.shape;
-	shape.extents[part.axis] = held(part);
+	// A vocabulary split holds its rows by the permutation, not by a range: each card an equal part.
+	shape.extents[part.axis] = tensor.split == Split::Vocabulary ? tensor.shape.extents[0] / cards : held(part);
 	return shape;
 }
 
@@ -501,11 +516,14 @@ struct Sections {
 				}
 			}
 		}
-		auto const covers = tensor.split == Split::Host || total == tensor.shape.extents[axis];
+		// The vocabulary permutation gives each card half the draft ids and half the others, in whole lm_head blocks.
+		auto const permuted = tensor.split != Split::Vocabulary ||
+		                      (tensor.shape.extents[0] == vocab && draft_vocab % (cards * scale_block) == 0 && vocab % cards == 0);
+		auto const covers = tensor.split == Split::Host || tensor.split == Split::Vocabulary || total == tensor.shape.extents[axis];
 		auto const in_rank = axis < tensor.shape.rank;
 		auto const blocked = tensor.format != Format::E4m3 || tensor.shape.rank == 2;
 		auto const balanced = card_bytes(tensor, 0) == card_bytes(tensor, cards - 1);
-		if (!covers || !in_rank || !blocked || !balanced) {
+		if (!covers || !permuted || !in_rank || !blocked || !balanced) {
 			return false;
 		}
 	}

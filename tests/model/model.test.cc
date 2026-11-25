@@ -39,6 +39,7 @@ using model::Tensor;
 	return counts;
 }
 
+/** Cards holding each element of a tensor: none, every card, or one. */
 [[nodiscard]] auto expected_holders(Split split) -> Count {
 	switch (split) {
 	case Split::Host:
@@ -49,14 +50,20 @@ using model::Tensor;
 	case Split::Columns:
 	case Split::DeltanetChannels:
 	case Split::HiddenPair:
+	case Split::Vocabulary:
 		return 1;
 	}
 	std::unreachable();
 }
 
+/** Cards holding each index of the split axis as a range: a vocabulary split holds its rows by the permutation. */
+[[nodiscard]] auto range_holders(Split split) -> Count {
+	return split == Split::Vocabulary ? 0 : expected_holders(split);
+}
+
 [[nodiscard]] auto shards_reassemble_the_whole_tensor() -> bool {
 	return std::ranges::all_of(model::inventory, [](Tensor const& tensor) {
-		auto const holders = expected_holders(tensor.split);
+		auto const holders = range_holders(tensor.split);
 		return std::ranges::all_of(coverage(tensor), [holders](Count count) {
 			return count == holders;
 		});
@@ -160,15 +167,18 @@ using model::Tensor;
 	return true;
 }
 
+// A card's lm_head rows are a permutation of the vocabulary, never a range of token ids, so no range describes them;
+// each card holds half the rows, and half the draft vocabulary is whole lm_head blocks.
 [[nodiscard]] auto lm_head_splits_the_vocabulary() -> bool {
 	auto const& head = named("lm_head.weight");
 	for (auto card = Count{0}; card < model::cards; ++card) {
-		auto const rows = ranges_held(head, card).at(0);
-		if (rows.begin != card * model::vocab_per_card || rows.length != model::vocab_per_card) {
+		auto const shape = model::card_shape(head, card);
+		if (!ranges_held(head, card).empty() || shape.extents[0] != model::vocab_per_card || shape.extents[1] != model::hidden) {
 			return false;
 		}
 	}
-	return ranges_held(named("model.language_model.embed_tokens.weight"), 0).empty();
+	return head.split == Split::Vocabulary && model::draft_vocab_per_card % model::scale_block == 0 &&
+	       ranges_held(named("model.language_model.embed_tokens.weight"), 0).empty();
 }
 
 [[nodiscard]] auto inventory_names_are_unique() -> bool {
@@ -234,7 +244,7 @@ auto main() -> int {
 	        .holds = mtp_fc_takes_the_same_features_of_both_inputs(),
 	    },
 	    engine::testing::Case{
-	        .name = "lm_head splits the vocabulary in halves and the embedding lives on no card",
+	        .name = "lm_head halves the permuted vocabulary, by no range of ids, and the embedding lives on no card",
 	        .holds = lm_head_splits_the_vocabulary(),
 	    },
 	    engine::testing::Case{
