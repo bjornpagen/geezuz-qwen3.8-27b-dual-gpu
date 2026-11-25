@@ -13,6 +13,12 @@ conventions: per card unless stated, gb = 1e9 bytes, "p2" is the 912 gb/s memory
 
 ## decisions for the owner
 
+**resolved by the owner:** 1a, with a correction: the unscaled three-way split is exact only for p ≥ 2^-110 (an
+exhaustive check over all 1,065,353,217 fp32 values in [0, 1] found 134,217,728 inexact below that, where the low
+part falls under bf16's 2^-133 subnormal step); scaling P by 2^40 first makes every value exact (2^38 already
+suffices), and the row sum carries the same scale. PLAN 0.2 records it. 2a: one ptx-jit load path. 3a: `iomem=relaxed`
+for the sweep and the soak only.
+
 these need the owner because the fix would change the meaning of the lossless contract or an owner decision. none of
 them was applied to PLAN.md. recommendation first.
 
