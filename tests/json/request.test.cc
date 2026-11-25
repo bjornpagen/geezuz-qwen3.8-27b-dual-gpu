@@ -734,6 +734,7 @@ struct Refusal {
 	    {.body = item(R"({"type":"function_call","call_id":"c","name":"f","arguments":"{}","output":"o"})"), .error = at(Violation::UnknownField, {P{"input"}, zero, P{"output"}})},
 	    {.body = item(R"({"type":"function_call_output","output":"x"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"call_id"}})},
 	    {.body = item(R"({"type":"function_call_output","call_id":"c"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"output"}})},
+	    {.body = item(R"({"type":"function_call_output","call_id":"c","output":"o","name":"f"})"), .error = at(Violation::Unsupported, {P{"input"}, zero, P{"name"}})},
 	    {.body = item(R"({"type":"function_call_output","call_id":"c","output":[{"type":"input_image","image_url":"u"}]})"),
 	     .error = at(Violation::Unsupported, {P{"input"}, zero, P{"output"}, zero, P{"type"}})},
 	    {.body = item(R"({"type":"custom_tool_call","call_id":"c","name":"t"})"), .error = at(Violation::MissingField, {P{"input"}, zero, P{"input"}})},

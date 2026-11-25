@@ -325,6 +325,10 @@ struct Draft {
 		if (auto const checked = only(*read, custom ? Allowed{custom_output_members} : Allowed{output_members}); !checked) {
 			return std::unexpected(checked.error());
 		}
+		// The output answers its call by id; a name beside it would be a second, unchecked claim about the call.
+		if (read->name) {
+			return refuse_at("name", Violation::Unsupported);
+		}
 		auto call_id = require(read->call_id, "call_id");
 		if (!call_id) {
 			return std::unexpected(call_id.error());
