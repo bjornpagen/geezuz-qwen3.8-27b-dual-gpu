@@ -9,4 +9,5 @@ export import :sync;
 export import :compute;
 export import :link;
 export import :checks;
+export import :lanes;
 export import :runner;

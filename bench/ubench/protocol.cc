@@ -68,38 +68,51 @@ export [[nodiscard]] auto finish(CardView view, std::string_view kernel) -> Resu
 	return {};
 }
 
+/**
+ * Enqueues `K` on the view's stream: a kernel this component declares is built from the typed owners it takes; a
+ * kernel another component declares takes its parameter struct as that component builds it.
+ */
+export template<class K, class... Ks, class... Arguments>
+[[nodiscard]] auto enqueue(CardView view, device::Program<Ks...> const& program, Arguments const&... arguments) -> Result<void> {
+	if constexpr (ubench_device::Typed<K, Arguments...>) {
+		return lift(ubench_device::launch<K>(view.context, program, view.stream, arguments...));
+	} else {
+		return lift(view.context.launch<K>(program, view.stream, arguments...));
+	}
+}
+
 /** Launches `K` once on the view's stream and waits for it. */
 export template<class K, class... Ks, class... Arguments>
 [[nodiscard]] auto run_once(CardView view, device::Program<Ks...> const& program, Arguments const&... arguments) -> Result<void> {
-	return lift(ubench_device::launch<K>(view.context, program, view.stream, arguments...)).and_then([&] {
+	return enqueue<K>(view, program, arguments...).and_then([&] {
 		return finish(view, K::entry);
 	});
 }
 
-/** One timed launch of `K`, in milliseconds between markers recorded around it. */
-template<class K, class... Ks, class... Arguments>
+/** One timed run of `Run`'s launches, in milliseconds between markers recorded around them. */
+template<class Run, class... Ks, class... Arguments>
 [[nodiscard]] auto timed_once(CardView view, device::Program<Ks...> const& program, Arguments const&... arguments) -> Result<double> {
 	auto start = view.context.create_timed_event();
 	auto end = view.context.create_timed_event();
 	if (!start || !end) {
 		return std::unexpected(UbenchError{.reason = !start ? start.error() : end.error()});
 	}
-	auto const enqueued = start->record(view.stream)
+	auto const enqueued = lift(start->record(view.stream))
 	                          .and_then([&] {
-		                          return ubench_device::launch<K>(view.context, program, view.stream, arguments...);
+		                          return Run::enqueue(view, program, arguments...);
 	                          })
 	                          .and_then([&] {
-		                          return end->record(view.stream);
+		                          return lift(end->record(view.stream));
 	                          });
 	if (!enqueued) {
-		return std::unexpected(UbenchError{.reason = enqueued.error()});
+		return std::unexpected(enqueued.error());
 	}
 	auto const state = end->wait_until(std::chrono::steady_clock::now() + deadline);
 	if (!state) {
 		return std::unexpected(UbenchError{.reason = state.error()});
 	}
 	if (*state == device::EventState::Pending) {
-		return std::unexpected(UbenchError{.reason = Hung{.kernel = K::entry}});
+		return std::unexpected(UbenchError{.reason = Hung{.kernel = Run::entry}});
 	}
 	auto const elapsed = end->since(*start);
 	if (!elapsed) {
@@ -110,25 +123,48 @@ template<class K, class... Ks, class... Arguments>
 	return static_cast<double>((*elapsed)->count());
 }
 
+/** Kernels launched back to back on one stream with the same arguments, timed as one run; named by the first. */
+template<class First, class... Rest>
+struct Launches {
+	static constexpr std::string_view entry = First::entry;
+
+	template<class... Ks, class... Arguments>
+	[[nodiscard]] static auto enqueue(CardView view, device::Program<Ks...> const& program, Arguments const&... arguments) -> Result<void> {
+		auto result = ubench::enqueue<First>(view, program, arguments...);
+		auto const next = [&]<class K> {
+			result = result.and_then([&] {
+				return ubench::enqueue<K>(view, program, arguments...);
+			});
+		};
+		(next.template operator()<Rest>(), ...);
+		return result;
+	}
+};
+
 /**
- * The protocol for an event-timed kernel: `warmup_launches` launches, then the best (shortest) of `timed_launches`,
- * in milliseconds. `between` runs before every launch (a reset of what the kernel consumes) and must leave the stream
- * ordered before the launch.
+ * The protocol for event-timed kernels: `warmup_launches` runs, then the best (shortest) of `timed_launches`, in
+ * milliseconds. A run launches `First`, then each of `Rest`, with the same arguments. `between` runs before every run
+ * (a reset of what the kernels consume) and must leave the stream ordered before it.
  */
-export template<class K, class... Ks, class Between, class... Arguments>
+export template<class First, class... Rest, class... Ks, class Between, class... Arguments>
 [[nodiscard]] auto best_time(CardView view, device::Program<Ks...> const& program, Between between, Arguments const&... arguments) -> Result<double> {
+	using Run = Launches<First, Rest...>;
 	for (auto launch = 0; launch < warmup_launches; ++launch) {
-		if (auto ran = between().and_then([&] {
-			    return run_once<K>(view, program, arguments...);
-		    });
-		    !ran) {
+		auto const ran = between()
+		                     .and_then([&] {
+			                     return Run::enqueue(view, program, arguments...);
+		                     })
+		                     .and_then([&] {
+			                     return finish(view, Run::entry);
+		                     });
+		if (!ran) {
 			return std::unexpected(ran.error());
 		}
 	}
 	auto best = std::numeric_limits<double>::infinity();
 	for (auto launch = 0; launch < timed_launches; ++launch) {
 		auto const took = between().and_then([&] {
-			return timed_once<K>(view, program, arguments...);
+			return timed_once<Run>(view, program, arguments...);
 		});
 		if (!took) {
 			return std::unexpected(took.error());
@@ -136,7 +172,7 @@ export template<class K, class... Ks, class Between, class... Arguments>
 		best = std::min(best, *took);
 	}
 	if (!(best > 0.0)) {
-		return no_reading(K::entry, "the timed launches took no time");
+		return no_reading(Run::entry, "the timed launches took no time");
 	}
 	return best;
 }
@@ -172,6 +208,14 @@ public:
 	/** Zeroes the device side, ordered before whatever the view's stream runs next. */
 	[[nodiscard]] auto clear(CardView view) -> Result<void> {
 		std::ranges::fill(host_.host(), T{});
+		auto transfer = view.context.upload(view.stream, std::move(device_), std::move(host_), 0);
+		return settle(std::move(transfer));
+	}
+
+	/** Writes `values` to the device side, ordered before whatever the view's stream runs next. */
+	[[nodiscard]] auto put(CardView view, std::span<T const> values) -> Result<void> {
+		core::invariant(values.size() == Count);
+		std::ranges::copy(values, host_.host().begin());
 		auto transfer = view.context.upload(view.stream, std::move(device_), std::move(host_), 0);
 		return settle(std::move(transfer));
 	}

@@ -105,7 +105,7 @@ struct Comes {
 	case Benchmark::CrossSmHop:
 		return none("ubench_hop_backoff");
 	case Benchmark::PeerFlag:
-		return none("ubench_flag_ping_spin");
+		return none("ubench_flag_ping_release_backoff");
 	case Benchmark::PeerPush:
 		return none("ubench_receive_c4");
 	case Benchmark::ReleaseCost:
@@ -134,6 +134,19 @@ struct Comes {
 		return none("prims_check_reduce");
 	case Benchmark::CheckTranscendentals:
 		return none("prims_digest_transcendentals");
+	case Benchmark::CheckStageRing:
+		return none("prims_check_stage_ring");
+	case Benchmark::CheckOrder:
+		return none("prims_check_order");
+	case Benchmark::GemvRows:
+		return none("gemv_stream_r1");
+	case Benchmark::ProbeMma:
+		return none("prims_probe_mma");
+	case Benchmark::DeltanetChain:
+		return none("deltanet_probe_chain_8");
+	case Benchmark::SplitKAttention:
+	case Benchmark::PrefillGemm:
+		return Verdict::Measured;
 	}
 	std::unreachable();
 }
@@ -150,7 +163,8 @@ struct Comes {
 			auto const result = ubench::run(listed.benchmark, bench);
 			auto const expected = expected_on_double(listed.benchmark);
 			auto const declared = std::ranges::all_of(driver.launches(), [](fake::Launch const& launch) {
-				return launch.entry.starts_with("ubench_") || launch.entry.starts_with("prims_");
+				return launch.entry.starts_with("ubench_") || launch.entry.starts_with("prims_") || launch.entry.starts_with("gemv_") ||
+				       launch.entry.starts_with("gemm_") || launch.entry.starts_with("deltanet_") || launch.entry.starts_with("attn_");
 			});
 			if (!comes_to(expected, result) || !declared) {
 				std::println("  {} did not come to its reading on the double{}", listed.name, result ? "" : ": " + ubench::describe(result.error()));

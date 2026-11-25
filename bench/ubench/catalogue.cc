@@ -3,7 +3,7 @@
 // The closed set of microbenchmarks, what each answers, and the review table they answer. A benchmark either answers
 // one of the adversarial review's open questions, whose expectation and decision the runner reads from the review
 // itself, or measures a required primitive the review's table does not cover and states its own. Every question in
-// the review has exactly one benchmark or one pending entry naming the kernel it waits for; the build checks it.
+// the review has exactly one benchmark; the build checks it.
 export module engine.ubench:catalogue;
 
 import std;
@@ -30,6 +30,11 @@ export enum class Benchmark : std::uint8_t {
 	SustainedClock,
 	OffsetStep,
 	TranscendentalRate,
+	GemvRows,
+	ProbeMma,
+	DeltanetChain,
+	SplitKAttention,
+	PrefillGemm,
 	StageHandoff,
 	L2PolicyReuse,
 	LdmatrixSwizzle,
@@ -38,6 +43,8 @@ export enum class Benchmark : std::uint8_t {
 	CheckFragments,
 	CheckReduce,
 	CheckTranscendentals,
+	CheckStageRing,
+	CheckOrder,
 };
 
 /** A benchmark that answers the review's open question `number` (its U-number). */
@@ -119,9 +126,9 @@ export inline constexpr auto catalogue = std::to_array<Entry>({
     {.benchmark = Benchmark::PeerFlag,
      .name = "peer_flag",
      .answers = Question{10},
-     .basis = "hw-link §3: one-way remote store ~0.6-1.0 us and flag handoff ~1-2 us, inferred (±2x) from a GB200 measurement. "
-              "Only the release/acquire variant runs: relaxed and fence.sc.sys flags need primitives the prims component does "
-              "not have yet",
+     .basis = "hw-link §3: one-way remote store ~0.6-1.0 us and flag handoff ~1-2 us, inferred (±2x) from a GB200 measurement; "
+              "upstream measured fence.sc.sys + flag at 28 us per call against 24 us for st.release.sys (hw-link §4). Four "
+              "variants: release/acquire with the engine's backoff and spinning, relaxed (the floor) and fence.sc.sys-fenced",
      .operator_sets = root_links},
     {.benchmark = Benchmark::PeerPush,
      .name = "peer_push",
@@ -138,10 +145,10 @@ export inline constexpr auto catalogue = std::to_array<Entry>({
      .name = "link_health",
      .answers = Question{13},
      .basis = "hw-link §1-2: 4 links x 14.0625 GB/s per direction datasheet [WP], NV4 measured by others; native peer atomics "
-              "not established. The engine's start already refuses a machine whose eight links do not all join the peer; "
-              "link speed and the p2p attributes are not read by the driver boundary",
-     .operator_sets = "by hand: `nvidia-smi nvlink -s` (4 x 14.062 GB/s per card) and `nvidia-smi topo -m` (NV4), first on the open "
-                      "kernel module, then the proprietary module of the same version; iommu=pt; persistence mode on"},
+              "not established. The engine's start refuses a machine whose eight links do not all join the peer; this reads "
+              "each link's version (raw, its NVML numbering inferred) and speed, and the peer path's rank and atomics",
+     .operator_sets = "the open kernel module first, then the proprietary module of the same version; iommu=pt; persistence mode "
+                      "on; confirm the raw link version against `nvidia-smi nvlink -s` and `topo -m` once"},
     {.benchmark = Benchmark::HostFetch,
      .name = "host_fetch",
      .answers = Question{14},
@@ -152,10 +159,10 @@ export inline constexpr auto catalogue = std::to_array<Entry>({
     {.benchmark = Benchmark::L2Persistence,
      .name = "l2_persistence",
      .answers = Question{15},
-     .basis = "hw-sm §4: persisting l2 about 4.5 MB (75% of 6 MiB) inferred; 6144 KB of l2 datasheet [WP]. Survival is read from "
-              "each 128 KiB segment's read-back time against the same segment hot and a cold one",
-     .operator_sets = "by hand: cudaDevAttrMaxPersistingL2CacheSize and accessPolicyMaxWindowSize (deviceQuery); the driver "
-                      "boundary does not read them"},
+     .basis = "hw-sm §4: persisting l2 about 4.5 MB (75% of 6 MiB) inferred; 6144 KB of l2 datasheet [WP]. The driver's "
+              "persisting and window limits are read; survival is each 128 KiB segment's read-back time against the same "
+              "segment hot and a cold one",
+     .operator_sets = std::nullopt},
     {.benchmark = Benchmark::RingStall,
      .name = "ring_stall",
      .answers = Question{16},
@@ -164,11 +171,11 @@ export inline constexpr auto catalogue = std::to_array<Entry>({
     {.benchmark = Benchmark::SustainedClock,
      .name = "sustained_clock",
      .answers = Question{18},
-     .basis = "hw-power §1-2: ~1800-1900 MHz under water at 400 W inferred; 1710 MHz at 350 W on air measured by others. The SM "
-              "clock is measured on the card (cycles over the global timer), launch by launch",
-     .operator_sets = "root: `nvidia-smi -pm 1`, `nvidia-smi -i N -pl 400`; run unlocked first, then lock `nvidia-smi -lgc F,F` one "
-                      "step below the sustained clock; power and the sw_power_cap counter by hand over a 10-minute soak "
-                      "(`nvidia-smi --query-gpu=clocks_event_reasons_counters.sw_power_cap,power.draw --format=csv -lms 100`)"},
+     .basis = "hw-power §1-2: ~1800-1900 MHz under water at 400 W inferred; 1710 MHz at 350 W on air measured by others. A "
+              "10-minute soak of both cards: the SM clock measured on the card launch by launch, NVML's clock and power "
+              "sampled, and the software power cap's counter across the soak",
+     .operator_sets = "root: `nvidia-smi -pm 1`, `nvidia-smi -i N -pl 400`; run unlocked first, then with `nvidia-smi -lgc F,F` "
+                      "one step below the sustained clock, accepting the lock only if the power cap's counter stays flat"},
     {.benchmark = Benchmark::OffsetStep,
      .name = "offset_step",
      .answers = Question{19},
@@ -185,6 +192,39 @@ export inline constexpr auto catalogue = std::to_array<Entry>({
               "operations from their specification. The mufu side cannot be measured: the ptx gate refuses every .approx "
               "instruction, so no engine image holds one; the documented rate stands in",
      .operator_sets = "root: lock the SM clock (`nvidia-smi -lgc F,F`)"},
+    {.benchmark = Benchmark::GemvRows,
+     .name = "gemv_rows",
+     .answers = Question{5},
+     .basis = "hw-sm §6: 128 of ~152-173 tensor clocks per weight fragment at 32 rows, 160 at 40, inferred; the gemv component's "
+              "own streaming kernel over down_proj's whole placement at 8 to 40 rows",
+     .operator_sets = "root: lock the SM clock (`nvidia-smi -lgc F,F`): the crossover moves with the core clock"},
+    {.benchmark = Benchmark::ProbeMma,
+     .name = "probe_mma",
+     .answers = Question{6},
+     .basis = "hw-sm §3: 8-product blocks, truncation, a 25-bit window and at least 3 carry bits, measured by others [GM §IV] "
+              "on an RTX 3060 and identical on an A100 [FASI]; 256 seeded random probes, every lane's D compared bit for bit "
+              "with engine.mma_model",
+     .operator_sets = std::nullopt},
+    {.benchmark = Benchmark::DeltanetChain,
+     .name = "deltanet_chain",
+     .answers = Question{17},
+     .basis = "prior-art §7: upstream's core ~80 us per layer at 8 slots, its state floor 27 us at 936 GB/s; ~300 clocks per "
+              "token per chain from the review's arithmetic. The deltanet component's chain probes, one-slot prefill and "
+              "8-slot decode core",
+     .operator_sets = "root: lock the SM clock (`nvidia-smi -lgc F,F`)"},
+    {.benchmark = Benchmark::SplitKAttention,
+     .name = "split_k_attention",
+     .answers = Question{21},
+     .basis = "the review's arithmetic only (no hardware source): exact P's two extra PV mmas ride under the kv stream at 3 "
+              "rows per slot and approach the ridge at 5. The attention component's decode core against its one-part twin, "
+              "4096 positions per slot",
+     .operator_sets = std::nullopt},
+    {.benchmark = Benchmark::PrefillGemm,
+     .name = "prefill_gemm",
+     .answers = Question{22},
+     .basis = "prior-art §0: Marlin ~63 TFLOPS at 250 W and FlashAttention-2 54-57 TFLOPS, measured by others; 71 TFLOPS "
+              "ceiling at 1695 MHz datasheet [WP]. The gemv component's prefill gemm over 2048 rows",
+     .operator_sets = "root: `nvidia-smi -pl 400` and the SM clock lock"},
     {.benchmark = Benchmark::StageHandoff,
      .name = "stage_handoff",
      .answers =
@@ -262,6 +302,25 @@ export inline constexpr auto catalogue = std::to_array<Entry>({
          },
      .basis = "the transcendentals header, proven on the host over every fp32 input",
      .operator_sets = std::nullopt},
+    {.benchmark = Benchmark::CheckStageRing,
+     .name = "check_stage_ring",
+     .answers =
+         Primitive{
+             .expected = "zero mismatches; each checked tile well under a microsecond",
+             .settles = "the cp.async ring with mbarrier completion delivers every word in order on the hardware",
+         },
+     .basis = "the stage ring's phase arithmetic, proven on the host; mbarrier and cp.async semantics documented [PTX]",
+     .operator_sets = std::nullopt},
+    {.benchmark = Benchmark::CheckOrder,
+     .name = "check_order",
+     .answers =
+         Primitive{
+             .expected = "zero mismatches",
+             .settles = "release and acquire across SMs, the epoch flags, the peer protocol, the fenced relaxed flag and the "
+                        "remaining primitives hold on the hardware",
+         },
+     .basis = "the memory model's release/acquire and fence.sc semantics, documented [PTX]",
+     .operator_sets = std::nullopt},
 });
 
 static_assert(std::ranges::all_of(std::views::iota(std::size_t{0}, catalogue.size()),
@@ -269,7 +328,7 @@ static_assert(std::ranges::all_of(std::views::iota(std::size_t{0}, catalogue.siz
 	                                  return std::to_underlying(catalogue.at(index).benchmark) == index;
                                   }),
               "the catalogue lists every benchmark once, in the enum's order");
-static_assert(catalogue.size() == std::to_underlying(Benchmark::CheckTranscendentals) + 1U);
+static_assert(catalogue.size() == std::to_underlying(Benchmark::CheckOrder) + 1U);
 
 export [[nodiscard]] constexpr auto entry(Benchmark benchmark) -> Entry const& {
 	return catalogue.at(std::to_underlying(benchmark));
@@ -284,33 +343,6 @@ export [[nodiscard]] constexpr auto parse(std::string_view name) -> std::optiona
 	}
 	return std::nullopt;
 }
-
-/**
- * A measurement that cannot run yet: the kernel it needs belongs to another component and is not built, or cannot be
- * launched as it stands. `question` is the review's number where the measurement answers one.
- */
-export struct Pending {
-	std::string_view name;
-	std::optional<int> question;
-	std::string_view waits_for;
-};
-
-export inline constexpr auto pending = std::to_array<Pending>({
-    {.name = "gemv_rows", .question = 5, .waits_for = "the streaming gemv kernel (ring, sequence-B decode, mma, scale fma) from the gemv lane"},
-    {.name = "mma_model",
-     .question = 6,
-     .waits_for = "prims_probe_mma taking one parameter struct, with its probe layout shared in selfcheck.h (the prims lane); "
-                  "the model it is compared with, engine.mma_model, is on main"},
-    {.name = "deltanet_chain", .question = 17, .waits_for = "the deltanet recurrence and decode-core kernels from the deltanet lane"},
-    {.name = "split_k_attention", .question = 21, .waits_for = "the decode split-k attention kernel with one and three PV mmas from the attention lane"},
-    {.name = "prefill_gemm", .question = 22, .waits_for = "the prefill gemm kernel from the gemv lane"},
-    {.name = "check_stage_ring",
-     .question = std::nullopt,
-     .waits_for = "prims_check_stage_ring taking one parameter struct, which the typed launch requires (the prims lane)"},
-    {.name = "check_order",
-     .question = std::nullopt,
-     .waits_for = "prims_check_order taking one parameter struct, with its scratch layout shared in selfcheck.h (the prims lane)"},
-});
 
 /** One row of the review's microbenchmark table. */
 export struct Row {
@@ -387,45 +419,31 @@ export [[nodiscard]] constexpr auto review() -> Table {
 	return review_table(ubench_device::adversarial);
 }
 
-/** How many benchmarks answer question `number`, and how many pending entries wait to. */
-export struct Answers {
-	std::size_t benchmarks;
-	std::size_t pending;
-};
-
-export [[nodiscard]] constexpr auto answers(int number) -> Answers {
-	auto const answered = std::ranges::count_if(catalogue, [&](Entry const& candidate) {
+/** How many benchmarks answer question `number`. */
+export [[nodiscard]] constexpr auto answers(int number) -> std::size_t {
+	return static_cast<std::size_t>(std::ranges::count_if(catalogue, [&](Entry const& candidate) {
 		auto const* const question = std::get_if<Question>(&candidate.answers);
 		return question != nullptr && question->number == number;
-	});
-	auto const waiting = std::ranges::count(pending, std::optional{number}, &Pending::question);
-	return {.benchmarks = static_cast<std::size_t>(answered), .pending = static_cast<std::size_t>(waiting)};
+	}));
 }
 
 /**
- * Whether `table` and the catalogue agree: every question in the table has exactly one benchmark or exactly one
- * pending entry, never both, and nothing here answers a question the table does not ask.
+ * Whether `table` and the catalogue agree: every question in the table has exactly one benchmark, and no benchmark
+ * answers a question the table does not ask.
  */
 export [[nodiscard]] constexpr auto covers(Table const& table) -> bool {
 	auto const rows = table.view();
-	auto const asked = [&](int number) {
-		return std::ranges::count(rows, number, &Row::question) == 1;
-	};
 	auto const each_once = std::ranges::all_of(rows, [](Row const& row) {
-		auto const found = answers(row.question);
-		return found.benchmarks + found.pending == 1;
+		return answers(row.question) == 1;
 	});
 	auto const no_strays = std::ranges::all_of(catalogue, [&](Entry const& candidate) {
 		auto const* const question = std::get_if<Question>(&candidate.answers);
-		return question == nullptr || asked(question->number);
+		return question == nullptr || std::ranges::count(rows, question->number, &Row::question) == 1;
 	});
-	auto const no_stray_pending = std::ranges::all_of(pending, [&](Pending const& waiting) {
-		return !waiting.question.has_value() || asked(*waiting.question);
-	});
-	return each_once && no_strays && no_stray_pending;
+	return each_once && no_strays;
 }
 
-static_assert(covers(review()), "every question in the review has exactly one benchmark or one pending entry");
+static_assert(covers(review()), "every question in the review has exactly one benchmark");
 
 /** The review's row for question `number`, which the table holds exactly once. */
 export [[nodiscard]] constexpr auto row(Table const& table, int number) -> Row {

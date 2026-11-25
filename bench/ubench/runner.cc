@@ -2,8 +2,7 @@
 //
 // The runner: which benchmarks a command line names, running them in catalogue order over the started machine, and
 // printing each outcome beside the review's expectation, the evidence behind it, the decision it settles and what the
-// operator must have set. The pending list closes every report, so a measurement that could not run is never mistaken
-// for one that passed.
+// operator must have set.
 export module engine.ubench:runner;
 
 import std;
@@ -18,6 +17,7 @@ import :sync;
 import :compute;
 import :link;
 import :checks;
+import :lanes;
 
 namespace engine::ubench {
 
@@ -92,6 +92,16 @@ export [[nodiscard]] auto run(Benchmark benchmark, BenchView const& bench) -> Re
 		return offset_step(bench);
 	case Benchmark::TranscendentalRate:
 		return transcendental_rate(bench);
+	case Benchmark::GemvRows:
+		return gemv_rows(bench);
+	case Benchmark::ProbeMma:
+		return probe_mma(bench);
+	case Benchmark::DeltanetChain:
+		return deltanet_chain(bench);
+	case Benchmark::SplitKAttention:
+		return split_k_attention(bench);
+	case Benchmark::PrefillGemm:
+		return prefill_gemm(bench);
 	case Benchmark::StageHandoff:
 		return stage_handoff(bench);
 	case Benchmark::L2PolicyReuse:
@@ -108,6 +118,10 @@ export [[nodiscard]] auto run(Benchmark benchmark, BenchView const& bench) -> Re
 		return check_reduce(bench);
 	case Benchmark::CheckTranscendentals:
 		return check_transcendentals(bench);
+	case Benchmark::CheckStageRing:
+		return check_stage_ring(bench);
+	case Benchmark::CheckOrder:
+		return check_order(bench);
 	}
 	std::unreachable();
 }
@@ -172,18 +186,6 @@ export void print(Benchmark benchmark, Result<Outcome> const& result, Table cons
 	std::println("verdict:  {}", verdict_name(result->verdict));
 }
 
-/** Prints the measurements that cannot run yet and what each waits for. */
-export void print_pending() {
-	std::println("== pending: measurements that did not run");
-	for (auto const& waiting : pending) {
-		if (waiting.question) {
-			std::println("  {} (U{}): waits for {}", waiting.name, *waiting.question, waiting.waits_for);
-		} else {
-			std::println("  {}: waits for {}", waiting.name, waiting.waits_for);
-		}
-	}
-}
-
 /** Prints the clocks the run starts at: each card's memory clock and p-state, and its calibrated SM clock. */
 export void print_clocks(BenchView const& bench) {
 	for (auto const card : device::card_pair) {
@@ -207,7 +209,7 @@ export [[nodiscard]] auto passed(Result<Outcome> const& result) -> bool {
 
 /**
  * A whole run: starts streams on both cards, calibrates their SM clocks, runs every selected benchmark and prints
- * every report, the pending list last. Whether every selected benchmark ran and none failed.
+ * every report. Whether every selected benchmark ran and none failed.
  */
 export [[nodiscard]] auto run_all(device::Devices const& devices, std::span<Benchmark const> selection) -> Result<bool> {
 	auto zero = lift(devices.context(model::Card::Zero).create_stream());
@@ -229,7 +231,6 @@ export [[nodiscard]] auto run_all(device::Devices const& devices, std::span<Benc
 		print(benchmark, result, table);
 		all_passed = all_passed && passed(result);
 	}
-	print_pending();
 	return all_passed;
 }
 

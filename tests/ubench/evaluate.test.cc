@@ -4,6 +4,7 @@
 // refusals included, each checked against the arithmetic it states.
 import std;
 import engine.device;
+import engine.mma_model;
 import engine.model;
 import engine.prims;
 import engine.testing;
@@ -179,10 +180,14 @@ inline constexpr auto digest_count = static_cast<std::size_t>(selfcheck::functio
 				expected.at(card) += share * 0.125;
 			}
 		}
-		auto const outcome = ubench::evaluate_l2_persistence(cards);
-		holds = holds && outcome && std::abs(outcome->readings.at(0).value - expected[0]) < 1e-9 && std::abs(outcome->readings.at(1).value - expected[1]) < 1e-9;
+		auto const limits = std::array{engine::device::L2Persistence{.max_persisting_bytes = std::uint64_t{4608} * 1024, .max_access_policy_window_bytes = std::uint64_t{128} << 20U},
+		                               engine::device::L2Persistence{.max_persisting_bytes = 0, .max_access_policy_window_bytes = 0}};
+		auto const outcome = ubench::evaluate_l2_persistence(cards, limits);
+		// Per card: the two limits, then the surviving MiB.
+		holds = holds && outcome && near(outcome->readings.at(0).value, 4.5) && near(outcome->readings.at(1).value, 128.0) &&
+		        std::abs(outcome->readings.at(2).value - expected[0]) < 1e-9 && std::abs(outcome->readings.at(5).value - expected[1]) < 1e-9;
 		cards.at(1).cold.at(5) = cards.at(1).hot.at(5);
-		holds = holds && !ubench::evaluate_l2_persistence(cards).has_value();
+		holds = holds && !ubench::evaluate_l2_persistence(cards, limits).has_value();
 	}
 	return holds;
 }
@@ -256,6 +261,98 @@ inline constexpr auto digest_count = static_cast<std::size_t>(selfcheck::functio
 	       near(outcome.readings[1].value, ubench::ldmatrix_measure.operations / 4000.0) && near(outcome.readings[2].value, 4.0);
 }
 
+/**
+ * U6 against the model: results equal to the model's prediction hold, every flipped bit is counted as one differing
+ * result, and all-zero results are no reading.
+ */
+[[nodiscard]] auto mma_probes_are_judged_bit_for_bit(std::uint64_t seed) -> bool {
+	auto random = engine::testing::generator(seed);
+	auto const all = ubench::mma_probes(seed);
+	auto const probes = std::vector<selfcheck::MmaProbe>(all.begin(), all.begin() + 8);
+	auto results = std::vector<engine::device::prims::Accumulator>(probes.size() * 32);
+	for (auto probe = std::size_t{0}; probe < probes.size(); ++probe) {
+		auto operands = engine::mma_model::WarpOperands{};
+		for (auto lane = std::size_t{0}; lane < 32; ++lane) {
+			std::ranges::copy(std::span{std::span{probes[probe].a}[lane].reg}, operands.a.at(lane).begin());
+			std::ranges::copy(std::span{std::span{probes[probe].b}[lane].reg}, operands.b.at(lane).begin());
+			std::ranges::copy(std::span{std::span{probes[probe].c}[lane].reg}, operands.c.at(lane).begin());
+		}
+		auto const model = engine::mma_model::warp_mma(operands);
+		for (auto lane = std::size_t{0}; lane < 32; ++lane) {
+			std::ranges::copy(model.at(lane), std::span{results.at(probe * 32 + lane).reg}.begin());
+		}
+	}
+	auto const agreeing = ubench::evaluate_probe_mma(Card::Zero, probes, results);
+	auto holds = agreeing && agreeing->verdict == Verdict::Holds && agreeing->readings.at(1).value == 0.0;
+	auto flipped = std::set<std::size_t>{};
+	for (auto flip = 0; flip < 20; ++flip) {
+		auto const at = std::uniform_int_distribution<std::size_t>{0, results.size() * 4 - 1}(random);
+		if (flipped.insert(at).second) {
+			auto& value = std::span{results.at(at / 4).reg}[at % 4];
+			value = std::bit_cast<float>(std::bit_cast<std::uint32_t>(value) ^ 1U);
+		}
+	}
+	auto const differing = ubench::evaluate_probe_mma(Card::One, probes, results);
+	holds = holds && differing && differing->verdict == Verdict::Fails && differing->readings.at(1).value == static_cast<double>(flipped.size());
+	auto const zeros = std::vector<engine::device::prims::Accumulator>(probes.size() * 32);
+	return holds && !ubench::evaluate_probe_mma(Card::Zero, probes, zeros).has_value();
+}
+
+/** The probe set is the same for a seed, and its operands are finite: no infinity or nan reaches the model. */
+[[nodiscard]] auto mma_probes_are_fixed_and_finite() -> bool {
+	auto const first = ubench::mma_probes(7);
+	auto const second = ubench::mma_probes(7);
+	auto const finite_bf16 = [](std::uint32_t half) {
+		return (half & 0x7f80U) != 0x7f80U;
+	};
+	auto finite = true;
+	for (auto const& probe : first) {
+		for (auto const& fragment : std::span{probe.a}) {
+			for (auto const reg : std::span{fragment.reg}) {
+				finite = finite && finite_bf16(reg & 0xffffU) && finite_bf16(reg >> 16U);
+			}
+		}
+		for (auto const& accumulator : std::span{probe.c}) {
+			for (auto const value : std::span{accumulator.reg}) {
+				finite = finite && std::isfinite(value);
+			}
+		}
+	}
+	return finite && first.size() == selfcheck::mma_probes &&
+	       std::ranges::equal(std::as_bytes(std::span{first}), std::as_bytes(std::span{second}));
+}
+
+/** A chain probe's latency is the median block's cycles over its token loop per token; an empty loop is no reading. */
+[[nodiscard]] auto chain_latency_is_the_median_block() -> bool {
+	auto counts = std::vector<unsigned long long>{};
+	for (auto block = 0ULL; block < 9; ++block) {
+		counts.push_back(1000 * block);
+		counts.push_back(1000 * block + 1024 * (300 + block));
+	}
+	auto const latency = ubench::cycles_per_token(counts, 9, "probe");
+	counts.at(9) = counts.at(8);
+	return latency && near(*latency, 304.0) && !ubench::cycles_per_token(counts, 9, "probe").has_value();
+}
+
+/** Link versions are shown raw and only noted, never asserted; the start's proof is the verdict. */
+[[nodiscard]] auto link_versions_are_noted_not_asserted() -> bool {
+	using engine::device::NvlinkVersion;
+	auto const link = [](NvlinkVersion version) {
+		return engine::device::NvlinkLinkReading{.version = version, .megabytes_per_second = 14062};
+	};
+	auto const readings = std::array{
+	    ubench::LinkReading{.card = Card::Zero, .links = {link(NvlinkVersion::V3_0), link(NvlinkVersion::V3_0), link(NvlinkVersion::V3_0), link(NvlinkVersion::V3_0)},
+	                        .peer = {.performance_rank = 0, .native_atomics = false}},
+	    ubench::LinkReading{.card = Card::One, .links = {link(NvlinkVersion::V2_2), link(NvlinkVersion::V3_0), link(NvlinkVersion::V3_0), link(NvlinkVersion::V3_0)},
+	                        .peer = {.performance_rank = 0, .native_atomics = true}},
+	};
+	auto const outcome = ubench::evaluate_link_health(readings);
+	auto const flagged = std::ranges::count_if(outcome.notes, [](std::string const& note) {
+		return note.starts_with("card 1: link 0");
+	});
+	return outcome.verdict == Verdict::Holds && flagged == 1 && near(outcome.readings.at(1).value, 14.062) && outcome.readings.at(0).value == 4.0;
+}
+
 }
 
 auto main() -> int {
@@ -273,6 +370,10 @@ auto main() -> int {
 	    engine::testing::Case{.name = "the calibrated clock is the median block", .holds = calibration_is_the_median_block()},
 	    engine::testing::Case{.name = "the folded decode's losses are read per exponent", .holds = folded_losses_are_per_exponent()},
 	    engine::testing::Case{.name = "a pair benchmark compares the engine's form with the alternative", .holds = pairs_compare_the_engine_form()},
+	    engine::testing::Case{.name = "mma probes are judged against the model bit for bit (seed 15)", .holds = mma_probes_are_judged_bit_for_bit(15)},
+	    engine::testing::Case{.name = "the mma probe set is fixed per seed and finite", .holds = mma_probes_are_fixed_and_finite()},
+	    engine::testing::Case{.name = "a chain's latency is the median block's cycles per token", .holds = chain_latency_is_the_median_block()},
+	    engine::testing::Case{.name = "nvlink versions are noted for confirmation, never asserted", .holds = link_versions_are_noted_not_asserted()},
 	};
 	return engine::testing::report(cases);
 }

@@ -21,34 +21,60 @@ namespace shapes = engine::device::ubench::link;
 
 using model::Card;
 
-/** The best initiator time of the flag ping-pong under one wait. */
+/** The best initiator time of the flag ping-pong under one flag flavor and wait. */
 export struct FlagReading {
+	std::string_view kernel;
+	shapes::Flavor flavor;
 	ub::Wait wait;
 	double nanoseconds;
 };
+
+[[nodiscard]] constexpr auto flavor_label(shapes::Flavor flavor) -> std::string_view {
+	switch (flavor) {
+	case shapes::Flavor::ReleaseAcquire:
+		return "st.release.sys / ld.acquire.sys";
+	case shapes::Flavor::Relaxed:
+		return "st.relaxed.sys / ld.relaxed.sys, unordered";
+	case shapes::Flavor::Fenced:
+		return "fence.sc.sys + st.relaxed.sys / ld.relaxed.sys + fence.sc.sys";
+	}
+	std::unreachable();
+}
 
 export [[nodiscard]] auto evaluate_peer_flag(std::span<FlagReading const> readings) -> Result<Outcome> {
 	auto outcome = Outcome{.readings = {}, .verdict = Verdict::Measured, .notes = {}};
 	for (auto const& reading : readings) {
 		if (!(reading.nanoseconds > 0.0)) {
-			return no_reading(kernels::FlagKernel<kernels::FlagEnd::Ping, ub::Wait::Spin>::entry, "the initiator timed nothing");
+			return no_reading(reading.kernel, "the initiator timed nothing");
 		}
-		outcome.readings.push_back({.label = std::format("one-way flag handoff card 0 <-> card 1, st.release.sys / ld.acquire.sys, {}",
+		outcome.readings.push_back({.label = std::format("one-way flag handoff card 0 <-> card 1, {}, {}", flavor_label(reading.flavor),
 		                                                 reading.wait == ub::Wait::Backoff ? "production backoff" : "spinning"),
 		                            .value = reading.nanoseconds / static_cast<double>(shapes::flag_iterations) / 2.0,
 		                            .unit = Unit::Nanoseconds});
 	}
-	outcome.notes.emplace_back("relaxed and fence.sc.sys flags are not measured: the prims component has no relaxed system-scope store or "
-	                           "load and no fence.sc.sys primitive");
+	outcome.notes.emplace_back("the relaxed flags are the hardware's floor; release over relaxed is what ordering costs, fenced the "
+	                           "protocol the engine does not use");
 	return outcome;
 }
 
+/** The flag variants measured, in order: the engine's own (with its backoff, then spinning), and the two comparisons. */
+template<shapes::Flavor flavor_, ub::Wait wait_>
+struct FlagVariant {
+	static constexpr shapes::Flavor flavor = flavor_;
+	static constexpr ub::Wait wait = wait_;
+	using Ping = kernels::FlagKernel<kernels::FlagEnd::Ping, flavor, wait>;
+	using Pong = kernels::FlagKernel<kernels::FlagEnd::Pong, flavor, wait>;
+};
+
+using FlagVariants = std::tuple<FlagVariant<shapes::Flavor::ReleaseAcquire, ub::Wait::Backoff>, FlagVariant<shapes::Flavor::ReleaseAcquire, ub::Wait::Spin>,
+                                FlagVariant<shapes::Flavor::Relaxed, ub::Wait::Spin>, FlagVariant<shapes::Flavor::Fenced, ub::Wait::Spin>>;
+
 /** Launches the answering end on card 1, then the initiator on card 0, and waits for both. */
-template<ub::Wait wait, class PingProgram, class PongProgram>
+template<class Variant, class PingProgram, class PongProgram>
 [[nodiscard]] auto flag_round(BenchView const& bench, PingProgram const& ping, PongProgram const& pong, std::array<Readback<unsigned long long, 1>, model::cards>& flags,
                               Readback<unsigned long long, 1>& nanoseconds, kernels::Nanoseconds const& answer_time) -> Result<double> {
-	using Ping = kernels::FlagKernel<kernels::FlagEnd::Ping, wait>;
-	using Pong = kernels::FlagKernel<kernels::FlagEnd::Pong, wait>;
+	using Ping = Variant::Ping;
+	using Pong = Variant::Pong;
 	auto const zero = bench.card(Card::Zero);
 	auto const one = bench.card(Card::One);
 	auto& zero_flag = flags.at(0);
@@ -78,14 +104,18 @@ template<ub::Wait wait, class PingProgram, class PongProgram>
 }
 
 export [[nodiscard]] auto peer_flag(BenchView const& bench) -> Result<Outcome> {
-	using PingBackoff = kernels::FlagKernel<kernels::FlagEnd::Ping, ub::Wait::Backoff>;
-	using PingSpin = kernels::FlagKernel<kernels::FlagEnd::Ping, ub::Wait::Spin>;
-	using PongBackoff = kernels::FlagKernel<kernels::FlagEnd::Pong, ub::Wait::Backoff>;
-	using PongSpin = kernels::FlagKernel<kernels::FlagEnd::Pong, ub::Wait::Spin>;
 	auto const& zero = bench.card(Card::Zero).context;
 	auto const& one = bench.card(Card::One).context;
-	auto const ping = lift(zero.load<PingBackoff, PingSpin>());
-	auto const pong = lift(one.load<PongBackoff, PongSpin>());
+	auto const ping = std::apply(
+	    [&](auto... variants) {
+		    return lift(zero.load<typename decltype(variants)::Ping...>());
+	    },
+	    FlagVariants{});
+	auto const pong = std::apply(
+	    [&](auto... variants) {
+		    return lift(one.load<typename decltype(variants)::Pong...>());
+	    },
+	    FlagVariants{});
 	auto zero_flag = Readback<unsigned long long, 1>::create(zero);
 	auto one_flag = Readback<unsigned long long, 1>::create(one);
 	auto nanoseconds = Readback<unsigned long long, 1>::create(zero);
@@ -95,10 +125,11 @@ export [[nodiscard]] auto peer_flag(BenchView const& bench) -> Result<Outcome> {
 	}
 	auto flags = std::array{std::move(*zero_flag), std::move(*one_flag)};
 	auto readings = std::vector<FlagReading>{};
-	auto const measure = [&]<ub::Wait wait> -> Result<void> {
+	auto const ran = for_each_shape<FlagVariants>([&](auto variant) -> Result<void> {
+		using Variant = decltype(variant);
 		auto best = std::numeric_limits<double>::infinity();
 		for (auto launch = 0; launch < warmup_launches + timed_launches; ++launch) {
-			auto const took = flag_round<wait>(bench, *ping, *pong, flags, *nanoseconds, *answer_time);
+			auto const took = flag_round<Variant>(bench, *ping, *pong, flags, *nanoseconds, *answer_time);
 			if (!took) {
 				return std::unexpected(took.error());
 			}
@@ -106,11 +137,8 @@ export [[nodiscard]] auto peer_flag(BenchView const& bench) -> Result<Outcome> {
 				best = std::min(best, *took);
 			}
 		}
-		readings.push_back({.wait = wait, .nanoseconds = best});
+		readings.push_back({.kernel = Variant::Ping::entry, .flavor = Variant::flavor, .wait = Variant::wait, .nanoseconds = best});
 		return {};
-	};
-	auto const ran = measure.template operator()<ub::Wait::Backoff>().and_then([&] {
-		return measure.template operator()<ub::Wait::Spin>();
 	});
 	if (!ran) {
 		return std::unexpected(ran.error());
@@ -171,8 +199,8 @@ export [[nodiscard]] auto peer_push(BenchView const& bench) -> Result<Outcome> {
 	auto const pushes = lift(load_exchange<PushOf>(zero.context));
 	auto const pulls = lift(load_exchange<PullOf>(one.context));
 	auto const receivers = lift(one.context.load<kernels::ReceiveKernel<4>, kernels::ReceiveKernel<16>, kernels::ReceiveKernel<64>>());
-	auto const receive = scratch<ub::Word4, shapes::receive_chunks>(one.context);
-	auto const send = scratch<ub::Word4, shapes::receive_chunks>(zero.context);
+	auto const receive = scratch<ub::Chunk, shapes::receive_chunks>(one.context);
+	auto const send = scratch<ub::Chunk, shapes::receive_chunks>(zero.context);
 	auto const sinks = scratch<unsigned, shapes::max_senders>(one.context);
 	auto flags = Readback<unsigned long long, shapes::max_senders>::create(one.context);
 	auto go = Readback<unsigned long long, 1>::create(zero.context);
@@ -264,9 +292,9 @@ export [[nodiscard]] auto release_cost(BenchView const& bench) -> Result<Outcome
 		auto const program = lift(view.context.load<ReleaseOf<shapes::Background::Idle>, ReleaseOf<shapes::Background::PeerStores>,
 		                                             ReleaseOf<shapes::Background::HostWrites>>());
 		auto const flag = scratch<unsigned long long, 1>(view.context);
-		auto const release_scratch = scratch<ub::Word4, ub::sms>(view.context);
-		auto const peer_slots = scratch<ub::Word4, static_cast<std::size_t>(ub::sms) * shapes::background_chunks>(peer);
-		auto const host = lift(view.context.allocate_mapped<ub::Word4, static_cast<std::size_t>(ub::sms) * shapes::background_chunks>());
+		auto const release_scratch = scratch<ub::Chunk, ub::sms>(view.context);
+		auto const peer_slots = scratch<ub::Chunk, static_cast<std::size_t>(ub::sms) * shapes::background_chunks>(peer);
+		auto const host = lift(view.context.allocate_mapped<ub::Chunk, static_cast<std::size_t>(ub::sms) * shapes::background_chunks>());
 		auto stop = Readback<unsigned long long, 1>::create(view.context);
 		auto cycles = Readback<unsigned long long, 1>::create(view.context);
 		if (auto const failed = first_failure(program, flag, release_scratch, peer_slots, host, stop, cycles)) {
@@ -309,18 +337,64 @@ export [[nodiscard]] auto release_cost(BenchView const& bench) -> Result<Outcome
 	});
 }
 
+/** What the management library and the driver say about one card's links and its path to the peer. */
+export struct LinkReading {
+	Card card;
+	std::array<device::NvlinkLinkReading, device::nvlink_links> links;
+	device::PeerFacts peer;
+};
+
+/** The nvlink version a 3090's links report as NVML numbers it; older drivers report the bare major version 3. */
+inline constexpr auto expected_version = device::NvlinkVersion::V3_0;
+
 /**
- * The link facts the engine's start proved before any benchmark ran: every nvlink link of each card is up and leads to
- * the other card, and each card maps the other's memory. A machine without them never reaches the runner.
+ * The link facts. The engine's start already proved every link up and joined to the peer and the peer mapped both
+ * ways, or the runner would not be running: that is the verdict. Versions are shown raw, because NVML's numbering of
+ * them is inferred and bring-up confirms it; native atomics are shown because the engine must not need them.
  */
-export [[nodiscard]] auto link_health(BenchView const& /*bench*/) -> Result<Outcome> {
+export [[nodiscard]] auto evaluate_link_health(std::span<LinkReading const> readings) -> Outcome {
 	auto outcome = Outcome{.readings = {}, .verdict = Verdict::Holds, .notes = {}};
-	for (auto const card : device::card_pair) {
-		outcome.readings.push_back({.label = std::format("{}, nvlink links up and joined to the peer", on(card)), .value = static_cast<double>(device::nvlink_links), .unit = Unit::Count});
+	for (auto const& reading : readings) {
+		auto const card = reading.card;
+		for (auto link = std::size_t{0}; link < reading.links.size(); ++link) {
+			auto const& found = reading.links.at(link);
+			outcome.readings.push_back({.label = std::format("{}, link {} version, raw NVML value", on(card), link),
+			                            .value = static_cast<double>(std::to_underlying(found.version)),
+			                            .unit = Unit::Count});
+			if (found.megabytes_per_second) {
+				outcome.readings.push_back({.label = std::format("{}, link {} speed", on(card), link),
+				                            .value = static_cast<double>(*found.megabytes_per_second) / 1000.0,
+				                            .unit = Unit::GigabytesPerSecond});
+			} else {
+				outcome.notes.push_back(std::format("{}: NVML has no speed field for link {}", on(card), link));
+			}
+			if (found.version != expected_version) {
+				outcome.notes.push_back(std::format("{}: link {} reads version {}, not {} (nvlink 3.0 as nvml.h numbers it); confirm at bring-up", on(card), link,
+				                                    std::to_underlying(found.version), std::to_underlying(expected_version)));
+			}
+		}
+		outcome.readings.push_back({.label = std::format("{}, peer path performance rank", on(card)), .value = static_cast<double>(reading.peer.performance_rank), .unit = Unit::Count});
+		outcome.readings.push_back({.label = std::format("{}, native peer atomics (1 yes, 0 no)", on(card)), .value = reading.peer.native_atomics ? 1.0 : 0.0, .unit = Unit::Count});
 	}
-	outcome.notes.emplace_back("peer access maps each card's memory into the other's both ways; link speed and the p2p attributes (native "
-	                           "atomics, performance rank) are for nvidia-smi by hand");
+	outcome.notes.emplace_back("every link up and joined to the peer, and the peer mapped both ways, were proved by the engine's start; "
+	                           "the engine uses no peer atomics whatever the attribute says");
 	return outcome;
+}
+
+export [[nodiscard]] auto link_health(BenchView const& bench) -> Result<Outcome> {
+	auto readings = std::vector<LinkReading>{};
+	auto const ran = for_each_card([&](Card card) -> Result<void> {
+		auto const links = lift(bench.devices.nvlinks(card));
+		auto const peer = lift(bench.devices.peer_facts(card));
+		if (auto const failed = first_failure(links, peer)) {
+			return std::unexpected(*failed);
+		}
+		readings.push_back({.card = card, .links = *links, .peer = *peer});
+		return {};
+	});
+	return ran.transform([&] {
+		return evaluate_link_health(readings);
+	});
 }
 
 /** One fetch shape's best time on one card. */
@@ -421,7 +495,7 @@ export [[nodiscard]] auto host_fetch(BenchView const& bench) -> Result<Outcome> 
 			    return lift(view.context.load<decltype(kernels_of_sweep)...>());
 		    },
 		    kernels::FetchSweep{});
-		auto const table = lift(view.context.allocate_mapped<ub::Word4, shapes::table_chunks>());
+		auto const table = lift(view.context.allocate_mapped<ub::Chunk, shapes::table_chunks>());
 		auto reading = Readback<shapes::FetchReading, 1>::create(view.context);
 		if (auto const failed = first_failure(program, table, reading)) {
 			return std::unexpected(*failed);

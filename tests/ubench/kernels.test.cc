@@ -54,6 +54,7 @@ template<template<class> class Kernel, class Rows>
 	using ub::Wait;
 	using ub::compute::Mix;
 	using ub::link::Background;
+	using ub::link::Flavor;
 	using engine::device::prims::selfcheck::Function;
 	auto const stream = sweep_loads<kernels::ReadKernel, kernels::ReadSweep>(context) &&
 	                    loads<kernels::ReadKernel<kernels::RowMajorRead>, kernels::SustainKernel, kernels::L2PrefetchKernel, kernels::L2ProbeKernel,
@@ -70,8 +71,12 @@ template<template<class> class Kernel, class Rows>
 	          kernels::LdmatrixKernel<ub::compute::Swizzle::Xor>, kernels::LdmatrixKernel<ub::compute::Swizzle::None>,
 	          kernels::PipelineKernel<ub::compute::Pipelining::Double>, kernels::PipelineKernel<ub::compute::Pipelining::Sequential>,
 	          kernels::ReductionKernel<ub::compute::Reduction::FloatButterfly>, kernels::ReductionKernel<ub::compute::Reduction::IntegerRedux>>(context);
-	auto const link = loads<kernels::FlagKernel<kernels::FlagEnd::Ping, Wait::Backoff>, kernels::FlagKernel<kernels::FlagEnd::Ping, Wait::Spin>,
-	                        kernels::FlagKernel<kernels::FlagEnd::Pong, Wait::Backoff>, kernels::FlagKernel<kernels::FlagEnd::Pong, Wait::Spin>,
+	auto const link = loads<kernels::FlagKernel<kernels::FlagEnd::Ping, Flavor::ReleaseAcquire, Wait::Backoff>,
+	                        kernels::FlagKernel<kernels::FlagEnd::Ping, Flavor::ReleaseAcquire, Wait::Spin>,
+	                        kernels::FlagKernel<kernels::FlagEnd::Ping, Flavor::Relaxed, Wait::Spin>, kernels::FlagKernel<kernels::FlagEnd::Ping, Flavor::Fenced, Wait::Spin>,
+	                        kernels::FlagKernel<kernels::FlagEnd::Pong, Flavor::ReleaseAcquire, Wait::Backoff>,
+	                        kernels::FlagKernel<kernels::FlagEnd::Pong, Flavor::ReleaseAcquire, Wait::Spin>,
+	                        kernels::FlagKernel<kernels::FlagEnd::Pong, Flavor::Relaxed, Wait::Spin>, kernels::FlagKernel<kernels::FlagEnd::Pong, Flavor::Fenced, Wait::Spin>,
 	                        kernels::ReceiveKernel<4>, kernels::ReceiveKernel<16>, kernels::ReceiveKernel<64>, kernels::ReleaseKernel<Background::Idle>,
 	                        kernels::ReleaseKernel<Background::PeerStores>, kernels::ReleaseKernel<Background::HostWrites>, kernels::MailboxKernel>(context) &&
 	                  rows_load<kernels::PushKernel, kernels::PushSweep>(context) && rows_load<kernels::PullKernel, kernels::PushSweep>(context) &&
@@ -80,8 +85,15 @@ template<template<class> class Kernel, class Rows>
 		                      return loads<decltype(fetches)...>(context);
 	                      },
 	                      kernels::FetchSweep{});
-	auto const checks = loads<kernels::CheckDecodeKernel, kernels::CheckFragmentsKernel, kernels::CheckReduceKernel, kernels::DigestKernel>(context);
-	return stream && sync && compute && link && checks && driver.violations().empty();
+	auto const checks = loads<kernels::CheckDecodeKernel, kernels::CheckFragmentsKernel, kernels::CheckReduceKernel, kernels::DigestKernel,
+	                          kernels::ProbeMmaKernel, kernels::StageRingCheckKernel, kernels::OrderCheckKernel>(context);
+	auto const gemv = std::apply(
+	                      [&](auto... sweep) {
+		                      return loads<decltype(sweep)...>(context);
+	                      },
+	                      kernels::GemvSweep{}) &&
+	                  loads<kernels::GemmPrefillKernel<kernels::PrefillMatrix::Down>, kernels::GemmPrefillKernel<kernels::PrefillMatrix::GateUp>>(context);
+	return stream && sync && compute && link && checks && gemv && driver.violations().empty();
 }
 
 template<class K>
@@ -108,6 +120,12 @@ static_assert(recorded_as_declared<kernels::HopKernel<ub::Wait::Spin>>() && reco
 static_assert(recorded_as_declared<kernels::DecodeFoldedKernel>() && recorded_as_declared<kernels::TensorKernel<ub::compute::Mix::Mma>>());
 static_assert(recorded_as_declared<kernels::ReleaseKernel<ub::link::Background::HostWrites>>() && recorded_as_declared<kernels::ReceiveKernel<64>>());
 static_assert(recorded_as_declared<kernels::DigestKernel>());
+
+// The prims component's self-check budgets, which the host takes from its shared header, are the ones its kernels
+// record: the header and the kernels cannot have drifted apart.
+static_assert(recorded_as_declared<kernels::CheckDecodeKernel>() && recorded_as_declared<kernels::CheckFragmentsKernel>());
+static_assert(recorded_as_declared<kernels::CheckReduceKernel>() && recorded_as_declared<kernels::ProbeMmaKernel>());
+static_assert(recorded_as_declared<kernels::StageRingCheckKernel>() && recorded_as_declared<kernels::OrderCheckKernel>());
 
 /** The same law at run time over every declared stall and exchange kernel. */
 [[nodiscard]] auto every_budget_is_its_record() -> bool {

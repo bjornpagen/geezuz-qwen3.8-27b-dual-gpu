@@ -8,13 +8,12 @@ namespace {
 namespace ubench = engine::ubench;
 using ubench::Benchmark;
 
-/** Every question the review's table asks has exactly one benchmark or exactly one pending entry, never both. */
+/** Every question the review's table asks has exactly one benchmark. */
 [[nodiscard]] auto every_question_is_answered_once() -> bool {
 	auto const table = ubench::review();
 	auto const rows = table.view();
 	auto const once = std::ranges::all_of(rows, [](ubench::Row const& row) {
-		auto const found = ubench::answers(row.question);
-		return found.benchmarks + found.pending == 1;
+		return ubench::answers(row.question) == 1;
 	});
 	return !rows.empty() && once && ubench::covers(table);
 }
@@ -43,7 +42,7 @@ using ubench::Benchmark;
 
 /**
  * Coverage fails for every way the table and the catalogue can disagree: a question dropped from the table (its
- * benchmark or pending entry is then a stray), a question added that nothing answers, and a question listed twice;
+ * benchmark is then a stray), a question added that nothing answers, and a question listed twice;
  * rows after the section's end do not count.
  */
 [[nodiscard]] auto coverage_rejects_every_disagreement(std::uint64_t seed) -> bool {
@@ -103,26 +102,17 @@ using ubench::Benchmark;
 	return holds;
 }
 
-/** Pending entries are named once each and say what they wait for. */
-[[nodiscard]] auto pending_entries_are_distinct_and_explained() -> bool {
-	return std::ranges::all_of(ubench::pending, [](ubench::Pending const& waiting) {
-		return !waiting.waits_for.empty() && std::ranges::count(ubench::pending, waiting.name, &ubench::Pending::name) == 1 &&
-		       !ubench::parse(waiting.name).has_value();
-	});
-}
-
 }
 
 auto main() -> int {
 	auto const cases = std::array{
-	    engine::testing::Case{.name = "every question in the review has exactly one benchmark or one pending entry", .holds = every_question_is_answered_once()},
+	    engine::testing::Case{.name = "every question in the review has exactly one benchmark", .holds = every_question_is_answered_once()},
 	    engine::testing::Case{.name = "the embedded review's table parses to U1..U22 with every column", .holds = the_review_table_parses_whole()},
 	    engine::testing::Case{.name = "coverage fails for a dropped, doubled or unanswered question (seed 1)", .holds = coverage_rejects_every_disagreement(1)},
 	    engine::testing::Case{.name = "coverage fails for a dropped, doubled or unanswered question (seed 2)", .holds = coverage_rejects_every_disagreement(2)},
 	    engine::testing::Case{.name = "every benchmark name parses back to it and nothing else parses", .holds = names_round_trip()},
 	    engine::testing::Case{.name = "a selection is a set in catalogue order, refused whole on an unknown name (seed 3)",
 	                          .holds = selection_is_a_set_in_catalogue_order(3)},
-	    engine::testing::Case{.name = "pending entries are distinct, explained and not benchmark names", .holds = pending_entries_are_distinct_and_explained()},
 	};
 	return engine::testing::report(cases);
 }

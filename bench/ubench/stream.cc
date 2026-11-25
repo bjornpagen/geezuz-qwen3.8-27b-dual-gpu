@@ -91,7 +91,7 @@ export [[nodiscard]] auto read_stream(BenchView const& bench) -> Result<Outcome>
 	auto const ran = for_each_card([&](model::Card card) -> Result<void> {
 		auto const view = bench.card(card);
 		auto const program = lift(load_sweep<kernels::ReadKernel, kernels::ReadSweep>(view.context));
-		auto const source = scratch<ub::Word4, shapes::chunks>(view.context);
+		auto const source = scratch<ub::Chunk, shapes::chunks>(view.context);
 		if (auto const failed = first_failure(program, source)) {
 			return std::unexpected(*failed);
 		}
@@ -137,7 +137,7 @@ export [[nodiscard]] auto tile_layout(BenchView const& bench) -> Result<Outcome>
 	auto const ran = for_each_card([&](model::Card card) -> Result<void> {
 		auto const view = bench.card(card);
 		auto const program = lift(view.context.load<CanonicalKernel, RowMajorKernel>());
-		auto const source = scratch<ub::Word4, shapes::chunks>(view.context);
+		auto const source = scratch<ub::Chunk, shapes::chunks>(view.context);
 		if (auto const failed = first_failure(program, source)) {
 			return std::unexpected(*failed);
 		}
@@ -195,7 +195,7 @@ export [[nodiscard]] auto memory_clock(BenchView const& bench) -> Result<Outcome
 	auto const loaded = for_each_card([&](model::Card card) -> Result<void> {
 		auto const view = bench.card(card);
 		auto program = lift(view.context.load<CanonicalKernel>());
-		auto source = scratch<ub::Word4, shapes::chunks>(view.context);
+		auto source = scratch<ub::Chunk, shapes::chunks>(view.context);
 		if (auto const failed = first_failure(program, source)) {
 			return std::unexpected(*failed);
 		}
@@ -250,7 +250,7 @@ export [[nodiscard]] auto offset_step(BenchView const& bench) -> Result<Outcome>
 	auto const ran = for_each_card([&](model::Card card) -> Result<void> {
 		auto const view = bench.card(card);
 		auto const program = lift(view.context.load<CanonicalKernel>());
-		auto const source = scratch<ub::Word4, shapes::chunks>(view.context);
+		auto const source = scratch<ub::Chunk, shapes::chunks>(view.context);
 		if (auto const failed = first_failure(program, source)) {
 			return std::unexpected(*failed);
 		}
@@ -278,9 +278,15 @@ export struct SegmentTimes {
  * How much of the evict-last region survived the stream: each segment's share of the way from cold back to hot, in
  * MiB. A segment whose cold read is not slower than its hot read gives no contrast to measure against.
  */
-export [[nodiscard]] auto evaluate_l2_persistence(std::span<SegmentTimes const> cards) -> Result<Outcome> {
+export [[nodiscard]] auto evaluate_l2_persistence(std::span<SegmentTimes const> cards, std::span<device::L2Persistence const> limits) -> Result<Outcome> {
 	auto outcome = Outcome{.readings = {}, .verdict = Verdict::Measured, .notes = {}};
 	for (auto const card : device::card_pair) {
+		auto const& limit = limits[std::to_underlying(card)];
+		constexpr auto mebibyte = 1024.0 * 1024.0;
+		outcome.readings.push_back({.label = std::format("{}, the driver's persisting-l2 limit", on(card)), .value = static_cast<double>(limit.max_persisting_bytes) / mebibyte, .unit = Unit::Mebibytes});
+		outcome.readings.push_back({.label = std::format("{}, the driver's access-policy window limit", on(card)),
+		                            .value = static_cast<double>(limit.max_access_policy_window_bytes) / mebibyte,
+		                            .unit = Unit::Mebibytes});
 		auto const& times = cards[std::to_underlying(card)];
 		auto surviving = 0.0;
 		for (auto segment = std::size_t{0}; segment < times.hot.size(); ++segment) {
@@ -327,9 +333,9 @@ export [[nodiscard]] auto l2_persistence(BenchView const& bench) -> Result<Outco
 		auto const view = bench.card(card);
 		auto const program = lift(view.context.load<PrefetchKernel, ProbeKernel>());
 		auto const stream = lift(view.context.load<CanonicalKernel>());
-		auto const fetched = scratch<ub::Word4, ub::l2::region_chunks>(view.context);
-		auto const untouched = scratch<ub::Word4, ub::l2::region_chunks>(view.context);
-		auto const source = scratch<ub::Word4, shapes::chunks>(view.context);
+		auto const fetched = scratch<ub::Chunk, ub::l2::region_chunks>(view.context);
+		auto const untouched = scratch<ub::Chunk, ub::l2::region_chunks>(view.context);
+		auto const source = scratch<ub::Chunk, shapes::chunks>(view.context);
 		auto cycles = Readback<ub::Rate, ub::l2::segments>::create(view.context);
 		if (auto const failed = first_failure(program, stream, fetched, untouched, source, cycles)) {
 			return std::unexpected(*failed);
@@ -368,7 +374,16 @@ export [[nodiscard]] auto l2_persistence(BenchView const& bench) -> Result<Outco
 	if (!ran) {
 		return std::unexpected(ran.error());
 	}
-	return evaluate_l2_persistence(cards);
+	auto limits = std::vector<device::L2Persistence>{};
+	auto const read = for_each_card([&](model::Card card) {
+		return lift(bench.devices.l2_persistence(card)).transform([&](device::L2Persistence limit) {
+			limits.push_back(limit);
+		});
+	});
+	if (!read) {
+		return std::unexpected(read.error());
+	}
+	return evaluate_l2_persistence(cards, limits);
 }
 
 /** One stall sweep point on one card, in milliseconds. */
@@ -408,7 +423,7 @@ export [[nodiscard]] auto ring_stall(BenchView const& bench) -> Result<Outcome> 
 	auto points = std::vector<StallPoint>{};
 	auto const ran = for_each_card([&](model::Card card) -> Result<void> {
 		auto const view = bench.card(card);
-		auto const source = scratch<ub::Word4, shapes::chunks>(view.context);
+		auto const source = scratch<ub::Chunk, shapes::chunks>(view.context);
 		if (!source) {
 			return std::unexpected(source.error());
 		}
@@ -444,22 +459,84 @@ export [[nodiscard]] auto launch_megahertz(std::span<ub::Clocks const> blocks) -
 	return median(std::move(rates));
 }
 
-/** Each card's SM clock launch by launch through the soak. */
-export [[nodiscard]] auto evaluate_sustained_clock(std::span<std::vector<double> const, model::cards> megahertz) -> Outcome {
+/** How long the decode-like load runs: the soak a clock lock is accepted over. */
+export inline constexpr std::chrono::minutes soak = std::chrono::minutes{10};
+/** Launches between two management readings of power and clock. */
+inline constexpr int telemetry_period = 256;
+
+/** What the management library says about one card through the soak. */
+export struct SoakTelemetry {
+	/** The SM clock NVML reports, sampled through the soak, in MHz. */
+	std::vector<double> sm_megahertz;
+	/** The power draw sampled through the soak, in watts. */
+	std::vector<double> draw_watts;
+	/** The power limit the driver enforces, in watts. */
+	double limit_watts;
+	/** How long the software power cap held the clocks down during the soak; absent where NVML does not count it. */
+	std::optional<std::chrono::nanoseconds> power_capped;
+	/** Whether the software power cap was holding the clocks down when the soak ended. */
+	bool capped_at_end;
+};
+
+/** Each card's SM clock launch by launch through the soak, measured on the card, beside what NVML reported. */
+export [[nodiscard]] auto evaluate_sustained_clock(std::span<std::vector<double> const, model::cards> megahertz,
+                                                   std::span<SoakTelemetry const, model::cards> telemetry) -> Outcome {
 	auto outcome = Outcome{.readings = {}, .verdict = Verdict::Measured, .notes = {}};
 	for (auto const card : device::card_pair) {
 		auto const& series = megahertz[std::to_underlying(card)];
-		core::invariant(!series.empty());
+		auto const& seen = telemetry[std::to_underlying(card)];
+		core::invariant(!series.empty() && !seen.sm_megahertz.empty() && !seen.draw_watts.empty());
 		auto const settled = std::vector<double>(series.begin() + static_cast<std::ptrdiff_t>(series.size() / 2), series.end());
 		outcome.readings.push_back({.label = std::format("{}, first launch", on(card)), .value = series.front(), .unit = Unit::Megahertz});
 		outcome.readings.push_back({.label = std::format("{}, lowest launch", on(card)), .value = std::ranges::min(series), .unit = Unit::Megahertz});
 		outcome.readings.push_back({.label = std::format("{}, median of the second half", on(card)), .value = median(settled), .unit = Unit::Megahertz});
+		outcome.readings.push_back({.label = std::format("{}, NVML's SM clock, median sample", on(card)), .value = median(seen.sm_megahertz), .unit = Unit::Megahertz});
+		outcome.readings.push_back({.label = std::format("{}, highest power draw sampled", on(card)), .value = std::ranges::max(seen.draw_watts), .unit = Unit::Watts});
+		outcome.readings.push_back({.label = std::format("{}, enforced power limit", on(card)), .value = seen.limit_watts, .unit = Unit::Watts});
+		if (seen.power_capped) {
+			auto const capped = std::chrono::duration<double, std::milli>{*seen.power_capped}.count();
+			outcome.readings.push_back({.label = std::format("{}, time the software power cap held the clocks during the soak", on(card)), .value = capped, .unit = Unit::Milliseconds});
+			if (capped > 0.0) {
+				outcome.notes.push_back(std::format("{}: the power cap engaged; a lock at this clock would be undone by throttling", on(card)));
+			}
+		} else {
+			outcome.notes.push_back(std::format("{}: NVML does not count software power capping on this card; read clocks_event_reasons_counters by hand", on(card)));
+		}
+		if (seen.capped_at_end) {
+			outcome.notes.push_back(std::format("{}: the software power cap was holding the clocks when the soak ended", on(card)));
+		}
 	}
-	outcome.notes.emplace_back("the lock is one step below the second half's median, if the sw_power_cap counter stayed flat");
+	outcome.notes.emplace_back("the lock is one step below the second half's median, if the power cap's counter stayed flat");
 	return outcome;
 }
 
 using kernels::SustainKernel;
+
+/** The cumulative software power-cap time of each card now, absent where NVML does not count it. */
+[[nodiscard]] auto power_capped(BenchView const& bench) -> Result<std::array<std::optional<std::chrono::nanoseconds>, model::cards>> {
+	auto counted = std::array<std::optional<std::chrono::nanoseconds>, model::cards>{};
+	auto const read = for_each_card([&](model::Card card) {
+		return lift(bench.devices.clocks_event_counters(card)).transform([&](device::ClocksEventCounters counters) {
+			counted.at(std::to_underlying(card)) = counters.sw_power_cap;
+		});
+	});
+	return read.transform([&] {
+		return counted;
+	});
+}
+
+/** One sample of a card's NVML clock and power draw into its telemetry. */
+[[nodiscard]] auto sample(BenchView const& bench, model::Card card, SoakTelemetry& telemetry) -> Result<void> {
+	auto const clock = lift(bench.devices.sm_clock(card));
+	auto const power = lift(bench.devices.power(card));
+	if (auto const failed = first_failure(clock, power)) {
+		return std::unexpected(*failed);
+	}
+	telemetry.sm_megahertz.push_back(static_cast<double>(clock->megahertz));
+	telemetry.draw_watts.push_back(static_cast<double>(power->draw_milliwatts) / 1000.0);
+	telemetry.limit_watts = static_cast<double>(power->limit_milliwatts) / 1000.0;
+	return {};
+}
 
 export [[nodiscard]] auto sustained_clock(BenchView const& bench) -> Result<Outcome> {
 	struct Card {
@@ -471,7 +548,7 @@ export [[nodiscard]] auto sustained_clock(BenchView const& bench) -> Result<Outc
 	auto const set_up = for_each_card([&](model::Card card) -> Result<void> {
 		auto const& context = bench.card(card).context;
 		auto program = lift(context.load<SustainKernel>());
-		auto source = scratch<ub::Word4, shapes::chunks>(context);
+		auto source = scratch<ub::Chunk, shapes::chunks>(context);
 		auto clocks = Readback<ub::Clocks, ub::sms>::create(context);
 		if (auto const failed = first_failure(program, source, clocks)) {
 			return std::unexpected(*failed);
@@ -479,18 +556,31 @@ export [[nodiscard]] auto sustained_clock(BenchView const& bench) -> Result<Outc
 		cards.push_back({.program = std::move(*program), .source = std::move(*source), .clocks = std::move(*clocks)});
 		return {};
 	});
-	if (!set_up) {
-		return std::unexpected(set_up.error());
+	auto const before = set_up.and_then([&] {
+		return power_capped(bench);
+	});
+	if (!before) {
+		return std::unexpected(before.error());
 	}
 	auto megahertz = std::array<std::vector<double>, model::cards>{};
-	for (auto launch = 0; launch < shapes::Sustain::launches; ++launch) {
+	auto telemetry = std::array<SoakTelemetry, model::cards>{};
+	auto const until = std::chrono::steady_clock::now() + soak;
+	for (auto launch = 0; std::chrono::steady_clock::now() < until; ++launch) {
 		// Both cards run at once, as they do in the engine: each card's power and clock are its own.
 		auto const queued = for_each_card([&](model::Card card) {
 			auto const& mine = cards.at(std::to_underlying(card));
 			auto const view = bench.card(card);
 			return lift(kernels::launch<SustainKernel>(view.context, mine.program, view.stream, mine.source, mine.clocks.device()));
 		});
-		auto const read = queued.and_then([&] {
+		auto const sampled = queued.and_then([&] {
+			return for_each_card([&](model::Card card) -> Result<void> {
+				if (launch % telemetry_period != 0) {
+					return {};
+				}
+				return sample(bench, card, telemetry.at(std::to_underlying(card)));
+			});
+		});
+		auto const read = sampled.and_then([&] {
 			return for_each_card([&](model::Card card) {
 				auto& mine = cards.at(std::to_underlying(card));
 				auto const view = bench.card(card);
@@ -510,7 +600,24 @@ export [[nodiscard]] auto sustained_clock(BenchView const& bench) -> Result<Outc
 			return std::unexpected(read.error());
 		}
 	}
-	return evaluate_sustained_clock(megahertz);
+	auto const after = power_capped(bench);
+	auto const ended = after.and_then([&](auto const&) {
+		return for_each_card([&](model::Card card) {
+			return lift(bench.devices.clocks_event_reasons(card)).transform([&](device::ClocksEventReasons reasons) {
+				telemetry.at(std::to_underlying(card)).capped_at_end = reasons.contains(device::ClocksEventReason::SwPowerCap);
+			});
+		});
+	});
+	if (!ended) {
+		return std::unexpected(ended.error());
+	}
+	for (auto const card : device::card_pair) {
+		auto const index = std::to_underlying(card);
+		auto const& start = before->at(index);
+		auto const& end = after->at(index);
+		telemetry.at(index).power_capped = start && end ? std::optional{*end - *start} : std::nullopt;
+	}
+	return evaluate_sustained_clock(megahertz, telemetry);
 }
 
 /** One card's activation-load cycles per block under each priority assignment. */
@@ -554,8 +661,8 @@ export [[nodiscard]] auto l2_policy_reuse(BenchView const& bench) -> Result<Outc
 	auto const ran = for_each_card([&](model::Card card) -> Result<void> {
 		auto const view = bench.card(card);
 		auto const program = lift(view.context.load<SplitKernel, UniformKernel>());
-		auto const source = scratch<ub::Word4, shapes::chunks>(view.context);
-		auto const activations = scratch<ub::Word4, shapes::Reuse<shapes::Priorities::Split>::activation_chunks>(view.context);
+		auto const source = scratch<ub::Chunk, shapes::chunks>(view.context);
+		auto const activations = scratch<ub::Chunk, shapes::Reuse<shapes::Priorities::Split>::activation_chunks>(view.context);
 		auto rates = Readback<ub::Rate, ub::sms>::create(view.context);
 		if (auto const failed = first_failure(program, source, activations, rates)) {
 			return std::unexpected(*failed);

@@ -148,7 +148,7 @@ export [[nodiscard]] auto barrier_cost(BenchView const& bench) -> Result<Outcome
 		auto const view = bench.card(card);
 		auto const program = lift(view.context.load<MbarrierBackoff, MbarrierSpin, NamedBarrier, CopyCompletion, SleepGrain>());
 		auto cycles = Readback<unsigned long long, 1>::create(view.context);
-		auto copied = Readback<ub::Word4, 32>::create(view.context);
+		auto copied = Readback<ub::Chunk, 32>::create(view.context);
 		auto sleeps = Readback<shapes::SleepReading, shapes::sleep_kinds>::create(view.context);
 		if (auto const failed = first_failure(program, cycles, copied, sleeps)) {
 			return std::unexpected(*failed);

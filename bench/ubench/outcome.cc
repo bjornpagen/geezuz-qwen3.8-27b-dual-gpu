@@ -17,10 +17,14 @@ export enum class Unit : std::uint8_t {
 	Megahertz,
 	Nanoseconds,
 	Microseconds,
+	Milliseconds,
 	Cycles,
 	FlopPerClockPerSm,
 	PerClockPerSm,
+	PerMicrosecond,
+	Teraflops,
 	Mebibytes,
+	Watts,
 	Ratio,
 	Count,
 };
@@ -35,14 +39,22 @@ export enum class Unit : std::uint8_t {
 		return "ns";
 	case Unit::Microseconds:
 		return "us";
+	case Unit::Milliseconds:
+		return "ms";
 	case Unit::Cycles:
 		return "cycles";
 	case Unit::FlopPerClockPerSm:
 		return "flop/clk/SM";
 	case Unit::PerClockPerSm:
 		return "/clk/SM";
+	case Unit::PerMicrosecond:
+		return "/us";
+	case Unit::Teraflops:
+		return "TFLOPS";
 	case Unit::Mebibytes:
 		return "MiB";
+	case Unit::Watts:
+		return "W";
 	case Unit::Ratio:
 		return "x";
 	case Unit::Count:
