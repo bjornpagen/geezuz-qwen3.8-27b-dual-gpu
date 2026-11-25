@@ -27,19 +27,19 @@ inline constexpr std::size_t hidden = 256;
 inline constexpr std::size_t vocab = 1024;
 
 export inline constexpr std::array<model::Tensor, 13> inventory = {{
-    {"model.language_model.embed_tokens.weight", model::matrix(vocab, hidden), Scope::Model, Format::Bf16, Split::Host},
-    {"model.language_model.norm.weight", model::vector(hidden), Scope::Model, Format::Bf16, Split::Replicated},
-    {"lm_head.weight", model::matrix(vocab, hidden), Scope::Model, Format::Bf16, Split::Vocabulary},
-    {"fc.weight", model::matrix(hidden, 2 * hidden), Scope::Mtp, Format::Bf16, Split::Columns},
-    {"input_layernorm.weight", model::vector(hidden), Scope::DecoderLayer, Format::Bf16, Split::Replicated},
-    {"self_attn.q_proj.weight", model::matrix(1024, hidden), Scope::DecoderLayer, Format::E4m3, Split::Rows},
-    {"self_attn.v_proj.weight", model::matrix(512, hidden), Scope::DecoderLayer, Format::E4m3, Split::Rows},
-    {"mlp.gate_proj.weight", model::matrix(512, hidden), Scope::DecoderLayer, Format::E4m3, Split::Rows},
-    {"mlp.up_proj.weight", model::matrix(512, hidden), Scope::DecoderLayer, Format::E4m3, Split::Rows},
-    {"mlp.down_proj.weight", model::matrix(hidden, 512), Scope::DecoderLayer, Format::E4m3, Split::Columns},
-    {"linear_attn.A_log", model::vector(64), Scope::DecoderLayer, Format::Bf16, Split::Rows},
-    {"linear_attn.in_proj_a.weight", model::matrix(8, 512), Scope::DecoderLayer, Format::Bf16, Split::Columns},
-    {"linear_attn.conv1d.weight", model::depthwise(64, 4), Scope::DecoderLayer, Format::Bf16, Split::Rows},
+    {.name = "model.language_model.embed_tokens.weight", .shape = model::matrix(vocab, hidden), .scope = Scope::Model, .format = Format::Bf16, .split = Split::Host},
+    {.name = "model.language_model.norm.weight", .shape = model::vector(hidden), .scope = Scope::Model, .format = Format::Bf16, .split = Split::Replicated},
+    {.name = "lm_head.weight", .shape = model::matrix(vocab, hidden), .scope = Scope::Model, .format = Format::Bf16, .split = Split::Vocabulary},
+    {.name = "fc.weight", .shape = model::matrix(hidden, 2 * hidden), .scope = Scope::Mtp, .format = Format::Bf16, .split = Split::Columns},
+    {.name = "input_layernorm.weight", .shape = model::vector(hidden), .scope = Scope::DecoderLayer, .format = Format::Bf16, .split = Split::Replicated},
+    {.name = "self_attn.q_proj.weight", .shape = model::matrix(1024, hidden), .scope = Scope::DecoderLayer, .format = Format::E4m3, .split = Split::Rows},
+    {.name = "self_attn.v_proj.weight", .shape = model::matrix(512, hidden), .scope = Scope::DecoderLayer, .format = Format::E4m3, .split = Split::Rows},
+    {.name = "mlp.gate_proj.weight", .shape = model::matrix(512, hidden), .scope = Scope::DecoderLayer, .format = Format::E4m3, .split = Split::Rows},
+    {.name = "mlp.up_proj.weight", .shape = model::matrix(512, hidden), .scope = Scope::DecoderLayer, .format = Format::E4m3, .split = Split::Rows},
+    {.name = "mlp.down_proj.weight", .shape = model::matrix(hidden, 512), .scope = Scope::DecoderLayer, .format = Format::E4m3, .split = Split::Columns},
+    {.name = "linear_attn.A_log", .shape = model::vector(64), .scope = Scope::DecoderLayer, .format = Format::Bf16, .split = Split::Rows},
+    {.name = "linear_attn.in_proj_a.weight", .shape = model::matrix(8, 512), .scope = Scope::DecoderLayer, .format = Format::Bf16, .split = Split::Columns},
+    {.name = "linear_attn.conv1d.weight", .shape = model::depthwise(64, 4), .scope = Scope::DecoderLayer, .format = Format::Bf16, .split = Split::Rows},
 }};
 
 namespace index {
@@ -288,7 +288,7 @@ auto push_bf16(std::vector<std::byte>& bytes, std::uint16_t value) -> void {
 	auto random = engine::testing::generator(seed);
 	auto const uniform = core::alternative<Uniform>(fault);
 	auto stored = std::vector<Stored>{};
-	auto add = [&](std::size_t tensor, schedule::Instance const& at) {
+	auto const add = [&](std::size_t tensor, schedule::Instance const& at) {
 		auto const& entry = std::span{inventory}[tensor];
 		auto const name = bake::checkpoint_name(entry, at);
 		auto const elements = model::elements(entry.shape);

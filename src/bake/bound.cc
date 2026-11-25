@@ -57,11 +57,42 @@ export inline constexpr double overflow_limit = 0x1p70;
 	std::unreachable();
 }
 
-/** sum_i |W_ji| |1 + w_i| rounded up, maximized over the rows j of one v_proj. */
-[[nodiscard]] auto widest_row(std::string const& name, std::span<std::byte const> codes, std::span<std::byte const> scales,
-                              std::span<double const> gains, model::Shape const& shape) -> core::Result<double, BakeError> {
-	auto const rows = shape.extents[0];
-	auto const columns = shape.extents[1];
+/* PIN(clang-tidy-optional-merged-record): an optional beside a field read of a model struct crashes the lint here */
+/**
+ * An e4m3 tensor's codes, every one of them finite: parsed once, so reading a code's value needs no check. It borrows
+ * the checkpoint's bytes and lives within one call.
+ */
+class FiniteCodesView {
+public:
+	/** The codes of `name`, a tensor `columns` wide; a nan code is refused at its row and column. */
+	[[nodiscard]] static auto parse(std::string const& name, std::span<std::byte const> codes, std::size_t columns)
+	    -> core::Result<FiniteCodesView, BakeError> {
+		auto const nan = std::ranges::find_if(codes, [](std::byte code) { return !device::prims::finite(e4m3(code)); });
+		if (nan != codes.end()) {
+			auto const at = static_cast<std::size_t>(nan - codes.begin());
+			return refuse(NanCode{.tensor = name, .row = at / columns, .column = at % columns});
+		}
+		return FiniteCodesView{codes};
+	}
+
+	/** |the value of code `index`|, exactly. */
+	[[nodiscard]] auto magnitude(std::size_t index) const -> double {
+		return std::fabs(static_cast<double>(device::prims::value(e4m3(codes_[index]))));
+	}
+
+private:
+	explicit FiniteCodesView(std::span<std::byte const> codes) : codes_{codes} {}
+
+	[[nodiscard]] static auto e4m3(std::byte code) -> device::prims::E4m3 {
+		return {.bits = std::to_integer<unsigned char>(code)};
+	}
+
+	std::span<std::byte const> codes_;
+};
+
+/** sum_i |W_ji| |1 + w_i| rounded up, maximized over the rows j of one v_proj `rows` x `columns`. */
+[[nodiscard]] auto widest_row(FiniteCodesView const& codes, std::span<std::byte const> scales, std::span<double const> gains, std::size_t rows,
+                              std::size_t columns) -> double {
 	auto const block = model::scale_block;
 	auto const scale_columns = model::divide_up(columns, block);
 	auto widest = 0.0;
@@ -70,12 +101,7 @@ export inline constexpr double overflow_limit = 0x1p70;
 		for (auto first = std::size_t{0}; first < columns; first += block) {
 			auto sum = 0.0;
 			for (auto column = first; column < std::min(first + block, columns); ++column) {
-				auto const code = prims::FiniteE4m3::parse(std::to_integer<std::uint8_t>(codes[(row * columns) + column]));
-				if (!code) {
-					return refuse(NanCode{.tensor = name, .row = row, .column = column});
-				}
-				auto const magnitude = std::fabs(static_cast<double>(device::prims::value(code->code())));
-				sum = up(sum + up(magnitude * gains[column]));
+				sum = up(sum + up(codes.magnitude((row * columns) + column) * gains[column]));
 			}
 			auto const scale = std::fabs(bf16_at(scales, ((row / block) * scale_columns) + (first / block)));
 			total = up(total + up(sum * scale));
@@ -105,11 +131,11 @@ export template<Plan P>
 		for (auto index = std::size_t{0}; index < hidden; ++index) {
 			gains[index] = gain(bf16_at(weights, index));
 		}
-		auto const widest = widest_row(name, source.bytes(name), source.bytes(scale_name(name)), gains, v.shape);
-		if (!widest) {
-			return std::unexpected(widest.error());
+		auto const codes = FiniteCodesView::parse(name, source.bytes(name), hidden);
+		if (!codes) {
+			return std::unexpected(codes.error());
 		}
-		auto const layer = up(root * *widest);
+		auto const layer = up(root * widest_row(*codes, source.bytes(scale_name(name)), gains, v.shape.extents[0], hidden));
 		if (layer >= bound.value) {
 			bound = Bound{.value = layer, .tensor = name};
 		}

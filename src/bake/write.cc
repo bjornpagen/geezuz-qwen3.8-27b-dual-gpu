@@ -164,7 +164,7 @@ template<Plan P, model::Card card>
 template<Plan P>
 [[nodiscard]] auto write_host(Source const& source, std::filesystem::path const& directory)
     -> core::Result<Ready, BakeError> {
-	using C = typename P::Host;
+	using C = P::Host;
 	auto sink = Sink<C>::create(directory / image_name(C::target), source.verified().checkpoint);
 	if (!sink) {
 		return std::unexpected(sink.error());
