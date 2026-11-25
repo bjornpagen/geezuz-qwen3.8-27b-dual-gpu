@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Child processes against programs every darwin and linux machine has: their output comes back line by line in order,
-// their exit status and the signal that ended them are reported exactly, a deadline ends every wait, a line past the
-// bound is refused, a missing program is refused by name, and dropping a running child does not wait for it.
+// Child processes against programs every darwin and linux machine has, and this test run as its own child: output
+// comes back line by line in order, the exit status and the signal that ended a child are reported exactly, a deadline
+// ends every wait, a line past the bound is refused, a missing program is refused by name, dropping a running child
+// does not wait for it, and this process's own output reaches a pipe as it is written.
 import std;
 import engine.core;
 import engine.process;
@@ -115,10 +116,32 @@ constexpr auto patience = std::chrono::milliseconds{10'000};
 	return Clock::now() - started < std::chrono::seconds{10};
 }
 
+/** The line this test's own binary says when run as `speak`, before it waits to be killed. */
+constexpr auto spoken = std::string_view{"said before exit"};
+
+/**
+ * This process's output reaches a pipe as it is written: the child says a line and then waits, and the line arrives
+ * long before the child would end (a buffered line would arrive only at its exit).
+ */
+[[nodiscard]] auto output_is_flushed(std::filesystem::path const& self) -> bool {
+	auto child = process::Child::spawn(self, std::vector<std::string>{"speak"});
+	if (!child) {
+		return false;
+	}
+	auto const read = child->read_line_until(after(std::chrono::milliseconds{5'000}));
+	return read && *read == process::Read{process::Line{.text = std::string{spoken}}};
 }
 
-auto main() -> int {
+}
+
+auto main(int argc, char** argv) -> int {
 	using engine::testing::Case;
+	auto const arguments = std::span{argv, static_cast<std::size_t>(argc)};
+	if (arguments.size() == 2 && std::string_view{arguments[1]} == "speak") {
+		process::output_line(spoken);
+		std::this_thread::sleep_until(Clock::now() + std::chrono::seconds{30});
+		return 0;
+	}
 	auto const cases = std::array{
 	    Case{.name = "arguments reach the child, and its output comes back as a line", .holds = arguments_reach_the_child()},
 	    Case{.name = "lines arrive in order, empty and unterminated ones included", .holds = lines_arrive_in_order()},
@@ -128,6 +151,7 @@ auto main() -> int {
 	    Case{.name = "a line exactly at the bound is read", .holds = a_line_at_the_bound_is_read()},
 	    Case{.name = "a missing program is refused as not found", .holds = a_missing_program_is_refused()},
 	    Case{.name = "dropping a running child kills it", .holds = dropping_a_running_child_kills_it()},
+	    Case{.name = "this process's output reaches a pipe as it is written", .holds = output_is_flushed(std::filesystem::path{arguments[0]})},
 	};
 	return engine::testing::report(cases);
 }

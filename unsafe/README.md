@@ -8,4 +8,4 @@ state. AGENTS.md §5.2 and §15.
 
 - `fail/` — `engine.fail`: the always-on `invariant` (reached from dialect code as `engine::core::invariant`).
 - `file/` — `engine.file`: read-only whole-file mappings (the checkpoint, the baked image, test inputs).
-- `process/` — `engine.process`: a child process the caller owns (spawn, its output as lines, SIGTERM, reaping).
+- `process/` — `engine.process`: child processes the caller owns (spawn, output lines, SIGTERM, reaping); flushed stdout.

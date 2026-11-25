@@ -9,5 +9,5 @@ else()
 	set(spawn_backend spawn.linux.cc)
 endif()
 
-target_sources(engine_process PUBLIC FILE_SET CXX_MODULES FILES process.cc error.cc ${spawn_backend} child.cc)
+target_sources(engine_process PUBLIC FILE_SET CXX_MODULES FILES process.cc error.cc ${spawn_backend} child.cc output.cc)
 target_link_libraries(engine_process PUBLIC engine_language_profile engine_core)
