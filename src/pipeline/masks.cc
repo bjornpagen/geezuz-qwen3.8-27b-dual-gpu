@@ -13,9 +13,11 @@ namespace engine::pipeline {
 export using Token = tokenizer::Id;
 
 /** Words of a row-order mask: both cards' lm_head rows, as the grammar lays them out. */
-export inline constexpr std::size_t row_words = model::divide_up(grammar::engine_layout.rows, 64);
+export inline constexpr std::size_t row_words = model::cards * model::card_mask_words;
 
-static_assert(row_words == model::cards * grammar::card_words, "the row layout is each card's half, word-aligned");
+// The grammar lays its row masks out by its own width; the cards read the model's.
+static_assert(grammar::card_words == model::card_mask_words, "the grammar's card half is the cards' mask width");
+static_assert(row_words == model::divide_up(grammar::engine_layout.rows, 64), "the row layout is each card's half, word-aligned");
 
 /** The bit of `token`'s lm_head row in the row layout: card c's row r is bit c * vocab_per_card + r. */
 [[nodiscard]] auto row_bit(Token token) -> std::size_t {
@@ -53,10 +55,10 @@ export struct RowMask {
 		return mask;
 	}
 
-	/** Card `card`'s half, in its lm_head row order. */
-	[[nodiscard]] auto card(model::Card which) const -> std::span<std::uint64_t const, grammar::card_words> {
-		auto const offset = std::size_t{std::to_underlying(which)} * grammar::card_words;
-		return std::span<std::uint64_t const, grammar::card_words>{std::span{words}.subspan(offset, grammar::card_words)};
+	/** Card `which`'s half, in its lm_head row order: what the cards' publish takes as it is. */
+	[[nodiscard]] auto card(model::Card which) const -> std::span<std::uint64_t const, model::card_mask_words> {
+		auto const offset = std::size_t{std::to_underlying(which)} * model::card_mask_words;
+		return std::span<std::uint64_t const, model::card_mask_words>{std::span{words}.subspan(offset, model::card_mask_words)};
 	}
 
 	/** Whether the row holding `token` is allowed. */
