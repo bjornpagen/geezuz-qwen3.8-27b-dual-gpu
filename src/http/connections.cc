@@ -7,7 +7,6 @@ import engine.handle;
 import engine.net;
 import :exchange;
 import :inbound;
-import :alternative;
 import :limits;
 import :outbound;
 import :request;
@@ -130,9 +129,9 @@ static_assert(std::bit_width(max_connections - 1) + generation_bits < 63, "conne
 template<BodyBounds B>
 [[nodiscard]] auto deadline_of(Connection<B> const& connection) -> std::optional<net::Deadline> {
 	auto phase = std::optional<net::Deadline>{};
-	if (auto const idle = alternative<Idle>(connection.phase)) {
+	if (auto const idle = core::alternative<Idle>(connection.phase)) {
 		phase = idle->read_by;
-	} else if (auto const lingering = alternative<Lingering>(connection.phase)) {
+	} else if (auto const lingering = core::alternative<Lingering>(connection.phase)) {
 		phase = lingering->until;
 	}
 	if (phase && connection.write_by) {
@@ -148,10 +147,10 @@ template<BodyBounds B>
 }
 
 [[nodiscard]] auto abandonment(ConnectionHandle handle, Phase const& phase) -> std::optional<Exchange> {
-	if (auto const awaiting = alternative<Awaiting>(phase)) {
+	if (auto const awaiting = core::alternative<Awaiting>(phase)) {
 		return Exchange{.connection = handle, .sequence = awaiting->sequence};
 	}
-	if (auto const streaming = alternative<Streaming>(phase)) {
+	if (auto const streaming = core::alternative<Streaming>(phase)) {
 		return Exchange{.connection = handle, .sequence = streaming->sequence};
 	}
 	return std::nullopt;
@@ -199,7 +198,7 @@ public:
 	}
 
 	[[nodiscard]] auto idle() const -> bool {
-		return live_.empty();
+		return table_->live_count() == 0;
 	}
 
 	/** Waits until a fact, `until`, or the nearest connection or accept deadline. */
@@ -210,7 +209,7 @@ public:
 				deadline = candidate;
 			}
 		};
-		for (auto const handle : live_) {
+		for (auto const handle : table_->handles()) {
 			consider(deadline_of(slot(handle)));
 		}
 		consider(accept_after_);
@@ -219,7 +218,7 @@ public:
 
 	/** Queues every connection whose deadline has passed: advancing it closes it. */
 	auto expire(net::Deadline now) -> void {
-		for (auto const handle : live_) {
+		for (auto const handle : table_->handles()) {
 			if (auto const deadline = deadline_of(slot(handle)); deadline && *deadline <= now) {
 				enqueue(handle);
 			}
@@ -261,7 +260,8 @@ public:
 
 	/** Watches the listener again when the server can take a connection. */
 	[[nodiscard]] auto listen() -> core::Result<void, net::NetError> {
-		if (mode_ == Mode::Stopping || !listener_ || listening_ == Listening::Watched || accept_after_ || live_.size() == max_connections) {
+		if (mode_ == Mode::Stopping || !listener_ || listening_ == Listening::Watched || accept_after_ ||
+		    table_->live_count() == max_connections) {
 			return {};
 		}
 		if (auto watched = poller_.watch(*listener_, listener_token); !watched) {
@@ -275,22 +275,25 @@ public:
 	auto begin_stop() -> void {
 		mode_ = Mode::Stopping;
 		listener_.reset();
-		for (auto index = live_.size(); index > 0; --index) {
-			auto const handle = live_[index - 1];
-			if (std::holds_alternative<Idle>(slot(handle).phase)) {
-				std::ignore = close(handle);
-			}
+		// Collected first: closing releases slots, and the table must hold still while its handles are listed.
+		auto const idle = table_->handles() | std::views::filter([this](ConnectionHandle handle) {
+			                  return std::holds_alternative<Idle>(slot(handle).phase);
+		                  }) |
+		                  std::ranges::to<std::vector>();
+		for (auto const handle : idle) {
+			std::ignore = close(handle);
 		}
 	}
 
 	/** Closes one connection at once; the exchange it abandoned, if any. */
 	[[nodiscard]] auto close_any() -> std::optional<Exchange> {
-		core::invariant(!live_.empty());
-		return close(live_.back());
+		auto handles = table_->handles();
+		core::invariant(!std::ranges::empty(handles));
+		return close(*handles.begin());
 	}
 
 	auto answer(Exchange exchange, Answer answer) -> void {
-		if (auto const response = alternative<Response>(answer)) {
+		if (auto const response = core::alternative<Response>(answer)) {
 			core::invariant(respond(exchange, *response) == Delivery::Accepted);
 		} else if (std::holds_alternative<OpenStream>(answer)) {
 			core::invariant(open_stream(exchange) == Delivery::Accepted);
@@ -303,7 +306,7 @@ public:
 			return Delivery::Gone;
 		}
 		auto& connection = *found;
-		auto const awaiting = alternative<Awaiting>(connection.phase);
+		auto const awaiting = core::alternative<Awaiting>(connection.phase);
 		// A service answers each exchange once: a second answer is a bug in the service, not a client's doing.
 		core::invariant(awaiting.has_value());
 		auto const persistence = awaiting->persistence;
@@ -320,7 +323,7 @@ public:
 			return Delivery::Gone;
 		}
 		auto& connection = *found;
-		auto const awaiting = alternative<Awaiting>(connection.phase);
+		auto const awaiting = core::alternative<Awaiting>(connection.phase);
 		core::invariant(awaiting.has_value());
 		auto const persistence = awaiting->persistence;
 		connection.outbound.append(encode_stream_head(persistence, awaiting->id));
@@ -335,7 +338,7 @@ public:
 			return Flow::Gone;
 		}
 		auto& connection = *found;
-		auto const streaming = alternative<Streaming>(connection.phase);
+		auto const streaming = core::alternative<Streaming>(connection.phase);
 		// Events go only to an exchange the service opened as a stream and has not finished.
 		core::invariant(streaming.has_value());
 		core::invariant(event.data.size() <= max_event_bytes);
@@ -357,7 +360,7 @@ public:
 			return Delivery::Gone;
 		}
 		auto& connection = *found;
-		auto const streaming = alternative<Streaming>(connection.phase);
+		auto const streaming = core::alternative<Streaming>(connection.phase);
 		core::invariant(streaming.has_value());
 		connection.outbound.append(stream_end);
 		connection.phase = Flushing{.persistence = streaming->persistence};
@@ -372,9 +375,7 @@ private:
 	      port_{listener.port()},
 	      listener_{std::move(listener)},
 	      table_{std::make_unique<Table<B>>()},
-	      ids_{config.id_seed} {
-		live_.reserve(max_connections);
-	}
+	      ids_{config.id_seed} {}
 
 	/** The connection of a handle known to be live. */
 	[[nodiscard]] auto slot(ConnectionHandle handle) -> Connection<B>& {
@@ -406,10 +407,6 @@ private:
 	[[nodiscard]] auto close(ConnectionHandle handle) -> std::optional<Exchange> {
 		auto abandoned = abandonment(handle, slot(handle).phase);
 		table_->release(handle);
-		auto const found = std::ranges::find(live_, handle);
-		core::invariant(found != live_.end());
-		*found = live_.back();
-		live_.pop_back();
 		return abandoned;
 	}
 
@@ -421,7 +418,7 @@ private:
 	}
 
 	[[nodiscard]] auto accept_all(net::Deadline now) -> core::Result<void, net::NetError> {
-		while (mode_ == Mode::Serving && listener_ && live_.size() < max_connections) {
+		while (mode_ == Mode::Serving && listener_ && table_->live_count() < max_connections) {
 			auto accepted = listener_->accept();
 			if (!accepted) {
 				if (accepted.error().retry() == core::Retry::Transient) {
@@ -446,7 +443,6 @@ private:
 			if (!inserted) {
 				continue;
 			}
-			live_.push_back(*inserted);
 			enqueue(*inserted);
 		}
 		return {};
@@ -456,7 +452,7 @@ private:
 		auto progressed = false;
 		while (reads(connection)) {
 			auto const received = connection.socket.receive(connection.inbound.space());
-			if (auto const moved = alternative<net::Transferred>(received)) {
+			if (auto const moved = core::alternative<net::Transferred>(received)) {
 				connection.inbound.commit(moved->count);
 				if (std::holds_alternative<Lingering>(connection.phase)) {
 					connection.inbound.discard();
@@ -476,7 +472,7 @@ private:
 		auto progressed = false;
 		while (!connection.outbound.empty()) {
 			auto const sent = connection.socket.send(connection.outbound.front());
-			if (auto const moved = alternative<net::Transferred>(sent)) {
+			if (auto const moved = core::alternative<net::Transferred>(sent)) {
 				connection.outbound.consume(moved->count);
 				progressed = true;
 				continue;
@@ -504,13 +500,13 @@ private:
 			if (!connection.outbound.empty() && flush(connection, now) == Flush::Broken) {
 				return closed(handle);
 			}
-			if (auto const streaming = alternative<Streaming>(connection.phase);
+			if (auto const streaming = core::alternative<Streaming>(connection.phase);
 			    streaming.has_value() && streaming->backpressure == Backpressure::Owed && connection.outbound.queued() <= drain_mark) {
 				streaming->backpressure = Backpressure::Clear;
 				enqueue(handle);
 				return Drained{.exchange = Exchange{.connection = handle, .sequence = streaming->sequence}};
 			}
-			if (auto const flushing = alternative<Flushing>(connection.phase); flushing.has_value() && connection.outbound.empty()) {
+			if (auto const flushing = core::alternative<Flushing>(connection.phase); flushing.has_value() && connection.outbound.empty()) {
 				if (flushing->persistence == Persistence::KeepAlive && mode_ == Mode::Serving) {
 					connection.phase = Idle{.read_by = now + config_.read_timeout};
 				} else {
@@ -526,7 +522,7 @@ private:
 			}
 			if (std::holds_alternative<Idle>(connection.phase)) {
 				auto assembly = connection.inbound.assemble();
-				if (auto const assembled = alternative<Assembled<B>>(assembly)) {
+				if (auto const assembled = core::alternative<Assembled<B>>(assembly)) {
 					++connection.sequence;
 					auto id = assembled->client_id ? std::move(*assembled->client_id) : ids_.issue();
 					auto const persistence = mode_ == Mode::Serving ? assembled->persistence : Persistence::Close;
@@ -541,7 +537,7 @@ private:
 					connection.outbound.append(interim_continue);
 					continue;
 				}
-				if (auto const refused = alternative<Refused>(assembly)) {
+				if (auto const refused = core::alternative<Refused>(assembly)) {
 					connection.outbound.adopt(encode_refusal(refused->error.kind, ids_.issue()));
 					connection.phase = Flushing{.persistence = Persistence::Close};
 					continue;
@@ -575,7 +571,6 @@ private:
 	Listening listening_ = Listening::Watched;
 	std::optional<net::Deadline> accept_after_;
 	std::unique_ptr<Table<B>> table_;
-	std::vector<ConnectionHandle> live_;
 	std::array<ConnectionHandle, max_connections> pending_{};
 	std::size_t pending_head_ = 0;
 	std::size_t pending_count_ = 0;

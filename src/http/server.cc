@@ -6,7 +6,6 @@ import engine.core;
 import engine.net;
 import :connections;
 import :exchange;
-import :alternative;
 import :limits;
 import :request;
 import :write;
@@ -200,7 +199,7 @@ public:
 				mailbox_->drain([&service, &port](Message&& message) {
 					service.deliver(std::move(message), port);
 				});
-			} else if (auto const ready = alternative<net::Ready>(fact)) {
+			} else if (auto const ready = core::alternative<net::Ready>(fact)) {
 				if (auto accepted = connections_.ready(*ready, now); !accepted) {
 					return std::unexpected(accepted.error());
 				}

@@ -5,7 +5,6 @@ import std;
 import engine.core;
 import :error;
 import :head;
-import :alternative;
 import :limits;
 import :request;
 
@@ -67,7 +66,7 @@ class Inbound {
 public:
 	/** Where the next received bytes go: the head buffer's free tail, or the body's unread tail. */
 	[[nodiscard]] auto space() -> std::span<char> {
-		if (auto const reading = alternative<Reading>(stage_)) {
+		if (auto const reading = core::alternative<Reading>(stage_)) {
 			return reading->body.unread(reading->filled);
 		}
 		return std::span{buffer_}.subspan(buffered_);
@@ -75,7 +74,7 @@ public:
 
 	/** Whether `space` is empty: a head filled the buffer, or a body is complete and not yet assembled. */
 	[[nodiscard]] auto full() const -> bool {
-		if (auto const reading = alternative<Reading>(stage_)) {
+		if (auto const reading = core::alternative<Reading>(stage_)) {
 			return reading->filled == reading->body.length();
 		}
 		return buffered_ == buffer_.size();
@@ -83,7 +82,7 @@ public:
 
 	/** `count` bytes were received into `space`. */
 	auto commit(std::size_t count) -> void {
-		if (auto const reading = alternative<Reading>(stage_)) {
+		if (auto const reading = core::alternative<Reading>(stage_)) {
 			core::invariant(count <= reading->body.length() - reading->filled);
 			reading->filled += count;
 			return;
@@ -104,7 +103,7 @@ public:
 	}
 
 	[[nodiscard]] auto assemble() -> Assembly<B> {
-		if (auto const reading = alternative<Reading>(stage_)) {
+		if (auto const reading = core::alternative<Reading>(stage_)) {
 			if (reading->filled < reading->body.length()) {
 				return Partial{};
 			}

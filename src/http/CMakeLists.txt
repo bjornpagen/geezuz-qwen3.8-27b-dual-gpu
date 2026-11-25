@@ -2,7 +2,6 @@
 add_library(engine_http)
 target_sources(engine_http PUBLIC FILE_SET CXX_MODULES FILES
 	http.cc
-	alternative.cc
 	limits.cc
 	status.cc
 	error.cc
