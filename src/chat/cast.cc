@@ -10,7 +10,7 @@ import :dumps;
 namespace engine::chat {
 
 /** A JSON-schema type the response template casts a tool-call argument to. A string needs no cast. */
-enum class Cast : std::uint8_t {
+export enum class Cast : std::uint8_t {
 	Integer,
 	Number,
 	Boolean,
@@ -19,7 +19,8 @@ enum class Cast : std::uint8_t {
 	Array,
 };
 
-[[nodiscard]] constexpr auto cast_named(std::string_view name) -> std::optional<Cast> {
+/** The cast a schema type name asks for: none for `string`, nor for a name that is no JSON type. */
+export [[nodiscard]] constexpr auto cast_named(std::string_view name) -> std::optional<Cast> {
 	if (name == "integer") {
 		return Cast::Integer;
 	}
@@ -77,6 +78,40 @@ auto add_casts(std::vector<Cast>& casts, Json const& schema) -> void {
 	if (auto const nullable = object.find("nullable"); nullable && truthy(*nullable) && !std::ranges::contains(casts, Cast::Null)) {
 		casts.push_back(Cast::Null);
 	}
+}
+
+/** A parameter the response template casts, and its casts in the order it tries them. */
+export struct ParameterCasts {
+	std::string name;
+	std::vector<Cast> casts;
+
+	[[nodiscard]] auto operator==(ParameterCasts const&) const -> bool = default;
+};
+
+/**
+ * The casts of a function tool's parameters, as the response template casts a call's arguments: for each property of
+ * the `parameters` schema `schema`, in the order written, the casts its schema declares; a property with none (a
+ * string, or no type) is left out. `reader` reads the schema; a schema that does not read back is its error.
+ */
+export template<json::Bounds B>
+[[nodiscard]] auto parameter_casts(json::Reader<B>& reader, std::string_view schema) -> core::Result<std::vector<ParameterCasts>, json::ReadError> {
+	auto const loaded = load(reader, schema);
+	if (!loaded) {
+		return std::unexpected(loaded.error());
+	}
+	auto out = std::vector<ParameterCasts>{};
+	auto const properties = std::holds_alternative<Object>(loaded->value) ? std::get<Object>(loaded->value).find("properties") : std::nullopt;
+	if (!properties || !std::holds_alternative<Object>(properties->value)) {
+		return out;
+	}
+	for (auto const& property : std::get<Object>(properties->value).members) {
+		auto casts = std::vector<Cast>{};
+		add_casts(casts, property.value);
+		if (!casts.empty()) {
+			out.push_back(ParameterCasts{.name = property.name, .casts = std::move(casts)});
+		}
+	}
+	return out;
 }
 
 /** The first code point of each run of ten Unicode decimal digits past ASCII (Unicode 15.1, as the reference's Python). */

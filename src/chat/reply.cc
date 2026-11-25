@@ -49,16 +49,10 @@ export struct ToolCallEnd {
 /** What the reply parser reports: each piece of text is final when reported, and none is ever taken back. */
 export using Event = std::variant<ReasoningDelta, ContentDelta, ToolCallStart, ToolCallEnd>;
 
-/** A parameter the response template casts, and its casts in order. */
-struct CastParameter {
-	std::string name;
-	std::vector<Cast> casts;
-};
-
 /** A tool's name and the parameters whose arguments are cast. */
 struct Signature {
 	std::string name;
-	std::vector<CastParameter> parameters;
+	std::vector<ParameterCasts> parameters;
 };
 
 /** The argument casts of a reply's tools, with the reader that reads object and array arguments. */
@@ -72,7 +66,7 @@ struct Casting {
 		if (named == std::ranges::end(signatures | std::views::reverse)) {
 			return {};
 		}
-		auto const found = std::ranges::find(named->parameters, parameter, &CastParameter::name);
+		auto const found = std::ranges::find(named->parameters, parameter, &ParameterCasts::name);
 		return found == named->parameters.end() ? std::span<Cast const>{} : std::span<Cast const>{found->casts};
 	}
 };
@@ -363,21 +357,11 @@ auto Parser::make(std::span<json::Tool const> tools, Thinking thinking) -> core:
 		auto signature = Signature{.name = tool.name, .parameters = {}};
 		auto const function = core::alternative<json::FunctionTool>(tool.input);
 		if (function && function->parameters) {
-			auto const schema = load(*reader, function->parameters->text());
-			if (!schema) {
-				return std::unexpected(schema.error());
+			auto casts = parameter_casts(*reader, function->parameters->text());
+			if (!casts) {
+				return std::unexpected(casts.error());
 			}
-			auto const properties =
-			    std::holds_alternative<Object>(schema->value) ? std::get<Object>(schema->value).find("properties") : std::nullopt;
-			if (properties && std::holds_alternative<Object>(properties->value)) {
-				for (auto const& property : std::get<Object>(properties->value).members) {
-					auto casts = std::vector<Cast>{};
-					add_casts(casts, property.value);
-					if (!casts.empty()) {
-						signature.parameters.push_back(CastParameter{.name = property.name, .casts = std::move(casts)});
-					}
-				}
-			}
+			signature.parameters = *std::move(casts);
 		}
 		signatures.push_back(std::move(signature));
 	}
