@@ -143,12 +143,9 @@ export struct Admitted {
 	return *std::move(parsed);
 }
 
-/**
- * The sampling a turn gets when the request leaves a field out follows its thinking mode, which the template
- * defaults to on: a turn thinks unless `enable_thinking` is false.
- */
+/** The sampling a turn gets when the request leaves a field out follows its thinking mode, as the template decides it. */
 [[nodiscard]] constexpr auto defaults_for(json::TemplateOptions const& options) -> sampling::Defaults {
-	switch (options.thinking.value_or(json::Thinking::Enabled)) {
+	switch (json::thinking(options)) {
 	case json::Thinking::Enabled:
 		return sampling::thinking_defaults;
 	case json::Thinking::Disabled:
