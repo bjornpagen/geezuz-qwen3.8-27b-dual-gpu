@@ -8,3 +8,4 @@ set_tests_properties(model.draft_vocabulary PROPERTIES WORKING_DIRECTORY "${PROJ
 engine_checkpoint_test(model.checkpoint SOURCES checkpoint.test.cc LINK engine_model engine_file engine_json engine_safetensors)
 
 engine_test(model.sampled_vocabulary SOURCES sampled_vocabulary.test.cc LINK engine_model engine_tokenizer)
+engine_test(model.rounding SOURCES rounding.test.cc LINK engine_model)

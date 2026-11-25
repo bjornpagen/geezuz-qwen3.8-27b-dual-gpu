@@ -714,4 +714,325 @@ static_assert(pool_blocks >= slots, "every slot holds at least one kv block");
 
 static_assert(row_budgets_fit_the_slots(), "every row budget gives each slot its committed row and no slot more than its deepest draft");
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Rounding: where the engine rounds to bf16, what stays fp32, the order of every sum, and the fixed algorithms. The
+// kernels and the cpu reference both compute exactly this, so a kernel and the reference agree bit for bit and any
+// difference between them is a bug, not noise. Every fp32 operation is ieee, rounded to nearest even, with no
+// contraction: an fma is an fma only where it is named. exp, log, rsqrt, sigmoid, silu and softplus are the engine's
+// fixed routines (`prims::math`); cos and sin are `rope::rotation` below.
+
+/** How a value is held between the operation that produces it and those that consume it. */
+enum class Precision : unsigned char {
+	/** Rounded to nearest even once, where it is produced; every consumer reads the same bf16. */
+	Bf16,
+	Fp32,
+};
+
+/**
+ * Every value one operation of a decoder layer, the head or the mtp head hands to another, per verify row. A value is
+ * bf16 exactly where it is a tensor-core operand or is kept across positions (the kv cache, the convolution window);
+ * everything else, the residual stream and the deltanet state above all, is fp32.
+ */
+enum class Value : unsigned char {
+	/** A row of `embed_tokens`, as stored; it widens exactly into the residual stream. */
+	Embedding,
+	/** The residual stream, from the embedding (or the mtp fc) through every layer's two additions. */
+	Residual,
+	/** input_layernorm(residual): the mixer's matmul input. */
+	MixerInput,
+	/** in_proj_qkv's output: the convolution's input, kept in its window for the next positions. */
+	DeltanetProjection,
+	/** in_proj_z's output: it only gates. */
+	DeltanetGate,
+	/** in_proj_a's and in_proj_b's outputs: the decay's and the write strength's inputs. */
+	DeltanetDecayInput,
+	/** silu(conv(window)) per channel: q | k | v before the l2 norms. */
+	DeltanetConvolved,
+	/** The l2-normalized key, and the l2-normalized query times `deltanet_query_scale`. */
+	DeltanetKeys,
+	/**
+	 * The decay exp(-(exp(A_log) * softplus(a + dt_bias))) and the write strength sigmoid(b), each operation rounded in
+	 * that order.
+	 */
+	DeltanetGates,
+	/** The recurrent state, a key_dim x value_dim matrix per value head. */
+	DeltanetState,
+	/** The state read out by the query. */
+	DeltanetCore,
+	/** norm(core) * weight * silu(z): out_proj's input. */
+	DeltanetGated,
+	/** A matmul output summed across the cards before it is added to the residual. */
+	Partial,
+	/**
+	 * q after q_norm and rope: the scores' mma operand. Rope turns feature j (below rotary_dim / 2) with feature
+	 * j + rotary_dim / 2: x_j c - x_(j+32) s and x_(j+32) c + x_j s, each product rounded before the difference or sum;
+	 * features from rotary_dim up pass through.
+	 */
+	Query,
+	/** k after k_norm and rope, and v: kept in the kv cache. */
+	KeyValue,
+	/** The gate half of q_proj: it only gates. */
+	AttentionGate,
+	/** q . k scaled by `attention_score_scale`. */
+	Score,
+	/**
+	 * exp(score - m), m the largest score the row sees in the chunk; a position the row does not see weighs +0. Split
+	 * exactly into three bf16 parts at `attention_weight_scale` for the PV mmas.
+	 */
+	AttentionWeight,
+	/** A chunk's PV sums and row sum, and their merge over chunks. */
+	AttentionChunk,
+	/** The merged attention output times sigmoid(gate), rounded once: o_proj's input. */
+	AttentionGated,
+	/** post_attention_layernorm(residual): gate_proj's and up_proj's input. */
+	MlpInput,
+	/** gate_proj's and up_proj's outputs. */
+	MlpGateUp,
+	/** silu(gate) * up: down_proj's input. */
+	MlpProduct,
+	/**
+	 * The final norm's output: the lm_head's input, and the mtp head's hidden input at the same position (it is what a
+	 * serving stack hands its drafter, so the drafter was trained on it).
+	 */
+	FinalNormed,
+	/** Logits of the lm_head and of the draft lm_head. */
+	Logit,
+	/** pre_fc_norm_embedding(embedding) | pre_fc_norm_hidden(hidden): the mtp fc's input. */
+	MtpInput,
+	/** mtp.norm(mtp residual): the draft lm_head's input, and the next draft step's hidden input. */
+	MtpNormed,
+};
+
+[[nodiscard]] constexpr auto precision(Value value) -> Precision {
+	switch (value) {
+	case Value::Embedding:
+	case Value::MixerInput:
+	case Value::DeltanetProjection:
+	case Value::DeltanetGated:
+	case Value::Query:
+	case Value::KeyValue:
+	case Value::AttentionGated:
+	case Value::MlpInput:
+	case Value::MlpProduct:
+	case Value::FinalNormed:
+	case Value::MtpInput:
+	case Value::MtpNormed:
+		return Precision::Bf16;
+	case Value::Residual:
+	case Value::DeltanetGate:
+	case Value::DeltanetDecayInput:
+	case Value::DeltanetConvolved:
+	case Value::DeltanetKeys:
+	case Value::DeltanetGates:
+	case Value::DeltanetState:
+	case Value::DeltanetCore:
+	case Value::Partial:
+	case Value::AttentionGate:
+	case Value::Score:
+	case Value::AttentionWeight:
+	case Value::AttentionChunk:
+	case Value::MlpGateUp:
+	case Value::Logit:
+		return Precision::Fp32;
+	}
+	__builtin_unreachable();
+}
+
+/**
+ * Every sum of many fp32 terms, and its one order. "Lanes of w" is the order a warp gives: lane l takes terms
+ * [l w / 32, (l + 1) w / 32), folds them in ascending order by fma from +0 (fma(x, y, partial) for a product,
+ * fma(x, x, partial) for a square), and the 32 partials meet in a butterfly at distance 16, 8, 4, 2, 1, each lane
+ * adding its partner's value. An mma chain is a run of `mma.m16n8k16` steps whose accumulator starts at +0 and passes
+ * from step to step; each step is the sm_86 tensor core's own accumulation (`engine.mma_model` on the host).
+ */
+enum class Sum : unsigned char {
+	/**
+	 * Every product with a weight matrix. A phase's units (one weight tile of each tensor the phase interleaves) are
+	 * split over the SMs as `schedule::share` says, each output tile's units consecutive in ascending k. Per SM and
+	 * output element: for an e4m3 tile, an mma chain over its 8 k16 steps in ascending k, then
+	 * partial = fma(chain, block scale, partial) from +0; for bf16 tiles, one mma chain over all the SM's k16 steps in
+	 * ascending k. The output tile's SM partials are added left to right in SM order, then the cards' sums card 0 +
+	 * card 1 (for an axis-1 split), then the residual + that sum (the mtp fc's sum starts the mtp residual instead).
+	 * in_proj_a and in_proj_b, read whole, are one mma chain over the whole hidden in ascending k.
+	 */
+	Weights,
+	/**
+	 * An rms norm over the hidden size: each 128-feature tile's squares in lanes of 128, then the 40 tile sums added
+	 * left to right from tile 0. The mean is sum / hidden (a division), then rsqrt(mean + eps), x * that, then
+	 * * (1 + w) (`NormScale::OnePlusWeight`, 1 + w rounded in fp32).
+	 */
+	HiddenSquares,
+	/** q_norm and k_norm: the head's 256 squares in lanes of 256, then the same steps as `HiddenSquares`. */
+	HeadSquares,
+	/**
+	 * The deltanet l2 norms of q and k: lanes of 128; x * rsqrt(sum + `l2_norm_eps`), and the query then times
+	 * `deltanet_query_scale`.
+	 */
+	KeySquares,
+	/** The deltanet gated norm: lanes of 128; ((x * rsqrt(sum / value_dim + eps)) * w) * silu(z). */
+	ValueSquares,
+	/**
+	 * The deltanet recurrence, per value column j of a head, in fp32: S_ij = S_ij * decay for every i; memory =
+	 * sum_i S_ij k_i in lanes of 128; delta = (v_j - memory) * beta; S_ij = fma(k_i, delta, S_ij); out_j =
+	 * sum_i S_ij q_i in lanes of 128.
+	 */
+	DeltanetProducts,
+	/** The causal convolution: fma from +0 over the four taps, oldest input first, the current one last; then silu. */
+	Convolution,
+	/** q . k: one mma chain over the head's 16 k16 steps in ascending feature order; then * the score scale. */
+	Scores,
+	/**
+	 * A chunk's PV sums: one mma chain over its two k16 steps of positions, ascending, each step's hi, mid and lo
+	 * parts in that order (six mmas).
+	 */
+	ChunkValues,
+	/** A chunk's row sum of its scaled weights: one per lane (position within the chunk), the butterfly alone. */
+	ChunkWeights,
+	/**
+	 * The merge of a row's chunks, in chunk order: with M the largest chunk max, each chunk's factor exp(m - M), and
+	 * output and row sum each folded by fma(chunk value, factor, total) from +0; the result is output / row sum.
+	 */
+	ChunkMerge,
+};
+
+/** 1 / sqrt(head_dim), exact: the scores' scale is a power of two. */
+inline constexpr float attention_score_scale = 0x1p-4F;
+
+static_assert(head_dim == 256, "the score scale is 1 / sqrt(head_dim), exactly");
+
+/**
+ * The attention weights enter the PV mmas as P * 2^40 = hi + mid + lo exactly: hi keeps the top 16 bits of the fp32
+ * pattern, mid the top 16 of the exact remainder, lo the exact rest, each a bf16. Without the scale the lo part of a
+ * weight below 2^-110 falls under bf16's subnormal step; from 2^38 up every weight splits exactly. The row sum carries
+ * the same scale, so the division cancels it.
+ */
+inline constexpr float attention_weight_scale = 0x1p40F;
+
+/** A scaled attention weight's parts as bf16 bit patterns, largest first; their exact sum is the weight. */
+struct WeightParts {
+	unsigned short high;
+	unsigned short middle;
+	unsigned short low;
+};
+
+inline constexpr unsigned bf16_bits = 0xffff0000U;
+
+/** The split of a scaled weight in [0, 2^40]: each part is the top 16 bits of what the larger parts leave. */
+[[nodiscard]] constexpr auto split_weight(float scaled) -> WeightParts {
+	unsigned const high = __builtin_bit_cast(unsigned, scaled) & bf16_bits;
+	float const rest = scaled - __builtin_bit_cast(float, high);
+	unsigned const middle = __builtin_bit_cast(unsigned, rest) & bf16_bits;
+	float const low = rest - __builtin_bit_cast(float, middle);
+	return {
+	    .high = static_cast<unsigned short>(high >> 16U),
+	    .middle = static_cast<unsigned short>(middle >> 16U),
+	    .low = static_cast<unsigned short>(__builtin_bit_cast(unsigned, low) >> 16U),
+	};
+}
+
+/** 128^-1/2 to nearest: the deltanet query's scale after its l2 norm. */
+inline constexpr float deltanet_query_scale = 0x1.6a09e6p-4F;
+inline constexpr float l2_norm_eps = 1e-6F;
+
+static_assert(key_dim == 128, "the query scale is 1 / sqrt(key_dim)");
+
+/**
+ * The mtp head drafts as it was trained and is served: its entry at position i reads the trunk's `FinalNormed` at
+ * position i and the embedding of the token at position i + 1, and its rope and kv use position i. A draft step reads
+ * the previous entry's `MtpNormed` and the token it drafted, at the next position. (Checked against vLLM's Qwen3.5
+ * MTP drafter: the trunk returns its hidden states after the final norm, the proposer shifts the input ids left by
+ * one and copies the target positions unchanged, and the MTP model returns hidden states after `mtp.norm`, which the
+ * next step reads.)
+ */
+inline constexpr Count mtp_token_lead = 1;
+
+namespace rope {
+
+/**
+ * rope_theta^(-2j / rotary_dim) to the nearest fp32, j = 0 .. rotary_dim / 2 - 1. A rotation's angle is
+ * fp32(position) * inverse_frequency[j], rounded to fp32, as the checkpoint's serving code computes it.
+ */
+inline constexpr float inverse_frequency[rotary_dim / 2] = {
+    0x1.000000p+0F,  0x1.356656p-1F,  0x1.75f034p-2F,  0x1.c3f06cp-3F,  0x1.111aeep-3F,  0x1.4a12aep-4F,  0x1.8eec7ep-5F,
+    0x1.e222ecp-6F,  0x1.235a72p-6F,  0x1.6020a4p-7F,  0x1.a99428p-8F,  0x1.012cfap-8F,  0x1.36d21ap-9F,  0x1.77a7d8p-10F,
+    0x1.c603c4p-11F, 0x1.125c04p-11F, 0x1.4b96bep-12F, 0x1.90c182p-13F, 0x1.e459c6p-14F, 0x1.24b0fep-14F, 0x1.61bea2p-15F,
+    0x1.ab8884p-16F, 0x1.025b58p-16F, 0x1.383f88p-17F, 0x1.796182p-18F, 0x1.c8198cp-19F, 0x1.139e96p-19F, 0x1.4d1c98p-20F,
+    0x1.9298acp-21F, 0x1.e69338p-22F, 0x1.26091cp-22F, 0x1.635e88p-23F,
+};
+
+static_assert(rotary_dim == 64 && rope_theta == 10'000'000.0F, "the table is rope_theta's");
+
+/** cos and sin of one feature pair's angle at one position. */
+struct Rotation {
+	float cosine;
+	float sine;
+};
+
+// pi / 2 in three parts: the first two have 33 significant bits, so k times either is exact for every k below 2^20.
+inline constexpr double half_pi_high = 0x1.921fb544p+0;
+inline constexpr double half_pi_middle = 0x1.0b4611a6p-34;
+inline constexpr double half_pi_low = 0x1.3198a2e037073p-69;
+inline constexpr double two_over_pi = 0x1.45f306dc9c883p-1;
+inline constexpr double round_shifter = 0x1.8p52;
+
+/** sin r for |r| <= pi / 4: its Taylor series to r^17, truncated under 2^-60. */
+[[nodiscard]] constexpr auto sine_series(double r) -> double {
+	double const z = r * r;
+	double p = 1.0 / 355687428096000.0;
+	p = p * z - 1.0 / 1307674368000.0;
+	p = p * z + 1.0 / 6227020800.0;
+	p = p * z - 1.0 / 39916800.0;
+	p = p * z + 1.0 / 362880.0;
+	p = p * z - 1.0 / 5040.0;
+	p = p * z + 1.0 / 120.0;
+	p = p * z - 1.0 / 6.0;
+	return r + r * (z * p);
+}
+
+/** cos r for |r| <= pi / 4: its Taylor series to r^18, truncated under 2^-60. */
+[[nodiscard]] constexpr auto cosine_series(double r) -> double {
+	double const z = r * r;
+	double p = -1.0 / 6402373705728000.0;
+	p = p * z + 1.0 / 20922789888000.0;
+	p = p * z - 1.0 / 87178291200.0;
+	p = p * z + 1.0 / 479001600.0;
+	p = p * z - 1.0 / 3628800.0;
+	p = p * z + 1.0 / 40320.0;
+	p = p * z - 1.0 / 720.0;
+	p = p * z + 1.0 / 24.0;
+	p = p * z - 0.5;
+	return 1.0 + z * p;
+}
+
+[[nodiscard]] constexpr auto angle(Count position, Count pair) -> float {
+	return static_cast<float>(position) * inverse_frequency[pair];
+}
+
+/**
+ * cos and sin of the pair's angle at `position`, each the fp32 rounding of a double evaluation with an error near
+ * 2^-60: a fixed sequence of ieee double operations, so every machine computes the same bits (libm's cos and sin
+ * differ between platforms). The angle, at most max_positions, is reduced by pi / 2 in three parts.
+ */
+[[nodiscard]] constexpr auto rotation(Count position, Count pair) -> Rotation {
+	double const x = static_cast<double>(angle(position, pair));
+	double const k = (x * two_over_pi + round_shifter) - round_shifter;
+	double const r = ((x - k * half_pi_high) - k * half_pi_middle) - k * half_pi_low;
+	double const s = sine_series(r);
+	double const c = cosine_series(r);
+	switch (static_cast<unsigned long long>(k) % 4U) {
+	case 0:
+		return {.cosine = static_cast<float>(c), .sine = static_cast<float>(s)};
+	case 1:
+		return {.cosine = static_cast<float>(-s), .sine = static_cast<float>(c)};
+	case 2:
+		return {.cosine = static_cast<float>(-c), .sine = static_cast<float>(-s)};
+	default:
+		return {.cosine = static_cast<float>(s), .sine = static_cast<float>(-c)};
+	}
+}
+
+static_assert(max_positions <= Count{1} << 20U, "k times the first two parts of pi / 2 stays exact");
+
+}
+
 }
