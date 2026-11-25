@@ -155,21 +155,20 @@ using Reader = json::Reader<json::request_bounds>;
 	return true;
 }
 
-/** One streamed event's text: `data: `, the chunk, a blank line. */
-[[nodiscard]] auto event_text(json::ChunkHeader const& header, json::ChunkEvent const& event) -> std::string {
+/** One chunk's JSON, as appended for one server-sent event. */
+[[nodiscard]] auto chunk_text(json::ChunkHeader const& header, json::ChunkEvent const& event) -> std::string {
 	auto buffer = json::Buffer{std::size_t{1} << 20U};
 	auto const appended = json::append(buffer, header, event);
 	engine::core::invariant(appended.has_value());
 	return std::string{buffer.text()};
 }
 
-/** The chunk JSON of an event, after checking its server-sent-event framing. */
-[[nodiscard]] auto chunk_of(std::string const& event) -> std::optional<std::string> {
-	if (!event.starts_with("data: ") || !event.ends_with("\n\n")) {
-		return std::nullopt;
-	}
-	auto chunk = event.substr(6, event.size() - 8);
-	if (chunk.contains('\n')) {
+/**
+ * The chunk, when it is one line: an event's data must hold no line break, or the http layer would have to split
+ * it into several `data:` lines. JSON escaping guarantees it; this checks the writer keeps to it.
+ */
+[[nodiscard]] auto chunk_of(std::string chunk) -> std::optional<std::string> {
+	if (chunk.find_first_of("\r\n") != std::string::npos) {
 		return std::nullopt;
 	}
 	return chunk;
@@ -224,14 +223,13 @@ using Reader = json::Reader<json::request_bounds>;
 		    {json::UsageReport{.usage = usage}, usage_frame},
 		}};
 		for (auto const& [event, fixture] : frames) {
-			auto const chunk = chunk_of(event_text(header, event));
+			auto const chunk = chunk_of(chunk_text(header, event));
 			if (!chunk || !agrees(*reader, *chunk, object(fixture))) {
 				return false;
 			}
 		}
 	}
-	auto done = json::Buffer{json::done_event.size()};
-	return json::append_done(done).has_value() && done.text() == "data: [DONE]\n\n";
+	return true;
 }
 
 /** Cuts text into pieces at code point boundaries, as a decoder streams it. */
@@ -305,7 +303,7 @@ using Step = std::variant<std::string_view, std::size_t>;
 		auto reassembled = std::vector<std::string>(calls.size());
 		for (auto call = std::size_t{0}; call < calls.size(); ++call) {
 			auto const position = static_cast<std::uint32_t>(call);
-			auto const start = chunk_of(event_text(header, json::ToolCallStart{.index = position, .id = calls[call].id, .name = calls[call].name}));
+			auto const start = chunk_of(chunk_text(header, json::ToolCallStart{.index = position, .id = calls[call].id, .name = calls[call].name}));
 			if (!start) {
 				return false;
 			}
@@ -321,7 +319,7 @@ using Step = std::variant<std::string_view, std::size_t>;
 				return false;
 			}
 			for (auto const piece : pieces_of(calls[call].arguments.text(), rng)) {
-				auto const chunk = chunk_of(event_text(header, json::ArgumentsDelta{.index = position, .fragment = piece}));
+				auto const chunk = chunk_of(chunk_text(header, json::ArgumentsDelta{.index = position, .fragment = piece}));
 				if (!chunk) {
 					return false;
 				}
@@ -348,7 +346,7 @@ using Step = std::variant<std::string_view, std::size_t>;
 		auto const piece = model::random_text(rng, 30);
 		auto const header = json::ChunkHeader{.id = "chatcmpl-y", .created = 1, .model = "m"};
 		auto const event = json::ChunkEvent{json::ContentDelta{.text = piece}};
-		auto const whole = event_text(header, event);
+		auto const whole = chunk_text(header, event);
 		auto buffer = json::Buffer{rng() % (2 * whole.size())};
 		auto const appended = json::append(buffer, header, event);
 		if (appended.has_value() != (whole.size() <= buffer.text().size() + buffer.available()) || buffer.text() != (appended ? whole : std::string{})) {
@@ -363,7 +361,7 @@ using Step = std::variant<std::string_view, std::size_t>;
 auto main() -> int {
 	auto const cases = std::array{
 	    engine::testing::Case{.name = "a whole completion is the documented chat.completion (seed 1)", .holds = completions_as_documented(1, 2000)},
-	    engine::testing::Case{.name = "every stream frame is the documented chunk in one event (seed 2)", .holds = frames_as_documented(2, 2000)},
+	    engine::testing::Case{.name = "every stream frame is the documented chunk, on one line (seed 2)", .holds = frames_as_documented(2, 2000)},
 	    engine::testing::Case{.name = "streamed argument fragments reassemble the whole call (seed 3)", .holds = streamed_arguments_reassemble(3, 1000)},
 	    engine::testing::Case{.name = "a chunk is appended whole or not at all (seed 4)", .holds = chunks_append_whole_or_not_at_all(4, 5000)},
 	};

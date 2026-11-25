@@ -7,9 +7,9 @@ import :text;
 import :write;
 
 /**
- * The OpenAI chat completion as the engine writes it: one whole `chat.completion`, or a stream of
- * `chat.completion.chunk` server-sent events ending in `data: [DONE]`. Each event's bytes are appended to a caller's
- * bounded buffer whole or not at all; the http layer frames the buffer for the wire.
+ * The OpenAI chat completion as the engine writes it: one whole `chat.completion`, or the `chat.completion.chunk`
+ * objects of a stream, each the payload of one server-sent event. Each is appended to a caller's bounded buffer
+ * whole or not at all. The event framing and the stream's closing `[DONE]` are not JSON: they are the http layer's.
  */
 namespace engine::json {
 
@@ -238,7 +238,6 @@ struct Delta {
 
 template<Sink O>
 auto write_chunk(O& out, ChunkHeader const& header, ChunkEvent const& event) -> void {
-	out.put("data: ");
 	write_object(out, [&](Members<O>& members) {
 		members.string("id", header.id);
 		members.string("object", "chat.completion.chunk");
@@ -249,20 +248,11 @@ auto write_chunk(O& out, ChunkHeader const& header, ChunkEvent const& event) -> 
 			put_usage(members, std::get<UsageReport>(event).usage);
 		}
 	});
-	out.put("\n\n");
 }
 
-/** Appends one server-sent event: `data: ` and the chunk's JSON, then the blank line that ends the event. */
+/** Appends one chunk's JSON: the payload of one server-sent event, which the http layer frames. */
 export [[nodiscard]] auto append(Buffer& buffer, ChunkHeader const& header, ChunkEvent const& event) -> core::Result<void, Overflow> {
 	return buffer.append([&](auto& out) { write_chunk(out, header, event); });
-}
-
-/** The event that ends every stream. */
-export inline constexpr std::string_view done_event = "data: [DONE]\n\n";
-
-/** Appends the event that ends every stream. */
-export [[nodiscard]] auto append_done(Buffer& buffer) -> core::Result<void, Overflow> {
-	return buffer.append([](auto& out) { out.put(done_event); });
 }
 
 }
