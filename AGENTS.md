@@ -376,7 +376,10 @@ Borrows are exactly `T&`, `T const&`, `std::optional<T&>`, `std::span<T>`, `std:
 - Synchronous function parameters may borrow.
 - Public parsers and decoders return owning values; `parse(std::string{...})` never returns data referring to it.
 - Owning structs contain no borrows. An ephemeral `FooView` lives only inside one synchronous call chain.
-- A returned view refers only to immutable program-lifetime storage (a literal, an embedded image).
+- A returned view refers to immutable program-lifetime storage (a literal, an embedded image), or it is a member
+  accessor's borrow of its own owner (`Mapping::bytes()`, `Table::try_get`, `Table::handles()`): valid until the next
+  non-const call on that owner, used within the caller's synchronous call chain, never stored in a struct and never
+  carried across an async or sender boundary. A view whose validity depends on anything else is a value instead.
 - Values crossing an async or sender boundary are owned; a returned sender never captures locals or parameters by
   reference; messages between concurrent components are recursively free of references, spans and views.
 - When ownership and borrowing are both viable, copy at the lifetime boundary.
