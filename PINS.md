@@ -209,6 +209,7 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
 - sites: `src/bake/bound.cc` (`FiniteCodesView`, `widest_row`): the e4m3 codes are parsed once into a view that
   carries their finiteness, so the function reading `model::Shape` / `Range` fields holds no optional. any dialect unit
   importing both `engine.model` and `engine.schedule` keeps optionals out of functions that read model-struct fields.
+- also: `tests/soak/cards.test.cc`, which crashed the same way and carries the PIN comment.
 - reproducer: a header `struct Range { Count begin; Count length; }`; module A `export extern "C++" { #include }` of
   it; module B including it in its global module fragment with `export using model::Range;`; a unit importing std, A
   and B whose function holds a `std::optional<uint8_t>` and returns `range.begin`. exit 139 with both imports, 0 with

@@ -671,6 +671,10 @@ with its expected value and the decision it settles). the first is a plain read 
 of the measured memory clock's peak before any kernel tuning. upstream `v0.3.2` q8_0 with `MK_PROFILE=1`, with and
 without the bridge, gives the baseline and the real phase breakdown.
 
+the images are baked before any soak, because the soak hashes them on the cards. the engine refuses to start until a
+memory clock is accepted (fail closed), so phase b ends with a stock-clock acceptance soak (`geezuz-soak`) that sets
+it; the overclock sweep (U19) runs here as characterisation only. docs/BRINGUP.md is the ordered procedure.
+
 ### phase c: correctness on gpu
 
 baked images load; step 1 matches `geezuz-ref` within the noise floor on both rulers; golden hashes recorded; the
@@ -678,6 +682,7 @@ server runs end to end with 8 parallel streams, tools and thinking.
 
 ### phase d: must-do speed
 
+overclock acceptance (a new accepted clock, soaked with the golden hashes) belongs here, after step 2.
 step 2 under the harness, then the memory-overclock sweep and soak. then part 2.
 
 ---
