@@ -181,6 +181,17 @@ using model::Tensor;
 	       ranges_held(named("model.language_model.embed_tokens.weight"), 0).empty();
 }
 
+// A card's mask of a verify row is the fewest whole 64-bit words with a bit for every row of the card's lm_head.
+[[nodiscard]] auto card_masks_cover_the_lm_head_rows() -> bool {
+	auto const& head = named("lm_head.weight");
+	auto holds = true;
+	for (auto card = Count{0}; card < model::cards; ++card) {
+		auto const rows = model::card_shape(head, card).extents[0];
+		holds = holds && model::card_mask_words * 64 >= rows && (model::card_mask_words - 1) * 64 < rows;
+	}
+	return holds;
+}
+
 [[nodiscard]] auto inventory_names_are_unique() -> bool {
 	auto names = std::vector<std::pair<model::Scope, std::string_view>>{};
 	for (auto const& tensor : model::inventory) {
@@ -269,6 +280,10 @@ auto main() -> int {
 	    engine::testing::Case{
 	        .name = "lm_head halves the permuted vocabulary, by no range of ids, and the embedding lives on no card",
 	        .holds = lm_head_splits_the_vocabulary(),
+	    },
+	    engine::testing::Case{
+	        .name = "a card's mask is the fewest whole words with a bit for every row of the card's lm_head",
+	        .holds = card_masks_cover_the_lm_head_rows(),
 	    },
 	    engine::testing::Case{
 	        .name = "no two inventory entries name the same tensor",

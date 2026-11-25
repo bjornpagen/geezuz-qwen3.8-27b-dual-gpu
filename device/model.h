@@ -241,6 +241,12 @@ static_assert(query_heads_per_card % (query_heads / kv_heads) == 0, "a card's qu
 static_assert(value_heads_per_card % (value_heads / key_heads) == 0, "a card's value groups are whole");
 static_assert(ffn % cards == 0 && vocab % cards == 0 && draft_vocab % cards == 0);
 
+/**
+ * Words of 64 bits in one card's mask of a verify row: a bit per row of the card's lm_head, in its row order, padding
+ * included. The grammar writes masks this wide, the pipeline carries them, and decode copies them to the cards.
+ */
+inline constexpr Count card_mask_words = divide_up(vocab_per_card, 64);
+
 /** How a tensor's elements are stored in the checkpoint. */
 enum class Format : unsigned char {
 	/**
