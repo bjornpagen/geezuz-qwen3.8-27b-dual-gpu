@@ -9,3 +9,5 @@ engine_test(device.ring SOURCES ring.test.cc LINK engine_device engine_driver_do
 if(ENGINE_PLATFORM STREQUAL "darwin")
 	engine_test(device.unavailable SOURCES unavailable.test.cc LINK engine_device)
 endif()
+
+engine_compile_fail(kernel_grid_exceeds_cards SOURCE crowded_kernel.cc LINK engine_device MATCH "a co-resident grid fits the cards at its budget")

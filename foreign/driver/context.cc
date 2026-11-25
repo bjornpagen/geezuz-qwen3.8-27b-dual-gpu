@@ -165,11 +165,11 @@ public:
 		auto const function = program.functions_[Program<Ks...>::template position<K>()];
 		return make_current().and_then([&] {
 			if constexpr (K::residency == Residency::CoResident) {
-				return call(api_.launch_cooperative_kernel, function, K::grid.x, K::grid.y, K::grid.z, K::block.x, K::block.y, K::block.z,
-				            std::uint32_t{K::shared_bytes}, stream.handle_, arguments.data());
+				return call(api_.launch_cooperative_kernel, function, K::grid.x, K::grid.y, K::grid.z, block_of<K>.x, block_of<K>.y,
+				            block_of<K>.z, shared_of<K>, stream.handle_, arguments.data());
 			} else {
-				return call(api_.launch_kernel, function, K::grid.x, K::grid.y, K::grid.z, K::block.x, K::block.y, K::block.z,
-				            std::uint32_t{K::shared_bytes}, stream.handle_, arguments.data(), static_cast<void**>(nullptr));
+				return call(api_.launch_kernel, function, K::grid.x, K::grid.y, K::grid.z, block_of<K>.x, block_of<K>.y, block_of<K>.z,
+				            shared_of<K>, stream.handle_, arguments.data(), static_cast<void**>(nullptr));
 			}
 		});
 	}
@@ -220,10 +220,9 @@ private:
 			                                       .second = *second,
 			                                   }});
 		}
-		return call(api_.func_set_attribute, function, FunctionAttribute::MaxDynamicSharedSizeBytes, core::narrow<int>(K::shared_bytes))
-		    .transform([&] {
-			    program.functions_[Program<Ks...>::template position<K>()] = function;
-		    });
+		return call(api_.func_set_attribute, function, FunctionAttribute::MaxDynamicSharedSizeBytes, K::budget.shared_bytes).transform([&] {
+			program.functions_[Program<Ks...>::template position<K>()] = function;
+		});
 	}
 
 	Api api_;

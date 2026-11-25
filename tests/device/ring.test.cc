@@ -2,6 +2,7 @@
 import std;
 import engine.core;
 import engine.device;
+import engine.driver;
 import engine.driver_double;
 import engine.testing;
 
@@ -48,6 +49,22 @@ struct Answer {
 	});
 	return work;
 }
+
+// The same layout laws the device compiler checks in its own unit, on the same shapes, from the host compiler.
+struct Words {
+	std::array<std::uint64_t, 15> word;
+};
+
+struct Byte {
+	std::uint8_t value;
+};
+
+using engine::device::ring::Layout;
+using engine::device::ring::line;
+
+static_assert(Layout<Words, Byte>::response == 2 * line && Layout<Words, Byte>::bytes == 3 * line);
+static_assert(Layout<Byte, Words>::response == line && Layout<Byte, Words>::bytes == 2 * line);
+static_assert(Layout<Work, Answer>::descriptor == 16 && Layout<Work, Answer>::result == line + 8);
 
 constexpr auto capacity = std::size_t{3};
 

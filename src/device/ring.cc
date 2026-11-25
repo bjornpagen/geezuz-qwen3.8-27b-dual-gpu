@@ -36,9 +36,9 @@ using Completion = std::variant<Ran<R>, Exited>;
 /**
  * The host's end of the resident ring between the host and one card's persistent kernel: `Capacity` slots of mapped,
  * pinned memory through which the host submits descriptors and the kernel returns results, in submission order. The
- * slot layout and the acquire/release protocol per ticket are `driver::RingSlot`'s; this owner keeps the host's
- * bookkeeping, which makes the protocol's one rule a fact of its state: at most `Capacity` tickets are in flight, so
- * the host never rewrites a slot the kernel has not answered or the host has not collected.
+ * slot layout and the acquire/release protocol per ticket are `ring::Slot`'s, the device header both ends compile; this owner keeps the
+ * host's bookkeeping, which makes the protocol's one rule a fact of its state: at most `Capacity` tickets are in flight, so the host never
+ * rewrites a slot the kernel has not answered or the host has not collected.
  *
  * The persistent kernel takes `device_address()` and `Capacity` and serves tickets 1, 2, 3, ... until the exit ticket.
  * The ring must outlive the kernel's last access, and die before the context it was allocated from.
@@ -48,10 +48,10 @@ class Ring {
 public:
 	static_assert(Capacity > 0, "a ring holds at least one ticket in flight");
 
-	using Slots = driver::MappedArray<driver::RingSlot<D, R>, Capacity>;
+	using Slots = driver::MappedArray<ring::Slot<D, R>, Capacity>;
 
 	[[nodiscard]] static auto create(driver::Context const& context) -> core::Result<Ring, driver::DeviceError> {
-		return context.allocate_mapped<driver::RingSlot<D, R>, Capacity>().transform([](Slots slots) {
+		return context.allocate_mapped<ring::Slot<D, R>, Capacity>().transform([](Slots slots) {
 			return Ring{std::move(slots)};
 		});
 	}
@@ -99,7 +99,7 @@ public:
 		if (exit_ == ticket) {
 			return Completion<R>{Exited{.ticket = ticket}};
 		}
-		return Completion<R>{Ran<R>{.ticket = ticket, .result = answered.result}};
+		return Completion<R>{Ran<R>{.ticket = ticket, .result = answered.response.result}};
 	}
 
 private:
@@ -113,8 +113,8 @@ private:
 		return Ticket{.value = published_};
 	}
 
-	[[nodiscard]] auto slot(Ticket ticket) -> driver::RingSlot<D, R>& {
-		return slots_.host()[driver::ring_index(ticket.value, Capacity)];
+	[[nodiscard]] auto slot(Ticket ticket) -> ring::Slot<D, R>& {
+		return slots_.host()[ring::index(ticket.value, Capacity)];
 	}
 
 	Slots slots_;

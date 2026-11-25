@@ -4,6 +4,7 @@ export module engine.device:devices;
 import std;
 import engine.core;
 import engine.driver;
+import engine.prims;
 import engine.ptx;
 
 namespace engine::device {
@@ -24,10 +25,12 @@ export [[nodiscard]] constexpr auto peer(Rank rank) -> Rank {
 	return std::to_underlying(rank);
 }
 
-/** The machine: two RTX 3090s (GA102, compute capability 8.6, 82 SMs, 24 GiB), bridged by all four nvlink links. */
+/**
+ * The machine: two RTX 3090s, bridged by all four nvlink links. Each card's compute capability is the target the
+ * embedded images declare and its SM count is the sm_86 machine the kernels' budgets are checked against; this
+ * module adds only what nothing else knows: how many cards, how many links, how much memory.
+ */
 export inline constexpr std::size_t card_count = ranks.size();
-export inline constexpr int compute_capability = 86;
-export inline constexpr int sm_count = 82;
 export inline constexpr std::uint32_t nvlink_links = 4;
 
 /**
@@ -49,10 +52,10 @@ export inline constexpr int required_driver_version = [] {
 
 [[nodiscard]] auto refusal(driver::CardFacts const& card) -> std::optional<driver::WrongCard> {
 	auto const capability = card.compute_major * 10 + card.compute_minor;
-	if (capability != compute_capability) {
+	if (capability != ptx::abi.header.sm) {
 		return driver::WrongCard{.ordinal = card.ordinal, .fact = driver::CardFact::ComputeCapability, .found = capability};
 	}
-	if (card.sm_count != sm_count) {
+	if (card.sm_count != prims::sm86.sms) {
 		return driver::WrongCard{.ordinal = card.ordinal, .fact = driver::CardFact::SmCount, .found = card.sm_count};
 	}
 	if (card.memory_bytes < memory_floor || card.memory_bytes > memory_ceiling) {

@@ -3,6 +3,8 @@ export module engine.driver_double:machine;
 
 import std;
 import engine.driver;
+import engine.prims;
+import engine.ptx;
 
 namespace engine::driver_double {
 
@@ -16,9 +18,9 @@ export enum class LinkModel : std::uint8_t {
 
 /** One modelled card. The defaults are an RTX 3090 bridged to its peer by all four links, running CUDA in P2. */
 export struct CardModel {
-	int compute_major = 8;
-	int compute_minor = 6;
-	int sm_count = 82;
+	int compute_major = ptx::abi.header.sm / 10;
+	int compute_minor = ptx::abi.header.sm % 10;
+	int sm_count = device::prims::sm86.sms;
 	std::uint64_t memory_bytes = 25'447'170'048;
 	std::array<LinkModel, 4> links = {LinkModel::ToPeer, LinkModel::ToPeer, LinkModel::ToPeer, LinkModel::ToPeer};
 	bool reaches_peer = true;

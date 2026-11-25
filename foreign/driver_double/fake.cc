@@ -4,6 +4,7 @@ export module engine.driver_double:fake;
 import std;
 import engine.core;
 import engine.driver;
+import engine.prims;
 import :machine;
 
 // A test double of the CUDA driver and NVML: plain functions with the vendors' C signatures, filled into the same
@@ -697,16 +698,17 @@ auto fake_func_set_attribute(CUfunction function, driver::FunctionAttribute attr
 		return Status::InvalidHandle;
 	}
 	if (attribute != driver::FunctionAttribute::MaxDynamicSharedSizeBytes || value < 0 ||
-	    std::cmp_greater(value, driver::max_shared_bytes)) {
+	    std::cmp_greater(value, device::prims::sm86.max_shared_per_block)) {
 		return Status::InvalidValue;
 	}
 	record->dynamic_shared = value;
 	return Status::Success;
 }
 
-/** The co-residency limit the fake applies: sm_86 holds at most 1536 threads per SM. */
+/** The co-residency limit the fake applies: the threads one sm_86 SM holds. */
 [[nodiscard]] auto co_resident_blocks(CUdevice ordinal, std::uint64_t block_threads) -> std::uint64_t {
-	return core::narrow<std::uint64_t>(card(ordinal).sm_count) * (1536 / block_threads);
+	return core::narrow<std::uint64_t>(card(ordinal).sm_count) *
+	       (core::narrow<std::uint64_t>(device::prims::sm86.max_threads_per_sm) / block_threads);
 }
 
 [[nodiscard]] auto launch(CUfunction function, driver::Dim grid, driver::Dim block, unsigned int shared, CUstream stream, void** parameters,
@@ -726,7 +728,7 @@ auto fake_func_set_attribute(CUfunction function, driver::FunctionAttribute attr
 	}
 	auto const threads = block.count();
 	constexpr auto default_shared = 48U * 1024;
-	if (grid.count() == 0 || threads == 0 || threads > driver::max_block_threads ||
+	if (grid.count() == 0 || threads == 0 || std::cmp_greater(threads, device::prims::sm86.max_threads_per_block) ||
 	    shared > std::max(default_shared, static_cast<unsigned int>(record->dynamic_shared))) {
 		return Status::InvalidValue;
 	}

@@ -3,6 +3,7 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.prims;
 import engine.ptx;
 import engine.testing;
 
@@ -47,6 +48,8 @@ constexpr auto probe_text = std::to_array(R"(//
 
 constexpr auto probe_image = engine::ptx::image(probe_text);
 
+using engine::device::prims::Budget;
+
 struct ProbeParams {
 	std::uint64_t ring;
 	std::uint64_t out;
@@ -63,9 +66,8 @@ struct WideParams {
 struct Probe {
 	static constexpr engine::ptx::Image image = probe_image;
 	static constexpr std::string_view entry = "probe";
-	static constexpr device::Dim grid = {.x = 82, .y = 1, .z = 1};
-	static constexpr device::Dim block = {.x = 256, .y = 1, .z = 1};
-	static constexpr std::uint32_t shared_bytes = 64 * 1024;
+	static constexpr device::Dim grid = {.x = static_cast<std::uint32_t>(engine::device::prims::sm86.sms), .y = 1, .z = 1};
+	static constexpr Budget budget = {.threads = 256, .registers_per_thread = 128, .shared_bytes = 64 * 1024, .blocks_per_sm = 1};
 	static constexpr device::Residency residency = device::Residency::CoResident;
 	using Params = ProbeParams;
 };
@@ -74,8 +76,7 @@ struct Wide {
 	static constexpr engine::ptx::Image image = probe_image;
 	static constexpr std::string_view entry = "wide";
 	static constexpr device::Dim grid = {.x = 4, .y = 2, .z = 1};
-	static constexpr device::Dim block = {.x = 128, .y = 1, .z = 1};
-	static constexpr std::uint32_t shared_bytes = 0;
+	static constexpr Budget budget = {.threads = 128, .registers_per_thread = 64, .shared_bytes = 0, .blocks_per_sm = 2};
 	static constexpr device::Residency residency = device::Residency::Ordinary;
 	using Params = WideParams;
 };
@@ -84,8 +85,7 @@ struct Absent {
 	static constexpr engine::ptx::Image image = probe_image;
 	static constexpr std::string_view entry = "absent";
 	static constexpr device::Dim grid = {.x = 1, .y = 1, .z = 1};
-	static constexpr device::Dim block = {.x = 32, .y = 1, .z = 1};
-	static constexpr std::uint32_t shared_bytes = 0;
+	static constexpr Budget budget = {.threads = 32, .registers_per_thread = 32, .shared_bytes = 0, .blocks_per_sm = 1};
 	static constexpr device::Residency residency = device::Residency::Ordinary;
 	using Params = WideParams;
 };
@@ -95,8 +95,7 @@ struct Narrow {
 	static constexpr engine::ptx::Image image = probe_image;
 	static constexpr std::string_view entry = "probe";
 	static constexpr device::Dim grid = {.x = 1, .y = 1, .z = 1};
-	static constexpr device::Dim block = {.x = 32, .y = 1, .z = 1};
-	static constexpr std::uint32_t shared_bytes = 0;
+	static constexpr Budget budget = {.threads = 32, .registers_per_thread = 32, .shared_bytes = 0, .blocks_per_sm = 1};
 	static constexpr device::Residency residency = device::Residency::Ordinary;
 	using Params = WideParams;
 };
@@ -106,21 +105,9 @@ struct Pair {
 	static constexpr engine::ptx::Image image = probe_image;
 	static constexpr std::string_view entry = "pair";
 	static constexpr device::Dim grid = {.x = 1, .y = 1, .z = 1};
-	static constexpr device::Dim block = {.x = 32, .y = 1, .z = 1};
-	static constexpr std::uint32_t shared_bytes = 0;
+	static constexpr Budget budget = {.threads = 32, .registers_per_thread = 32, .shared_bytes = 0, .blocks_per_sm = 1};
 	static constexpr device::Residency residency = device::Residency::Ordinary;
 	using Params = std::uint64_t;
-};
-
-/** More co-resident blocks than 82 SMs hold at 256 threads each. */
-struct Crowded {
-	static constexpr engine::ptx::Image image = probe_image;
-	static constexpr std::string_view entry = "probe";
-	static constexpr device::Dim grid = {.x = 82 * 7, .y = 1, .z = 1};
-	static constexpr device::Dim block = {.x = 256, .y = 1, .z = 1};
-	static constexpr std::uint32_t shared_bytes = 0;
-	static constexpr device::Residency residency = device::Residency::CoResident;
-	using Params = ProbeParams;
 };
 
 static_assert(device::Kernel<Probe> && device::Kernel<Wide>);
@@ -134,8 +121,8 @@ template<class Params>
 template<class K>
 [[nodiscard]] auto recorded_as(fake::Launch const& launch, typename K::Params const& params) -> bool {
 	return launch.ordinal == 1 && launch.entry == K::entry && launch.grid.count() == K::grid.count() &&
-	       launch.block.count() == K::block.count() && launch.shared_bytes == K::shared_bytes && launch.residency == K::residency &&
-	       launch.parameters == bytes_of(params);
+	       std::cmp_equal(launch.block.count(), K::budget.threads) && std::cmp_equal(launch.shared_bytes, K::budget.shared_bytes) &&
+	       launch.residency == K::residency && launch.parameters == bytes_of(params);
 }
 
 /** Every launch reaches the driver with the kernel's declared geometry and exactly the parameter bytes given. */
@@ -240,26 +227,30 @@ template<class K>
 	       driver.live(Kind::Module) == 0;
 }
 
-[[nodiscard]] auto a_grid_that_cannot_be_co_resident_is_refused() -> bool {
-	auto const driver = Fake{Machine{}};
-	auto const opened = Devices::open(driver.driver());
-	if (!opened) {
-		return false;
-	}
-	auto const& context = opened->context(Rank::Zero);
-	auto const program = context.load<Crowded>();
-	auto const stream = context.create_stream();
-	if (!program || !stream) {
-		return false;
-	}
-	auto const launched = context.launch<Crowded>(*program, *stream, ProbeParams{});
-	return !launched &&
-	       launched.error() == device::DeviceError{.reason =
-	                                                   device::Failure{
-	                                                       .symbol = "cuLaunchCooperativeKernel",
-	                                                       .status = device::Status::CooperativeLaunchTooLarge,
-	                                                   }} &&
-	       driver.launches().empty();
+[[nodiscard]] auto a_launch_the_driver_refuses_fails_with_its_status() -> bool {
+	auto const launch_call = [](std::optional<std::size_t> failing) -> std::pair<std::size_t, bool> {
+		auto const driver = Fake{Machine{.failing_call = failing}};
+		auto const opened = Devices::open(driver.driver());
+		if (!opened) {
+			return {0, false};
+		}
+		auto const& context = opened->context(Rank::Zero);
+		auto const program = context.load<Probe>();
+		auto const stream = context.create_stream();
+		if (!program || !stream) {
+			return {0, false};
+		}
+		// The launch makes its context current, then launches: the launch is the second call from here.
+		auto const before = driver.calls();
+		auto const launched = context.launch<Probe>(*program, *stream, ProbeParams{});
+		auto const refused = !launched && launched.error() == device::DeviceError{.reason = device::Failure{
+		                                                                              .symbol = "cuLaunchCooperativeKernel",
+		                                                                              .status = device::Status::Unknown,
+		                                                                          }};
+		return {before + 1, failing ? refused && driver.launches().empty() : launched.has_value()};
+	};
+	auto const [index, launched] = launch_call(std::nullopt);
+	return launched && launch_call(index).second;
 }
 
 }
@@ -287,8 +278,8 @@ auto main() -> int {
 	        .holds = a_signature_drift_is_refused_at_load(),
 	    },
 	    engine::testing::Case{
-	        .name = "a co-resident grid larger than the cards hold fails the launch with the driver's status",
-	        .holds = a_grid_that_cannot_be_co_resident_is_refused(),
+	        .name = "a launch the driver refuses fails with the driver's status and records nothing",
+	        .holds = a_launch_the_driver_refuses_fails_with_its_status(),
 	    },
 	};
 	return engine::testing::report(cases);

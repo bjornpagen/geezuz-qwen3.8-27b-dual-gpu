@@ -23,10 +23,6 @@ using driver::Residency;
 using driver::Stream;
 using driver::Wire;
 
-using driver::ring_line;
-using driver::RingLayout;
-using driver::RingSlot;
-
 using driver::MemoryClock;
 using driver::PciAddress;
 using driver::PerformanceState;

@@ -3,6 +3,8 @@ import std;
 import engine.core;
 import engine.device;
 import engine.driver_double;
+import engine.prims;
+import engine.ptx;
 import engine.testing;
 
 namespace {
@@ -97,10 +99,10 @@ using fake::Machine;
 	for (auto ordinal = 0; std::cmp_less(ordinal, cards.size()); ++ordinal) {
 		auto const& card = cards[static_cast<std::size_t>(ordinal)];
 		auto const capability = card.compute_major * 10 + card.compute_minor;
-		if (capability != device::compute_capability) {
+		if (capability != engine::ptx::abi.header.sm) {
 			return device::WrongCard{.ordinal = ordinal, .fact = device::CardFact::ComputeCapability, .found = capability};
 		}
-		if (card.sm_count != device::sm_count) {
+		if (card.sm_count != engine::device::prims::sm86.sms) {
 			return device::WrongCard{.ordinal = ordinal, .fact = device::CardFact::SmCount, .found = card.sm_count};
 		}
 		if (card.memory_bytes < device::memory_floor || card.memory_bytes > device::memory_ceiling) {

@@ -24,27 +24,27 @@ class RingDevice {
 public:
 	explicit RingDevice(driver::CUdeviceptr base)
 	    : /* SAFETY: under the fake the device address of mapped memory is its host address, and the ring outlives this. */
-	      slots_{reinterpret_cast<driver::RingSlot<D, R>*>(base)} {}
+	      slots_{reinterpret_cast<device::ring::Slot<D, R>*>(base)} {}
 
 	/** Serves the next ticket if the host has published it: `body` maps a descriptor to its result. */
 	template<class Body>
 	[[nodiscard]] auto step(Body& body) -> Served {
-		auto& slot = slots_[driver::ring_index(next_, Capacity)];
-		if (std::atomic_ref{slot.request}.load(std::memory_order_acquire) != next_) {
+		auto& slot = slots_[device::ring::index(next_, Capacity)];
+		if (std::atomic_ref{slot.request.ticket}.load(std::memory_order_acquire) != next_) {
 			return Served::Idle;
 		}
-		auto const command = slot.command;
-		core::invariant(command == driver::Command::Run || command == driver::Command::Exit);
-		if (command == driver::Command::Run) {
-			slot.result = body(slot.descriptor);
+		auto const command = slot.request.command;
+		core::invariant(command == device::ring::Command::Run || command == device::ring::Command::Exit);
+		if (command == device::ring::Command::Run) {
+			slot.response.result = body(slot.request.descriptor);
 		}
-		std::atomic_ref{slot.response}.store(next_, std::memory_order_release);
+		std::atomic_ref{slot.response.ticket}.store(next_, std::memory_order_release);
 		++next_;
-		return command == driver::Command::Run ? Served::Ran : Served::Exited;
+		return command == device::ring::Command::Run ? Served::Ran : Served::Exited;
 	}
 
 private:
-	driver::RingSlot<D, R>* slots_;
+	device::ring::Slot<D, R>* slots_;
 	std::uint64_t next_ = 1;
 };
 

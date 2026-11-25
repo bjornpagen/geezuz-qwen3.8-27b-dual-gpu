@@ -2,6 +2,7 @@
 export module engine.driver:program;
 
 import std;
+import engine.prims;
 import engine.ptx;
 import :abi;
 import :memory;
@@ -29,33 +30,46 @@ export enum class Residency : std::uint8_t {
 	CoResident,
 };
 
-/** sm_86's per-block limits: threads, and the opt-in dynamic shared memory ceiling. */
-export inline constexpr std::uint64_t max_block_threads = 1024;
-export inline constexpr std::uint32_t max_shared_bytes = 99 * 1024;
-
 /**
- * A kernel as the host launches it: the image holding it, its `extern "C"` entry name, its launch geometry and dynamic
- * shared memory (compile-time facts, never launch arguments), and the one parameter struct it takes by value.
+ * A kernel as the host launches it: the image holding it, its `extern "C"` entry name, its grid, its resource budget
+ * (the same `prims::Budget` the kernel `static_assert`s, whose threads and shared bytes the launch uses), how its
+ * blocks share the card, and the one parameter struct it takes by value. Every one is a compile-time fact, never a
+ * launch argument.
  */
 export template<class K>
 concept Kernel = requires {
 	{ K::image } -> std::convertible_to<ptx::Image>;
 	{ K::entry } -> std::convertible_to<std::string_view>;
 	{ K::grid } -> std::convertible_to<Dim>;
-	{ K::block } -> std::convertible_to<Dim>;
-	{ K::shared_bytes } -> std::convertible_to<std::uint32_t>;
+	{ K::budget } -> std::convertible_to<device::prims::Budget>;
 	{ K::residency } -> std::convertible_to<Residency>;
 	typename K::Params;
 } && Wire<typename K::Params>;
+
+/** The block a kernel launches with: its budget's threads, in one dimension. */
+template<Kernel K>
+inline constexpr Dim block_of = {.x = static_cast<std::uint32_t>(K::budget.threads), .y = 1, .z = 1};
+
+/** The dynamic shared memory a kernel launches with: its budget's, all of it. */
+template<Kernel K>
+inline constexpr std::uint32_t shared_of = static_cast<std::uint32_t>(K::budget.shared_bytes);
 
 /** The static laws of one kernel's declaration; a declaration that breaks one does not compile. */
 template<Kernel K>
 consteval auto lawful() -> bool {
 	constexpr auto entry = std::string_view{K::entry};
-	constexpr auto threads = Dim{K::block}.count();
-	return !entry.empty() && entry.data()[entry.size()] == '\0' && Dim{K::grid}.count() > 0 && threads > 0 &&
-	       threads <= max_block_threads && threads % 32 == 0 && K::shared_bytes <= max_shared_bytes &&
+	return !entry.empty() && entry.data()[entry.size()] == '\0' && Dim{K::grid}.count() > 0 && device::prims::fits(K::budget) &&
 	       ptx::Image{K::image}.header == ptx::abi.header;
+}
+
+/**
+ * A co-resident kernel's grid fits the cards at its budget's occupancy, so the driver's refusal of an oversized
+ * cooperative grid is a budget error caught while compiling.
+ */
+template<Kernel K>
+consteval auto co_resident() -> bool {
+	constexpr auto resident = static_cast<std::uint64_t>(device::prims::sm86.sms) * static_cast<std::uint64_t>(K::budget.blocks_per_sm);
+	return K::residency == Residency::Ordinary || Dim{K::grid}.count() <= resident;
 }
 
 export class Context;
@@ -68,8 +82,9 @@ export template<Kernel... Ks>
     requires(sizeof...(Ks) > 0)
 class Program {
 public:
-	static_assert((lawful<Ks>() && ...), "a kernel's entry is a NUL-terminated name, its block a whole number of warps "
-	                                     "within sm_86's limits, and its image shares the engine's header");
+	static_assert((lawful<Ks>() && ...), "a kernel's entry is a NUL-terminated name, its budget fits an sm_86 SM, and "
+	                                     "its image shares the engine's header");
+	static_assert((co_resident<Ks>() && ...), "a co-resident grid fits the cards at its budget's occupancy");
 	/** The image every kernel of the program comes from. */
 	static constexpr ptx::Image image = std::tuple_element_t<0, std::tuple<Ks...>>::image;
 
