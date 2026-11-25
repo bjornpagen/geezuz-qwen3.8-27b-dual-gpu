@@ -38,7 +38,9 @@ using Block = std::array<Bf16, mma::block_products>;
 		}
 	}
 	if (largest == std::numeric_limits<int>::min()) {
-		auto const all_negative = std::ranges::all_of(terms, [](double zero) { return std::signbit(zero); });
+		auto const all_negative = std::ranges::all_of(terms, [](double zero) {
+			return std::signbit(zero);
+		});
 		return all_negative ? -0.0F : 0.0F;
 	}
 	auto const least = largest - 24;
@@ -91,10 +93,12 @@ struct Spread {
 		auto a = Block{};
 		auto b = Block{};
 		for (auto index = std::size_t{0}; index < a.size(); ++index) {
-			a.at(index) = random() % 16 == 0 ? Bf16{.bits = static_cast<unsigned short>(random() & 0x8000U)} : draw_bf16(random, operands.low, operands.high);
+			a.at(index) = random() % 16 == 0 ? Bf16{.bits = static_cast<unsigned short>(random() & 0x8000U)}
+			                                 : draw_bf16(random, operands.low, operands.high);
 			b.at(index) = draw_bf16(random, operands.low, operands.high);
 		}
-		auto const c = random() % 8 == 0 ? std::bit_cast<float>(static_cast<std::uint32_t>(random() & 0x80000000U)) : draw_fp32(random, addends.low, addends.high);
+		auto const c = random() % 8 == 0 ? std::bit_cast<float>(static_cast<std::uint32_t>(random() & 0x80000000U))
+		                                 : draw_fp32(random, addends.low, addends.high);
 		if (!same_bits(mma::block<mma::sm86>(c, a, b), oracle(c, a, b))) {
 			return false;
 		}
@@ -284,16 +288,23 @@ using V100Block = std::array<Bf16, 4>;
 	auto b = std::array<std::array<int, 8>, 16>{};
 	auto c = std::array<std::array<int, 8>, 16>{};
 	for (auto& row : a) {
-		std::ranges::generate(row, [&] { return static_cast<int>(random() % 31) - 15; });
+		std::ranges::generate(row, [&] {
+			return static_cast<int>(random() % 31) - 15;
+		});
 	}
 	for (auto& row : b) {
-		std::ranges::generate(row, [&] { return static_cast<int>(random() % 31) - 15; });
+		std::ranges::generate(row, [&] {
+			return static_cast<int>(random() % 31) - 15;
+		});
 	}
 	for (auto& row : c) {
-		std::ranges::generate(row, [&] { return static_cast<int>(random() % 1001) - 500; });
+		std::ranges::generate(row, [&] {
+			return static_cast<int>(random() % 1001) - 500;
+		});
 	}
 	auto const pack = [](int first, int second) {
-		return static_cast<std::uint32_t>(bf16(static_cast<float>(first)).bits) | (static_cast<std::uint32_t>(bf16(static_cast<float>(second)).bits) << 16U);
+		return static_cast<std::uint32_t>(bf16(static_cast<float>(first)).bits) |
+		       (static_cast<std::uint32_t>(bf16(static_cast<float>(second)).bits) << 16U);
 	};
 	auto operands = mma::WarpOperands{};
 	for (auto lane = 0; lane < 32; ++lane) {
@@ -303,7 +314,7 @@ using V100Block = std::array<Bf16, 4>;
 			auto const high = prims::fragment::a(lane, reg, 1);
 			operands.a.at(at).at(static_cast<std::size_t>(reg)) =
 			    pack(a.at(static_cast<std::size_t>(low.row)).at(static_cast<std::size_t>(low.column)),
-			         a.at(static_cast<std::size_t>(high.row)).at(static_cast<std::size_t>(high.column)));
+				     a.at(static_cast<std::size_t>(high.row)).at(static_cast<std::size_t>(high.column)));
 			auto const accumulator = prims::fragment::c(lane, reg);
 			operands.c.at(at).at(static_cast<std::size_t>(reg)) =
 			    static_cast<float>(c.at(static_cast<std::size_t>(accumulator.row)).at(static_cast<std::size_t>(accumulator.column)));
@@ -313,7 +324,7 @@ using V100Block = std::array<Bf16, 4>;
 			auto const high = prims::fragment::b(lane, reg, 1);
 			operands.b.at(at).at(static_cast<std::size_t>(reg)) =
 			    pack(b.at(static_cast<std::size_t>(low.row)).at(static_cast<std::size_t>(low.column)),
-			         b.at(static_cast<std::size_t>(high.row)).at(static_cast<std::size_t>(high.column)));
+				     b.at(static_cast<std::size_t>(high.row)).at(static_cast<std::size_t>(high.column)));
 		}
 	}
 	auto const result = mma::warp_mma(operands);
@@ -346,17 +357,23 @@ static_assert(folded == 16.5F);
 
 auto main() -> int {
 	auto const cases = std::array{
-	    engine::testing::Case{.name = "block matches the double oracle, cancelling exponents (seed 1)", .holds = agrees_with_oracle(1, {.low = 120, .high = 135}, {.low = 118, .high = 140})},
-	    engine::testing::Case{.name = "block matches the double oracle, wide exponents (seed 2)", .holds = agrees_with_oracle(2, {.low = 60, .high = 190}, {.low = 1, .high = 254})},
-	    engine::testing::Case{.name = "block matches the double oracle, subnormal operands (seed 3)", .holds = agrees_with_oracle(3, {.low = 0, .high = 40}, {.low = 0, .high = 20})},
-	    engine::testing::Case{.name = "step is exact when every term and sum is representable (seed 4)", .holds = exact_when_representable(4)},
-	    engine::testing::Case{.name = "one-signed blocks truncate toward zero within the window (seed 5)", .holds = truncates_toward_zero(5)},
+	    engine::testing::Case{.name = "block matches the double oracle, cancelling exponents (seed 1)",
+		                      .holds = agrees_with_oracle(1, {.low = 120, .high = 135}, {.low = 118, .high = 140})},
+	    engine::testing::Case{.name = "block matches the double oracle, wide exponents (seed 2)",
+		                      .holds = agrees_with_oracle(2, {.low = 60, .high = 190}, {.low = 1, .high = 254})},
+	    engine::testing::Case{.name = "block matches the double oracle, subnormal operands (seed 3)",
+		                      .holds = agrees_with_oracle(3, {.low = 0, .high = 40}, {.low = 0, .high = 20})},
+	    engine::testing::Case{.name = "step is exact when every term and sum is representable (seed 4)",
+		                      .holds = exact_when_representable(4)},
+	    engine::testing::Case{.name = "one-signed blocks truncate toward zero within the window (seed 5)",
+		                      .holds = truncates_toward_zero(5)},
 	    engine::testing::Case{.name = "a block's sum does not depend on product order (seed 6)", .holds = block_ignores_order(6)},
 	    engine::testing::Case{.name = "blocks chain as (c + T1) + T2 in k order", .holds = blocks_chain_in_k_order()},
 	    engine::testing::Case{.name = "the published tensor-core experiments reproduce", .holds = reproduces_published_experiments()},
 	    engine::testing::Case{.name = "zero sums are +0 unless every term is -0", .holds = zero_signs()},
 	    engine::testing::Case{.name = "results past fp32 truncate to the largest finite", .holds = overflow_truncates_to_largest()},
-	    engine::testing::Case{.name = "the warp form is the matrix product through the fragment maps (seed 7)", .holds = warp_form_is_the_matrix_product(7)},
+	    engine::testing::Case{.name = "the warp form is the matrix product through the fragment maps (seed 7)",
+		                      .holds = warp_form_is_the_matrix_product(7)},
 	};
 	return engine::testing::report(cases);
 }

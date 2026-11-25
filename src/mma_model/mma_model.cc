@@ -125,9 +125,13 @@ export template<Datapath datapath>
 	for (auto index = std::size_t{0}; index < a.size(); ++index) {
 		terms.at(index + 1) = product(a[index], b[index]);
 	}
-	auto const nonzero = [](Term const& candidate) { return candidate.magnitude != 0; };
+	auto const nonzero = [](Term const& candidate) {
+		return candidate.magnitude != 0;
+	};
 	if (std::ranges::none_of(terms, nonzero)) {
-		auto const all_negative = std::ranges::all_of(terms, [](Term const& zero) { return zero.negative; });
+		auto const all_negative = std::ranges::all_of(terms, [](Term const& zero) {
+			return zero.negative;
+		});
 		return all_negative ? -0.0F : 0.0F;
 	}
 	auto largest = std::numeric_limits<int>::min();
@@ -174,8 +178,7 @@ export template<std::size_t k>
 	static_assert(k % block_products == 0 && k > 0, "the tensor core sums whole blocks");
 	auto d = c;
 	for (auto first = std::size_t{0}; first < k; first += block_products) {
-		d = block<sm86>(d, a.subspan(first).template first<block_products>(),
-		                b.subspan(first).template first<block_products>());
+		d = block<sm86>(d, a.subspan(first).template first<block_products>(), b.subspan(first).template first<block_products>());
 	}
 	return d;
 }
