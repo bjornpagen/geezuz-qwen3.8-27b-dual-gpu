@@ -2,13 +2,21 @@
 
 status: proposed, awaiting approval. no engine code has changed yet.
 
-speed numbers are back-of-envelope estimates from upstream geezuz's published measurements and 3090 specs. none
-were measured on this box. the code-only phase (section 9) builds and type-checks; real numbers start when the
+this plan has two parts:
+- **part 1, must do**: the mandated cleanup, plus the performance work that is certain from first principles. it
+  goes in regardless.
+- **part 2, experiments**: everything with an uncertain payoff. each has a hypothesis, why it's uncertain, how to
+  measure it, and when to kill it.
+
+speed numbers are back-of-envelope estimates from upstream geezuz's published measurements and 3090 specs, not
+measurements on this box. the code-only phase (section 1.10) builds and type-checks; real numbers start when the
 hardware is up.
 
 ---
 
-## 0. decisions (locked)
+## 0. shared ground
+
+### 0.1 decisions (locked)
 
 | decision | value |
 |---|---|
@@ -17,222 +25,186 @@ hardware is up.
 | gpus | exactly two rtx 3090 (sm_86, 82 SMs, 24 gb each), water cooled, nvlink bridged, tensor parallel 2 |
 | host | x86_64 linux on the epyc, bare metal |
 | numerics | bf16 activations, fp32 accumulation, fp32 residual stream, fp32 deltanet state, bf16 kv cache |
-| parallel requests | required. fixed slot count compiled in, `S = 8` to start (one constant, revisited with measurements) |
-| memory overclock | yes, gated by the determinism harness (no ecc on gddr6x, so a bad clock is silent corruption) |
+| parallel requests | required. fixed slot count compiled in, `S = 8` |
+| memory overclock | yes, gated by the determinism harness |
 | license | agpl-3.0 stays (inherited from open-jet via geezuz). refactor in place; credits kept |
-| toolchain | latest stable clang/llvm and libc++, system cuda toolkit, no version pinning beyond "latest stable", dynamic linking |
+| toolchain | latest stable clang/llvm and libc++, system cuda toolkit, no exact pins, dynamic linking |
 | language | cpp-starter's c++26 dialect without reflection, compiled by clang; idris-mlir's engineering principles |
 | async | `std::execution` (stdexec until libc++ ships it) for all orchestration around the kernels |
 | build | cmake generating ninja, presets only |
 | phase now | code only: build and type-check, no gpu runs until the box is up |
 
-nothing is configurable that the hardware or the model already fixes. no runtime flags, environment switches,
-compatibility options or fallbacks that choose between implementations. one path per job. the build presets and the
-baked weight image are the only configuration.
+nothing is configurable that the hardware or the model already fixes: no runtime flags, environment switches,
+compatibility options or fallbacks that choose between implementations. the build presets and the baked weight
+image are the only configuration.
 
----
-
-## 1. the lossless contract
+### 0.2 the lossless contract
 
 full bf16 is 54 gb and does not fit in 48 gb, so the reference function is qwen's own fp8 checkpoint: 24.70b params
 in e4m3 and 3.08b in bf16 (lm_head, embeddings, norms, small linear_attn params, mtp fc). the engine computes exactly
 that function:
 
-- e4m3 to bf16 conversion is exact (every e4m3 value is a bf16 value); the block scale is applied in fp32.
-- weights only are quantized. activations stay bf16: no fp8 or int8 activation quantization, even though the
-  checkpoint says `activation_scheme: dynamic`, because that is a hopper speed trick and moves further from bf16.
-- every matmul accumulates in fp32. the residual stream and the deltanet state are fp32. the kv cache is bf16, which
-  is exactly what the reference attention sees.
+- e4m3 to bf16 conversion is exact; the block scale is applied in fp32.
+- weights only are quantized. activations stay bf16, even though the checkpoint says `activation_scheme: dynamic`.
+- every matmul accumulates in fp32; the residual stream and deltanet state are fp32; the kv cache is bf16.
 - lm_head runs in bf16 with exact top-k and argmax merged across the two cards.
-- speculative decoding verifies exactly. greedy output equals the model's greedy choice; sampling uses rejection
-  sampling, so the output distribution is unchanged.
-- sampling parameters are implemented exactly for every value the server accepts. a value outside the implemented
-  set is refused at the boundary with a named error, never approximated.
+- speculative decoding verifies exactly (greedy is exact; sampling uses rejection sampling).
+- sampling parameters are exact for every value the server accepts; anything else is refused with a named error.
 - the only allowed difference is floating-point summation order.
 
-outside the boundary, free to change because they only move acceptance rates, never output: the mtp drafter, the draft
-vocabulary, suffix drafting, tree shape, slot scheduling and the row budget.
+outside the boundary, because they only move acceptance rates: the drafter, the draft vocabulary, suffix drafting,
+tree shape, slot scheduling and the row budget.
 
----
+**excluded by the contract, don't re-propose:**
+- any 4-bit or sub-8-bit main-model weights;
+- int8 or fp8 activations;
+- fp8, int8 or 4-bit kv;
+- bf16 deltanet state;
+- fp16-accumulate matmuls;
+- int8 or bf16 compression of the cross-card partial sums.
 
-## 2. the byte and flop budget (per card, one decode cycle)
+### 0.3 the budget (per card, one decode cycle)
 
 | item | bytes | at 936 gb/s | at ~88% |
 |---|---|---|---|
 | body (fp8, 64 layers, half of each matrix) | 12.19 gb | 13.0 ms | 14.8 ms |
 | lm_head (bf16, half of 248,320 vocab) | 1.27 gb | 1.36 ms | 1.5 ms |
 | **main pass** | **13.46 gb** | **14.4 ms** | **16.3 ms** |
-| mtp head (~5 passes: catch-up + 4 drafts), as shipped | ~1.2 gb | 1.3 ms | — |
-| draft lm_head (32k vocab, 4 steps), as shipped | ~0.65 gb | 0.7 ms | — |
+| mtp head (~5 passes: catch-up + 4 drafts) | ~1.2 gb | 1.3 ms | — |
+| draft lm_head (32k vocab, 4 steps) | ~0.65 gb | 0.7 ms | — |
 | kv reads (bf16, 2 kv heads per card x 16 layers) | 32 kb x context tokens, per slot | 1.0 ms per 30k tokens | — |
 
-$$\text{tok/s per slot} = \frac{\tau}{t_{\text{cycle}}}, \qquad t_{\text{cycle}} \approx \max\left(t_{\text{bytes}},\ t_{\text{flops}}\right) + t_{\text{serial}}$$
+$$t_{\text{cycle}} \approx \max\left(t_{\text{bytes}},\ t_{\text{flops}}\right) + t_{\text{serial}}, \qquad \text{tok/s per slot} = \frac{\tau}{t_{\text{cycle}}}$$
 
-**the compute ceiling matters for lossless.** on the 3090, bf16 tensor-core math with fp32 accumulation runs at half
-the fp16-accumulate rate: ~71 tflops dense per card. one verify row costs ~27 gflop per card, ~0.38 ms at peak and
-~0.5 ms realistically:
+**the compute ceiling.** on the 3090, bf16 tensor-core math with fp32 accumulation runs at ~71 tflops dense per card,
+half the fp16-accumulate rate. one verify row costs ~27 gflop per card, ~0.5 ms realistically:
 
 $$t_{\text{flops}}(R) \approx 0.5\ \text{ms} \times R$$
 
-| rows per cycle R | compute | against the 16.3 ms weight stream |
-|---|---|---|
-| 16 | ~8 ms | hidden |
-| 24 | ~12 ms | hidden, little headroom |
-| 32 | ~16 ms | equal: compute-bound from here |
-| 40 | ~20 ms | compute-bound |
+compute crosses the 16.3 ms weight stream at about 32 rows. the engine therefore spends a **row budget of ~24 rows per
+cycle**, shared by all slots and their drafts: a compile-time constant, retuned on hardware.
 
-so the whole engine spends a **row budget of ~24 rows per cycle**, shared by all slots and their drafts. it is a
-compile-time constant, retuned on hardware. this replaces the earlier assumption that 32 rows are free: that holds
-for int8 math, which the lossless contract excludes.
-
-**vram per card.** ~13.5 gb weights plus ~1 gb workspace leaves ~9 gb: about 280k tokens of bf16 kv, shared by all
-slots through the paged pool. deltanet state is ~75 mb per slot per card (fp32), ~600 mb at 8 slots, plus prefix
-snapshots. the embedding table (2.54 gb bf16) stays in pinned host memory: one row per token.
+**vram per card.**
+- ~13.5 gb weights plus ~1 gb workspace leaves ~9 gb: about 280k tokens of bf16 kv, shared by all slots.
+- deltanet state is ~75 mb per slot (fp32), ~600 mb at 8 slots, plus snapshots.
+- the embedding table (2.54 gb bf16) lives in pinned host memory.
 
 ---
 
-## 3. the cull: what gets deleted from geezuz
+# part 1: must do
 
-hard cutover: each item is replaced outright, with no shim, alias or "remove later". the dead code, tests, docs and
-comments go in the same change. the hardware baseline (phase b) uses upstream's `v0.3.2` release build, so nothing
-old is kept in-tree for comparison.
+## 1.1 the cull
+
+hard cutover: each item is replaced outright, with no shim, alias or "remove later". dead code, tests, docs and
+comments go in the same change. the hardware baseline uses upstream's `v0.3.2` release build, so nothing old stays
+in-tree for comparison.
 
 | geezuz has | becomes |
 |---|---|
 | `MK_TP` 1 and 2, the one-gpu build and library, sequential one-gpu slots | tensor parallel 2 only |
 | q4_k / q5_k / q6_k / q8_0 per-tensor types, `gguf.h`, the k-quant re-layouts | one e4m3 + block-scale path from the baked image |
 | dp4a gemv for ≤10 rows, int8 mma above, per-type gemv instances (`mma.cuh`, `q8_tile.h`) | one bf16 tensor-core gemv for 1 to R rows |
-| int8 activation quantization (q8_1-style) and folding the next norm into the quantizer | bf16 activations |
-| int8 / bf16 cross-card exchange (`MK_OPT`) and the pcie p2p flag protocol | fp32 partials over nvlink, fused into the gemv epilogue |
+| int8 activation quantization and folding the next norm into the quantizer | bf16 activations |
+| int8 / bf16 cross-card exchange (`MK_OPT`) and the pcie p2p flag protocol | fp32 partials over nvlink |
 | sm_86 / sm_89 / sm_120 builds and `ARCH=` | sm_86 only |
-| `--kv f16/q8/auto`, the q8 kv path, 64/128-token blocks, `--kv-mem` | bf16 kv, one block size, the pool sized from the vram budget at build time |
-| `MK_OPT`, `MK_BATCH_ROWS`, `MK_PF_CAP`, `MK_EMBD_DEVICE`, `MK_PREFILL=mk`, `MK_DRAFT_SAMPLING`, `MK_DEVICES` | fixed choices compiled in (card order fixed by nvlink topology) |
+| `--kv f16/q8/auto`, the q8 kv path, 64/128-token blocks, `--kv-mem` | bf16 kv, one block size, pool geometry fixed at build time |
+| `MK_OPT`, `MK_BATCH_ROWS`, `MK_PF_CAP`, `MK_EMBD_DEVICE`, `MK_PREFILL=mk`, `MK_DRAFT_SAMPLING`, `MK_DEVICES` | fixed choices compiled in |
 | fp16-accumulate prefill gemm (`f16.f16.f16.f16` mma) | bf16 x bf16 to fp32 |
-| `-d 0..4`, the rejected-draft depth drop, 16-vs-32 row caps by slot count | one drafting policy under the row budget (section 7c) |
+| `-d 0..4`, the rejected-draft depth drop, 16-vs-32 row caps by slot count | one drafting policy under the row budget |
 | `--slots 1..8` | `S = 8` compiled in |
-| libllama for tokenization, the jinja chat template from the gguf | our qwen bpe tokenizer and a hardcoded qwen3.8 chat format (thinking, tool calls) |
+| libllama for tokenization, the jinja chat template from the gguf | our qwen bpe tokenizer and a hardcoded qwen3.8 chat format |
 | `mk_server.py`, `capi.cpp`, python benches and tests, docker, box scripts, Makefile, `make release` | one c++ server, tools and tests on cmake + ninja |
-| `tools/llama_ref`, `logit_stats.h`, `--kld` against llama.cpp | the cpu fp32 reference over the same fp8 checkpoint (section 8) |
+| `tools/llama_ref`, `logit_stats.h`, `--kld` against llama.cpp | the cpu fp32 reference over the same fp8 checkpoint |
 | `MK_PROFILE`, `MK_HOST_PROF`, `MK_PF_PROFILE` | a `profile` build preset |
-| `--raw`, `--ids`, `--prompt-ids`, `--turn2`, `--score` cli surface | a small cli over the same pipeline, plus the harness tools |
+| `--raw`, `--ids`, `--prompt-ids`, `--turn2`, `--score` | a small cli over the same pipeline, plus the harness tools |
 
 kept as ideas and rewritten in the new style:
-- the persistent megakernel;
-- lazy-replay deltanet rollback;
-- the paged kv pool with a radix prefix cache, deltanet snapshots, copy-on-write and preemption;
-- the shared-snapshot prefill deduplication;
-- the draft vocabulary;
+- the persistent megakernel and lazy-replay deltanet rollback;
+- the paged kv pool with radix prefix cache, deltanet snapshots, copy-on-write and preemption;
+- shared-snapshot prefill deduplication;
+- the 32k draft vocabulary;
 - double-buffered split-k attention;
-- prefill that leaves exactly the state the decode kernel expects;
-- the server's scheduling policy: fair chunked prefill, longest-cached-prefix slot assignment, and turn replay for
-  the prefix cache.
+- prefill that leaves exactly the state decode expects;
+- the server's scheduling policy: fair chunked prefill, longest-cached-prefix slot assignment, turn replay.
 
----
+## 1.2 toolchain and rules
 
-## 4. language, toolchain and rules
-
-### 4.1 toolchain
+### toolchain
 
 - **latest stable clang/llvm** for host c++26 and cuda device code (clang's cuda mode, `--cuda-gpu-arch=sm_86`), with
   **libc++**. no gnu compiler or runtime. dynamic linking.
-- **the system cuda toolkit**, the newest one that latest stable clang supports (clang lags new toolkits; `PINS.md`
-  records which pair is in use).
-- **device code without cudart.** clang compiles the kernels to cubin, the cubin is embedded in the binary, and the
-  host loads it with the cuda driver api (`cuModuleLoadData`). the only nvidia user-space library at runtime is the
-  driver.
-- **cmake generating ninja; presets are the only interface:**
+- **the system cuda toolkit**: the newest one latest stable clang supports. `PINS.md` records the pair in use.
+- **no cudart.** clang compiles the kernels to cubin, the cubin is embedded in the binary, and the host loads it
+  with the cuda driver api. the driver is the only nvidia runtime library.
+- **cmake generating ninja**, presets only:
 
   | preset | purpose |
   |---|---|
-  | `dev` | `-O1`, warnings as errors, trap-mode ubsan on host, device invariant checks on |
+  | `dev` | `-O1`, warnings as errors, trap-mode ubsan on host, device invariant checks |
   | `release` | `-O3`, lto, device checks off |
   | `asan-ubsan` | host-only runtime sanitizers for the cpu test suite |
   | `profile` | release plus the per-phase profiler |
-  | `lint` | clang-tidy over the whole graph (no reflection means clang sees everything) |
+  | `lint` | clang-tidy over the whole graph |
 
-- the configure gate rejects anything but x86_64 linux with a clang/libc++/cuda toolkit present. it checks presence
-  and minimum feature level, not exact versions.
+- the configure gate rejects anything but x86_64 linux with clang, libc++ and a cuda toolkit present.
 - `-std=c++26 -fno-exceptions -fno-rtti`, warnings as errors, host assertions always on.
-- `.clang-format` taken unchanged from cpp-starter (llvm base, tabs, 140 columns).
+- `.clang-format` taken unchanged from cpp-starter.
 
-### 4.2 what comes over from cpp-starter (the 80/20)
+### from cpp-starter (the 80/20)
 
 copied and adapted:
-- **AGENTS.md**: the "one concept, one primitive" table, minus the reflection rows and with clang as the
-  authoritative compiler. also its sections on modules, zones, structural typing, data modeling, `struct` vs
-  `class`, no runtime oo or rtti, no exceptions and the error algebra, ownership and borrowing, no shared
-  ownership, mutation, concurrency and the reactor law, casting, numeric conversions, c remnants, i/o and
-  formatting, api shape, boolean parameters, resource classes, allocation, testing, suppressions, enforcement, and
-  the review checklist.
-- **build files**: `CMakeLists.txt` skeleton and the centralized language-profile interface target,
-  `CMakePresets.json`, `.clang-format`, `.clang-tidy` (now two profiles: a dialect profile for `src/`, `tests/` and
-  `tools/`, and a quarantine profile for `device/`, `foreign/` and `unsafe/`).
-- **`src/handle.cc`**: generational handles. slots, kv blocks and connections are referenced by
-  `{index, generation}`.
-- **`src/core.cc`**: the `std::expected` error shape and the "errors are decision surfaces" pattern.
-- **`foreign/exec.cc` + `exec.backend.cc`**: the stdexec boundary. its narrow-abi quarantine was a workaround for a
-  gcc ice (`PIN(gcc-gmf-stdexec-ice)`); under clang, retest importing stdexec inside the module graph and delete the
-  workaround if it is clean.
-- **`unsafe/net.cc`, `net.loop.cc`, `net.linux.cc`, `net.internal.h`**: the bounded single-threaded epoll reactor,
-  linux backend only.
-- **`src/http.cc`**: the bounded http parser and writer, extended for what an openai endpoint needs (section 6).
-- **`tests/compile_fail/`**: the compile-fail harness (for example, a discarded `std::expected` must not compile).
-- **`PINS.md`**: kept as the ledger of deliberate deviations and the toolchain pair in use. no exact pins.
+- **AGENTS.md**: the "one concept, one primitive" table, minus the reflection rows and with clang authoritative.
+  also its sections on modules, source zones, structural typing, data modeling, `struct` vs `class`, no oo or rtti,
+  no exceptions and the error algebra, ownership and borrowing, no shared ownership, mutation, concurrency and the
+  reactor law, casting, numeric conversions, c remnants, i/o, api shape, boolean parameters, resource classes,
+  allocation, testing, suppressions, enforcement, and the review checklist.
+- **build files**: the `CMakeLists.txt` skeleton with the language-profile target, `CMakePresets.json`,
+  `.clang-format`, `.clang-tidy` (split into a dialect profile and a quarantine profile).
+- **`src/handle.cc`**: generational `{index, generation}` handles for slots, kv blocks and connections.
+- **`src/core.cc`**: the `std::expected` error shape ("errors are decision surfaces").
+- **`foreign/exec.cc` + `exec.backend.cc`**: the stdexec boundary. its narrow-abi quarantine was a gcc ice workaround;
+  under clang, retest importing stdexec inside the module graph and delete the workaround if it is clean.
+- **`unsafe/net.cc`, `net.loop.cc`, `net.linux.cc`, `net.internal.h`**: the bounded single-threaded epoll reactor.
+- **`src/http.cc`**: bounded http, extended with request bodies and sse streaming.
+- **`tests/compile_fail/`** and **`PINS.md`** (the ledger of the toolchain pair and deliberate deviations).
 
-dropped:
-- reflection (`src/enums.cc`, the reflection parts of `tests/conformance.test.cc`);
-- the gcc gate and the `upstream/` gcc defect ledger;
-- the darwin/arm64 machine boundary and `net.darwin.cc`;
-- static-linking and hardening-flag policy beyond what `dev` keeps.
+dropped: reflection (`src/enums.cc` and the reflection tests), the gcc gate and gcc defect ledger, darwin/arm64 and
+`net.darwin.cc`, the static-linking and hardening policy beyond `dev`.
 
-### 4.3 what comes over from idris-mlir (principles, written into AGENTS.md)
+### from idris-mlir (principles, written into AGENTS.md)
 
-- **representation first.** before adding a branch, flag or guard, change the data, types and invariants until the
-  case can't be expressed. a handoff names, per obligation, the state made unrepresentable, the check moved to a
-  boundary, or the branch deleted.
-- **no static fact paid for at runtime.** every shape, offset, tile schedule, head split, buffer size and pool
-  geometry is a compile-time constant from one model description, checked with `static_assert`. the only runtime
-  facts are the input tokens, the context lengths, which slots are live, and the machine's identity.
-- **one fact, held once.** model dimensions live in exactly one place (section 5.2); kernels, the baker, the
-  host and the tests derive from it.
-- **hard cutover, hard culling.** no dual paths or compatibility options. a replaced part is deleted with its tests
-  and docs.
-- **delete before you optimize.** every part names the fact only it supplies.
-- **a blowup is a bug**, fixed at its cause, never capped.
+- **representation first**: change data, types and invariants until the special case can't be expressed, before
+  adding a branch, flag or guard.
+- **no static fact paid for at runtime**: every shape, offset, tile schedule, head split, buffer size and pool
+  geometry is a compile-time constant checked with `static_assert`. the only runtime facts are the tokens, the
+  lengths, which slots are live, and the machine's identity.
+- **one fact, held once**: model dimensions live in one place (section 1.3).
+- **hard cutover, hard culling. delete before you optimize. a blowup is a bug, fixed at its cause.**
 - **a choice is a type or an enum case, never a `bool`.**
-- **comments explain why**, not what, and cite no documents or rule numbers. new files carry
-  `// SPDX-License-Identifier: AGPL-3.0-only`. upstream's notices say "version 3" without "or later", so `-only`
-  matches; confirm when stamping.
+- **comments explain why.** new files carry `// SPDX-License-Identifier: AGPL-3.0-only` (upstream says "version 3",
+  not "or later"; confirm when stamping).
 - **report numbers honestly**: what was measured, on what, how many runs.
-- **tests check behaviour** (logits against the reference, token streams, pool invariants, exit statuses), never
-  incidental output.
-- **done means built and checked here.** in the code-only phase: it compiles with zero warnings, lints clean, the
-  device code passes its resource gates, and the cpu tests pass. type-checked is not built.
+- **tests check behaviour**, never incidental output.
+- **done means built and checked here**; type-checked is not built.
 
-### 4.4 device code rules (new)
+### device code rules (new)
 
-the cuda kernels are a quarantine zone. device code can't import c++ modules, so the dialect's "no headers" rule
-can't hold there. inside the zone:
-- c++26 language features that clang supports in device code: templates, concepts, `constexpr`/`consteval`,
-  `if consteval`, structured bindings.
-- no exceptions, no rtti, no virtual, no dynamic allocation, no `printf`.
+- device code is a quarantine zone: it can't import modules, so it uses headers.
+- allowed: templates, concepts, `constexpr`/`consteval`. forbidden: exceptions, rtti, virtual, dynamic allocation,
+  `printf`.
 - **no runtime shape arguments.** every dimension is a template parameter or a `constexpr` from the model
-  description. kernel parameters carry only runtime facts (pointers into the per-cycle state, slot tables, lengths).
-- inline ptx only inside small named primitives (`cp.async`, `ld/st.acquire/release.sys`, `mma.sync`, e4m3
+  description. kernel parameters carry only runtime facts.
+- inline ptx only inside small named primitives (`cp.async`, acquire/release loads and stores, `mma.sync`, e4m3
   conversion), each documented with why.
-- **every kernel's resource budget is a static fact**: threads per block, registers per thread, shared memory per
-  block (≤ 99 kb on sm_86) and blocks per SM, all `static_assert`ed. the build fails if `ptxas -v` reports spills
-  or registers over budget.
-- device invariant traps exist only in the `dev` preset.
-- the launch abi upward is one narrow, typed function per kernel, exported to the dialect as a module partition
-  from `foreign/`.
+- **every kernel's resource budget is a static fact**: threads, registers, shared memory (≤ 99 kb per block) and
+  blocks per SM are `static_assert`ed. the build fails if `ptxas -v` reports spills or registers over budget.
+- device invariant traps exist only in `dev`.
+- one narrow typed launch function per kernel, exported upward as a module partition from `foreign/`.
 
----
-
-## 5. repository layout
+## 1.3 layout and the model description
 
 ```text
-AGENTS.md          normative rules (section 4), for humans and agents
+AGENTS.md          normative rules (section 1.2)
 CLAUDE.md          one line: read AGENTS.md
 PLAN.md            this file
 PINS.md            toolchain pair in use and deliberate deviations
@@ -248,267 +220,321 @@ bench/             benchmark clients (dialect)
 data/              draft vocabulary, tokenizer and chat-format fixtures
 ```
 
-### 5.1 module partitions (`src/`)
-
 | partition | holds |
 |---|---|
 | `engine:model` | re-export of the model description: dims, layer kinds, head splits, tensor list |
-| `engine:image` | the baked-image format: header, per-tensor extents, checksum; typed errors on mismatch |
+| `engine:image` | baked-image format: header with checkpoint hash, per-tensor extents; typed errors on mismatch |
 | `engine:bake` | safetensors reader, tensor-parallel split, tile layout in stream order |
-| `engine:tokenizer` | qwen byte-level bpe (pretokenizer, merges, special tokens), decode with utf-8 boundary handling |
-| `engine:chat` | qwen3.8 chat format: system, user, assistant, tool turns, thinking and reasoning effort, tool-call parse |
+| `engine:tokenizer` | qwen byte-level bpe, special tokens, utf-8-safe streaming decode |
+| `engine:chat` | qwen3.8 chat format: system, user, assistant, tool turns, thinking, reasoning effort, tool-call parse |
 | `engine:sampling` | sampling parameters as a closed type; exact top-k / top-p / min-p / temperature; seeds |
-| `engine:kv` | paged bf16 kv pool: refcounted blocks, copy-on-write, block tables per slot |
-| `engine:prefix` | radix tree over blocks, deltanet snapshots, lru eviction, host-ram and nvme tiers |
-| `engine:sched` | slots, admission, preemption, chunked-prefill share, row-budget allocation, turn replay |
-| `engine:device` | typed launch surface over the driver api: cards, streams, events, the resident-loop ring |
-| `engine:pipeline` | stdexec request pipeline (section 6) |
-| `engine:json` | bounded json parser and writer for the api schema |
-| `engine:http` | cpp-starter's bounded http, plus bodies, sse and chunked streaming |
-| `engine:openai` | `/v1/chat/completions` (streaming or not), `/v1/models`, `/health`, `/status` |
+| `engine:kv` | paged bf16 kv pool: refcounted blocks, copy-on-write, block tables |
+| `engine:prefix` | radix tree over blocks, deltanet snapshots, lru eviction |
+| `engine:sched` | slots, admission, preemption, chunked-prefill share, row budget, turn replay |
+| `engine:device` | typed launch surface over the driver api: cards, streams, events, the resident ring |
+| `engine:pipeline` | stdexec request pipeline |
+| `engine:json`, `engine:http`, `engine:openai` | bounded json, http with bodies and sse, the openai endpoint |
 
-### 5.2 one model description, held once
+**one model description, held once.** `device/model.h` is the single source of every model and layout constant: plain
+`constexpr`, no macros, because device code must read it. `foreign/model.cc` re-exports it as `engine:model`. tile
+schedules and buffer geometries are `consteval` functions over it. nothing else defines a dimension.
 
-`device/model.h` is the single source of every model and layout constant: plain `constexpr` with no macros, because
-device code must read it. `foreign/model.cc` includes it and exports it as `engine:model`. nothing else defines a
-dimension. tile schedules and buffer geometries are `consteval` functions over it, so a change to the model
-description re-derives everything, and `static_assert`s catch any inconsistency.
+**the baked image.** `geezuz-bake` reads the safetensors checkpoint once and writes one image per card:
+- verifies the checkpoint hash and stamps it in the header;
+- splits for tensor parallel 2 and drops the vision tower;
+- lays out e4m3 tiles and scales in exact stream order, 16-byte aligned;
+- converts nothing lossy.
 
----
+the engine mmaps the image and copies it to vram with no layout decisions. a mismatched image is refused at the
+boundary.
 
-## 6. parallel requests and the server
+## 1.4 server and parallel requests
 
-### 6.1 slots and the cycle
+- **`S = 8` slots**, each with its own deltanet state, mtp state and position; kv comes from the shared pool.
+- **every cycle runs all live slots together**, so weights are read once per cycle.
+- **row budget**: ~24 rows per cycle. a fixed, simple allocation ships first: one row per live slot for its
+  committed token, and the rest split evenly as draft depth, capped at 4 per slot. an adaptive allocator is an
+  experiment (2.3).
+- **per-slot work**: attention, deltanet, draft check and sampling run per slot with its own row count.
+- **preemption**: cached blocks are evicted first, then the newest admitted request pauses with its state cached and
+  resumes at the head of the queue.
+- **prefill alongside decode**:
+  - a prompt goes in whole when nothing is decoding;
+  - otherwise in chunks for a fixed share of time, alternating shortest-remaining and longest-waiting;
+  - prompts that share an uncached snapshot point are prefilled once;
+  - a prefix-cache hit prefills only the tail;
+  - turn replay keeps the cache hitting across turns.
+- **request pipeline (std::execution)**:
 
-- `S = 8` slots, compiled in. each has its own deltanet state, mtp state and position. its kv comes from the shared
-  pool.
-- every cycle runs all live slots together. weights are read once per cycle whatever the row count.
-- **the row budget** (~24 rows per cycle, section 2) is split across slots by a row allocator. each slot gets one
-  row for its committed token, plus draft rows assigned where the expected accepted tokens per row are highest
-  (from live acceptance stats). one busy slot gets a deep tree; eight busy slots get one or two drafts each. this is
-  scheduling, outside the lossless boundary.
-- per-slot work: attention, deltanet, draft checking and sampling each run per slot with its own row count.
-- **shared-prefix (cascade) attention**: kv blocks that several slots share through the prefix cache (system
-  prompt, a repo dump, a common transcript) are read once per cycle for all of them, and the softmax partials merge
-  exactly. lossless, and it addresses the main multi-agent cost: kv reads scale with slots × context.
-- **preemption**: as in geezuz. cached blocks are evicted first, then the newest admitted request pauses with its
-  state cached and resumes at the head of the queue.
+  ```text
+  http request (reactor) -> parse + validate (typed errors, bounded)
+    -> tokenize + render chat format
+    -> admit: slot + longest cached prefix            (scheduler; may wait)
+    -> prefill tail chunks                            (sender per chunk, when_all over both cards)
+    -> decode stream                                  (tokens -> detokenize -> sse frames)
+    -> finish: stop / length / tool_calls; snapshot into the prefix cache
+  cancellation: client disconnect -> stop token -> slot released at the next cycle boundary
+  ```
 
-### 6.2 prefill alongside decode
+  - one typed scheduler per card; a sender completes on a driver-api event.
+  - `when_all` over both cards for weight upload and prefill chunks.
+  - nvidia's `nvexec` targets nvc++/nvcc, so on clang we write a small stream/event scheduler in `foreign/`.
+  - **the decode cycle is not a graph of senders**: it is one persistent kernel; senders submit cycles and collect
+    results. a sender per phase would bring back ~340 launches per cycle.
+  - the http reactor stays cpp-starter's owner-driven epoll state machine.
+- **api**:
+  - `/v1/chat/completions`, streaming and not: `messages`, `tools`, `tool_choice`, `stream`, `max_tokens`,
+    `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`, and `chat_template_kwargs` (`enable_thinking`,
+    `reasoning_effort`, `preserve_thinking`).
+  - the response carries `reasoning_content`, `tool_calls`, and `usage.prompt_tokens_details.cached_tokens`.
+  - `/v1/models`, `/health`, `/status`, plus `X-Request-Id` tagging.
+  - unsupported parameters are refused with a named 400. assistant turns with `content: null` (tool-call-only or
+    reasoning-only turns that harnesses resend) are accepted as empty; adrien hit http 400s on exactly this.
 
-- with nothing decoding, a prompt is prefilled whole.
-- while others decode, prompts go in chunks for a fixed share of the time, alternating between the shortest
-  remaining prompt and the longest-waiting one (geezuz's fair policy).
-- prompts that arrive together and share an uncached snapshot point are prefilled once.
-- a prefix-cache hit prefills only the uncached tail; turn replay keeps a conversation's generated tokens
-  identical, so the cache keeps hitting.
+## 1.5 kv pool and prefix cache (port)
 
-### 6.3 the request pipeline (std::execution)
+- paged bf16 kv with refcounted blocks, copy-on-write, a radix tree over blocks, and deltanet snapshots at the system
+  prompt end, last user message start, generation prompt start and prompt end.
+- snapshots are capped at a fixed share of the pool; eviction is lru.
+- port geezuz's pool fuzz and scenario tests against a content-checking fake device.
 
-```text
-http request (reactor) -> parse + validate (typed errors, bounded)
-  -> tokenize + render chat format
-  -> admit: slot + longest cached prefix            (scheduler, may wait)
-  -> prefill tail chunks                            (sender per chunk, when_all over both cards)
-  -> decode stream: one sender per cycle batch      (tokens -> detokenize -> sse frames)
-  -> finish: stop / length / tool_calls; snapshot into the prefix cache
-cancellation: client disconnect -> stop token -> slot released at the next cycle boundary
-```
+## 1.6 device: decode and prefill
 
-- one typed scheduler per card; a sender completes on a driver-api event.
-- `when_all` over the two cards for weight upload, each prefill chunk, and kv tier spills.
-- **the decode cycle is not a graph of senders.** it is one persistent kernel, and senders only submit cycles to it
-  and collect what it returns. a sender per phase would reintroduce ~340 launches per cycle, which is exactly the
-  overhead being removed.
-- nvidia's `nvexec` targets nvc++/nvcc; on clang we write a small driver-api stream/event scheduler in `foreign/`.
-- the http reactor stays cpp-starter's owner-driven epoll state machine; senders carry application values only,
-  never kernel readiness.
+done in two hard-cutover steps inside one lane's history, never two kernels side by side.
 
-### 6.4 the api surface
+**step 1: straight port, the correctness baseline.** geezuz's persistent-megakernel design re-expressed in the new
+rules:
+- e4m3 tiles converted to bf16 in registers;
+- bf16 `mma.sync` with fp32 accumulation for every row count;
+- fp32 partial sums over nvlink with the same deterministic summation order on both cards;
+- bf16 kv;
+- fp32 deltanet state with lazy replay;
+- split-k flash decoding;
+- mtp drafting over the 32k draft vocabulary;
+- exact rejection-sampling verify.
 
-- `/v1/chat/completions`, streaming (sse) and non-streaming: `messages`, `tools`, `tool_choice`, `stream`,
-  `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`, and `chat_template_kwargs`
-  (`enable_thinking`, `reasoning_effort`, `preserve_thinking`). the response carries `reasoning_content`,
-  `tool_calls`, and `usage.prompt_tokens_details.cached_tokens`.
-- `/v1/models`, `/health`, `/status` (slots, pool, drafting counters).
-- `X-Request-Id` tagging as in geezuz.
-- unsupported parameters are refused with a named 400; nothing is silently ignored. that covers
-  presence/repetition penalties and anything the exact sampler doesn't implement.
-- cpp-starter's http rejects request bodies (501) and writes whole responses. it gains bounded body reads and
-  chunked sse writes in the same bounded style.
+grid barriers stay, so it is directly comparable to upstream.
 
-### 6.5 parallel throughput estimate (8 busy slots, code prompt)
+**step 2: the dataflow core. certain from first principles, so it is part 1:**
+- **producer/consumer warp specialization**: producers stream weights continuously through a `cp.async`
+  shared-memory ring; consumers wait on per-layer and per-tile counters instead of ~340 grid barriers. weights
+  have no data dependency, so dram never has to wait. ~8 mb of shared memory plus 6 mb of l2 gives ~15 µs of
+  run-ahead.
+- **all-reduce fused into the gemv epilogue**: fp32 partials go over nvlink per tile as they finish.
+- **serial phases under the weight stream**: deltanet core, attention, lm_head merge, sampling and the mtp steps run
+  while producers prefetch. the mtp steps overlap the next cycle's layer-0 prefetch.
+- **device-resident loop**: the kernel stays resident and exchanges cycle descriptors and results through a mapped,
+  pinned ring. no launch or readback per cycle.
+- **compile-time schedule**: generated from the model description; resource budgets are `static_assert`ed.
 
-24 rows across 8 slots is ~3 rows each, τ ≈ 2.5 per slot, cycle ≈ 17.5 ms:
+why it's certain: upstream's measured cycle (~20.9 ms on q4_k_m) is about twice its weight-read floor (~9.3 ms),
+so about half of every cycle is not moving weights. the exact split between barriers, exchange and serial phases gets
+measured in phase b, but the gap itself is arithmetic.
 
-$$\frac{8 \times 2.5}{17.5\ \text{ms}} \approx 1{,}140\ \text{tok/s aggregate},\quad \approx 140\ \text{tok/s per stream}$$
+**prefill (forced by the contract):**
+- bf16 x bf16 to fp32 tensor-core gemm on e4m3 converted in registers: ~71 tflops per card, so ~2,000 tok/s total
+  is the target;
+- fused `silu(gate) * up`;
+- chunked (wy) deltanet on tensor cores with fp32 state;
+- causal flash attention over the cache;
+- all-reduces over nvlink, overlapped with the gemm.
 
-upstream geezuz on q8_0 at 8 requests: 610. long contexts lower this: 8 slots at 30k tokens each add ~8 ms of kv
-reads per cycle unless the slots share prefixes (cascade attention).
+## 1.7 platform
 
----
+- **nvlink**: `nvidia-smi topo -m` shows NV4; the stock driver does p2p over nvlink with no patch. check that the
+  2-slot bridge spacing matches PCIE_6 / PCIE_4.
+- **power**: limit at or above stock 350 w, persistence mode, locked clocks so boost doesn't oscillate between
+  cycles.
+- **memory overclock**: sweep for peak decode throughput (gddr6x error replay hides errors as slowdowns), then
+  accept the clock only after a long golden-hash soak at operating temperature. adrien's 5090s got +15% raw bandwidth
+  but only +4% at tp2, because allreduce latency co-bound his decode. our fused nvlink exchange should let more of
+  it through.
+- **memory thermals**: 12 of the 24 gddr6x chips sit under the xg7's passive backplate. watch the memory junction
+  temperature during the soak; add a backplate fan if it climbs.
+- **host**: iommu passthrough, hugepage-backed pinned memory for the embedding table and rings, the resident loop's
+  host thread pinned to one core.
 
-## 7. the lossless optimization queue
+## 1.8 verification (built first; gates everything)
 
-### a. platform
+- **cpu reference (`geezuz-ref`)**: the model computed straight from the fp8 checkpoint in fp32 on the cpu, written
+  independently of the kernels. teacher-forced logits for plain text and for your own agent transcripts.
+- **decode-path ruler**: compares greedy continuations token by token against the reference. a prefill-only ruler
+  can't see decode kernels, and adrien's gotcha #2 is a decode kernel that read bit-identical on the prefill ruler.
+- **rulers**: top-1 agreement, kl and perplexity, with the noise floor measured.
+- **tokenizer and chat-format fixtures** generated once from qwen's reference tokenizer and template and committed.
+  check `tokenizer.json` for a baked truncation (adrien's gotcha #7).
+- **determinism harness**: a deterministic mode plus golden logit hashes per prompt and per slot mix. every clock,
+  kernel or schedule change reproduces them bit-for-bit, or stays within the noise floor and re-goldens with the
+  reason recorded.
+- **host property tests**: pool and prefix fuzzing; a scheduler simulation over a fake engine (preemption, budgets,
+  no lost tokens, no hangs); http/json/sse bounds.
+- **static device gates** (code-only phase): `ptxas -v` per kernel with zero spills and registers in budget;
+  shared memory and occupancy asserted; schedule geometry `static_assert`ed against the model description.
+- **measurement protocol** (adrien's gotcha #9: speculative decode varies ~10% between runs through content-dependent
+  acceptance): compare speed at temperature 0, within one boot, normalized per accepted token, best of n.
+- **profiler** in the `profile` preset: time per phase, warp arrival, peer wait, dram utilization.
 
-1. **nvlink.** `nvidia-smi topo -m` should show NV4, and the stock driver should do p2p over nvlink with no p2p
-   patch. check that the 2-slot bridge spacing matches PCIE_6 / PCIE_4.
-2. **power**: limit at or above stock 350 w; persistence mode; locked clocks so boost doesn't oscillate between
-   cycles.
-3. **gddr6x memory overclock**: sweep for peak decode throughput (error replay hides errors as slowdowns), then
-   accept the clock only if the determinism harness reproduces golden hashes over a long soak.
-4. **memory thermals**: 12 of the 24 gddr6x chips sit under the xg7's passive backplate, and memory-bound decode is
-   their worst case. watch memory junction temperature during the soak; add a backplate fan if it climbs.
-5. **host**: iommu passthrough, hugepage-backed pinned memory for the embedding table and the rings, the resident
-   loop's host thread pinned to one core.
-
-### b. decode core
-
-6. **barrier-free dataflow megakernel**:
-   - producer warps stream weights continuously through a `cp.async` ring in shared memory;
-   - consumer warps wait on per-layer and per-tile counters instead of ~340 grid barriers;
-   - ~8 mb of shared memory plus 6 mb of l2 gives ~15 µs of weight run-ahead at full bandwidth;
-   - the schedule is generated at compile time from the model description.
-7. **fp32 all-reduce over nvlink, fused into the gemv epilogue**: partials are sent per tile as they finish. both
-   cards add in the same order, so the residual stays bit-identical on both.
-8. **serial phases hidden under the weight stream**: deltanet core, attention, the lm_head merge, sampling and the mtp
-   draft steps. the mtp steps overlap the next cycle's layer-0 prefetch.
-9. **fixed tensor split**: attention q and kv heads, deltanet value heads (16 key / 48 value; 8 / 24 per card), ffn
-   rows 8,704 per card, lm_head vocabulary halves.
-10. **device-resident loop**: the kernel never exits. the host exchanges cycle descriptors and results through a
-    mapped, pinned ring.
-11. **lazy-replay deltanet rollback** with fp32 state.
-12. **attention**: split-k flash decoding on bf16 kv tiles, fp32 softmax and accumulation, double buffered, plus
-    cascade attention over shared blocks (section 6.1).
-13. **paged bf16 kv pool, radix prefix cache, deltanet snapshots, preemption.**
-
-### c. drafting (exact by construction)
-
-14. **one verify path for 1 to R rows** under the row budget (section 2), with no separate small-batch kernel.
-15. **tree drafts**: mtp top-k branches plus suffix branches verified together, with tree attention masks. deltanet
-    state is kept per branch along the tree, and only the accepted path is replayed.
-16. **suffix / prompt-lookup drafting** from the slot's context and your own past sessions. agent output (file
-    rewrites, diffs, tool-call json) copies context a lot.
-17. **drafter weights baked at reduced precision**: one drafter format, chosen by measured acceptance against bytes.
-18. **personalized drafter**: retrain only the mtp head on your own chats and coding sessions, main model frozen.
-19. **the row allocator** (section 6.1) adapts tree shape and depth to live acceptance across slots.
-
-### d. lm_head
-
-20. **certified-bound vocab pruning** (research):
-    - score every row with a low-precision shadow copy of lm_head and bound each row's error;
-    - drop rows that provably can't make the top-k, and recompute the survivors in bf16;
-    - greedy and top-k sampling stay exact; requests without top-k use the full softmax;
-    - saves ~0.6 gb per card per cycle if the bounds are tight enough.
-
-### e. prefill and caching
-
-21. **bf16 x bf16 to fp32 tensor-core gemm** on e4m3 converted in registers: ~71 tflops per card, so ~2,000 tok/s
-    total is a realistic target.
-22. **prefill all-reduces over nvlink**: ~42 mb per reduce for a 2,048-token chunk in fp32, overlapped with the gemm.
-23. **persistent prefix-cache tiers**: kv blocks and deltanet snapshots spill to host ram, then nvme, and survive
-    restarts. exact, because cached state is bit-identical.
-
----
-
-## 8. verification (built first; gates everything)
-
-24. **cpu reference (`geezuz-ref`)**: the model computed straight from the fp8 checkpoint in fp32 on the cpu. it is
-    written independently of the kernels: straightforward loops, threads via stdexec. it produces teacher-forced
-    logits for plain text and for your own agent transcripts.
-25. **rulers**: top-1 agreement, kl and perplexity against the reference, with the noise floor measured.
-26. **tokenizer and chat-format tests** against fixtures generated once from qwen's reference tokenizer and template
-    and committed under `data/`.
-27. **determinism harness**: a deterministic mode plus golden logit hashes per prompt and per slot mix. every clock,
-    kernel or schedule change reproduces them bit-for-bit, or, for an intentional reordering, stays within the noise
-    floor and re-goldens with the reason recorded.
-28. **host property tests**:
-    - kv pool and prefix cache fuzzing against a content-checking fake device (ported from geezuz's
-      `kv_cache_fuzz` and `kv_cache_scen`);
-    - a scheduler simulation over a fake engine (ported from `sched_sim`): preemption, budgets, no lost tokens,
-      no hangs;
-    - http/json/sse bounds tests in the cpp-starter style.
-29. **static device gates** (run in the code-only phase): `ptxas -v` for every kernel with zero spills and
-    registers within budget; shared memory and occupancy asserted; schedule geometry `static_assert`ed against the
-    model description.
-30. **per-phase profiler** in the `profile` preset: time per phase, warp arrival, peer wait, dram utilization.
-
----
-
-## 9. order of work
-
-### phase a: code only (now; no gpu)
-
-**where it runs:** a linux x86_64 environment with latest clang/llvm and the cuda toolkit, e.g. the cloud claude code
-containers. no gpu is needed: clang compiles the device code and ptxas reports resources. macos can't host the cuda
-toolkit, so the mac is for editing only.
-
-**done means**: `dev`, `release` and `lint` build with zero warnings, the static device gates pass, and the cpu test
-suite passes. nothing claims runtime correctness of the kernels until phase c.
-
-lanes for parallel subagents. lanes implement and hand over a change that builds; the coordinator merges onto
-`main`, runs every check on the merged tree, and sends exact fixes back. commits go straight to `main` (no
-feature branches, no prs).
-
-| lane | work | depends on |
-|---|---|---|
-| L0 scaffold | AGENTS.md and CLAUDE.md, the cpp-starter 80/20 (section 4.2), cmake gate, presets, language profile, clang-tidy profiles, zones, compile-fail harness, PINS.md | — (first) |
-| L1 cull | delete everything in section 3 that has no successor yet: tp1, non-sm_86, k-quants, q8 kv, env switches, python server and tools, docker, Makefile, llama_ref. move what survives into the zones | L0 |
-| L2 model + image + bake | `device/model.h`, `engine:model`, `engine:image`, `engine:bake` (safetensors reader, split, stream-order layout) | L0 |
-| L3 tokenizer + chat | `engine:tokenizer`, `engine:chat`, fixtures in `data/` | L0 |
-| L4 server | `engine:json`, `engine:http` extensions, `engine:openai`, `engine:pipeline`, `engine:sched` with the fake-engine simulation | L0 (sched also L5) |
-| L5 kv + prefix | `engine:kv`, `engine:prefix` (tiers included), ported fuzz and scenario tests | L0, L2 |
-| L6 device | e4m3/bf16 primitives, the fp8 gemv/gemm, attention (plus cascade), deltanet, the decode megakernel as a straight port first, prefill kernels, driver-api loader, the resident ring, static gates | L0, L2 |
-| L7 reference + harness | `geezuz-ref`, rulers, the determinism-harness tooling | L0, L2, L3 |
-
-L6 ships the straight port first, with barriers still in place, as the correctness baseline. the dataflow rewrite
-(item 6) is a separate change once the baseline exists. both are hard cutovers inside L6's history, never two
-kernels kept side by side.
-
-### phase b: hardware bring-up (when the box is up)
-
-- nvlink and the stock-driver p2p check, power, thermals (items 1, 2, 4).
-- upstream `v0.3.2` on q8_0 with `MK_PROFILE=1`, with and without the bridge: the baseline numbers.
-
-### phase c: correctness on gpu
-
-- baked images load; the straight-port kernel matches `geezuz-ref` within the noise floor; golden hashes recorded.
-- server end to end with 8 parallel streams, tools and thinking.
-
-### phase d: speed, each change measured under the harness
-
-dataflow megakernel (6–8), resident loop (10), prefill (21–22), drafting (14–19), memory overclock (3), then the
-research item (20).
-
----
-
-## 10. expected outcome
+## 1.9 must-do outcome (estimates)
 
 | config | cycle | 1 stream code (τ ≈ 4.46) | 1 stream prose (τ ≈ 2.16) | 8 streams code, aggregate |
 |---|---|---|---|---|
 | upstream geezuz q8_0 (pcie, 280 w) | ~25 ms | ~143 | ~85 (est) | 610 |
-| straight port on fp8 + nvlink (phase c) | ~23 ms (est) | ~190 | ~95 | ~700 |
-| + dataflow core, resident loop, reduced-precision drafter | ~18 ms | ~250 | ~120 | ~1,050 |
-| + memory overclock (~8%) | ~16.8 ms | ~265 | ~128 | ~1,120 |
-| + tree, suffix and row-allocated drafting | ~17.5 ms | ~330 | ~170 | ~1,150 |
+| step 1: straight port on fp8 + nvlink | ~23 ms | ~190 | ~95 | ~700 |
+| step 2: dataflow core + resident loop | ~18 ms | ~250 | ~120 | ~1,000 |
+| + memory overclock (~8%) | ~16.8 ms | ~265 | ~128 | ~1,080 |
 
-all estimates, and they compound. the dataflow row is the one physics most clearly supports. drafting gains depend on
-your traffic. long multi-slot contexts cost kv bandwidth unless the slots share prefixes.
+estimates. step 2 is the row physics most clearly supports. long multi-slot contexts add kv-read time per cycle.
+
+## 1.10 order of work
+
+### phase a: code only (now; no gpu)
+
+**where it runs**: a linux x86_64 environment with latest clang/llvm and the cuda toolkit, such as the cloud claude
+code containers. no gpu is needed: clang compiles the device code and ptxas reports resources. macos can't host the
+cuda toolkit, so the mac is for editing only.
+
+**done means**: `dev`, `release` and `lint` build with zero warnings, the static device gates pass, and the cpu tests
+pass. nothing claims runtime kernel correctness until phase c.
+
+**lanes for parallel subagents.** lanes implement and hand over a change that builds. the coordinator merges onto
+`main`, runs every check on the merged tree, and sends exact fixes back. commits go straight to `main`.
+
+| lane | work | depends on |
+|---|---|---|
+| L0 scaffold | AGENTS.md and CLAUDE.md, the cpp-starter 80/20, cmake gate, presets, language profile, clang-tidy profiles, zones, compile-fail harness, PINS.md | — (first) |
+| L1 cull | delete everything in 1.1 with no successor yet; move what survives into the zones | L0 |
+| L2 model + image + bake | `device/model.h`, `engine:model`, `engine:image`, `engine:bake` | L0 |
+| L3 tokenizer + chat | `engine:tokenizer`, `engine:chat`, fixtures | L0 |
+| L4 server | `engine:json`, `engine:http`, `engine:openai`, `engine:pipeline`, `engine:sched` + fake-engine simulation | L0, L5 |
+| L5 kv + prefix | `engine:kv`, `engine:prefix`, ported fuzz and scenario tests | L0, L2 |
+| L6 device | e4m3/bf16 primitives, fp8 gemv/gemm, attention, deltanet, decode step 1 then step 2, prefill, driver-api loader, resident ring, static gates | L0, L2 |
+| L7 reference + harness | `geezuz-ref`, rulers, decode-path ruler, determinism tooling | L0, L2, L3 |
+
+### phase b: hardware bring-up
+
+nvlink, power and thermals (1.7). upstream `v0.3.2` q8_0 with `MK_PROFILE=1`, with and without the bridge, gives the
+baseline and the real phase breakdown.
+
+### phase c: correctness on gpu
+
+baked images load; step 1 matches `geezuz-ref` within the noise floor on both rulers; golden hashes recorded; the
+server runs end to end with 8 parallel streams, tools and thinking.
+
+### phase d: must-do speed
+
+step 2 under the harness, then the memory-overclock sweep and soak. then part 2.
 
 ---
 
-## 11. risks
+# part 2: experiments
 
-- **clang cuda and the latest toolkit**: clang can trail the newest toolkit. use the newest pair clang supports and
-  record it in PINS.md.
-- **stdexec on clang + libc++**: the module boundary may still need the narrow-abi quarantine. retest, then keep or
-  delete it.
-- **kernels unverified until phase c**: phase a can prove builds, resource budgets and host logic, not kernel
+none of these goes in by default. each one ships only if it beats its kill criterion under the measurement protocol
+(1.8), with output unchanged (golden hashes, or the noise floor for intentional reorderings). ordered by expected
+value.
+
+### 2.1 tree drafts
+
+- **hypothesis**: verifying a tree of mtp top-k branches raises τ, mostly on prose, where today's chain accepts
+  ~2.16 of 5.
+- **why uncertain**: the bf16 compute ceiling caps rows at ~24 per cycle, so a tree competes with slots for rows.
+  per-branch deltanet state is real work: only the accepted path is replayed, but each branch needs its own state
+  update in the verify pass. the gain at one stream may not survive at eight.
+- **measure**: τ and tok/s at 1 and 8 streams, code and prose, against the chain.
+- **kill if**: under +10% tok/s at one stream, or any loss at eight.
+
+### 2.2 suffix / prompt-lookup branches
+
+- **hypothesis**: agent output copies context (file rewrites, diffs, tool-call json); a suffix match can propose
+  16–64 tokens for free.
+- **why uncertain**: adrien measured vllm's suffix decoding as a replacement for mtp and code decode fell from ~180 to
+  31 tok/s, because fresh generation has nothing to match. it can only work as extra branches added when a match
+  exists, never in place of mtp.
+- **measure**: share of cycles with a match, τ gain on your agent transcripts, no regression on fresh prose.
+- **kill if**: no gain on your own traffic.
+
+### 2.3 adaptive row allocator
+
+- **hypothesis**: spending the ~24 rows where expected accepted tokens per row is highest beats the fixed split, e.g.
+  a deep tree for one busy slot, shallow drafts for eight.
+- **why uncertain**: the gain depends on acceptance variance across slots and needs good live estimates.
+- **kill if**: under +5% aggregate on mixed loads.
+
+### 2.4 row budget and slot count tuning
+
+- **hypothesis**: the real compute crossover sits somewhere between 20 and 32 rows; `S` other than 8 may be better.
+- **measure**: cycle time against rows on the hardware, then tok/s per stream and aggregate.
+- **ship**: the measured constants. this changes constants, not code paths.
+
+### 2.5 replicated drafter
+
+- **hypothesis**: holding the whole mtp head on both cards (+0.48 gb vram each) removes every cross-card exchange
+  from the latency-bound draft steps.
+- **why uncertain**: it doubles mtp bytes per card (~+1.3 ms per cycle) to save the exchange latency of ~10 serial
+  steps. which wins depends on nvlink latency, measured in phase b.
+- **kill if**: the cycle isn't faster.
+
+### 2.6 reduced-precision drafter
+
+- **hypothesis**: drafter bytes (~1.85 gb per card per cycle as shipped) drop by about half at 8-bit-int or lower
+  for the fc and draft lm_head, saving ~1 ms per cycle. this sits outside the lossless boundary, so output is
+  unchanged.
+- **why uncertain**: adrien saw a quantized drafter beat the original on two checkpoints, and a mismatched one lose
+  26% of code decode. acceptance can move either way.
+- **kill if**: τ x (1 / cycle) doesn't improve.
+
+### 2.7 personalized drafter
+
+- **hypothesis**: an mtp head finetuned on your own chats and coding sessions (main model frozen) raises acceptance on
+  your traffic.
+- **why uncertain**: needs a training run and enough of your data; the gain is unknown.
+- **kill if**: τ on held-out sessions isn't up.
+
+### 2.8 cascade (shared-prefix) attention
+
+- **hypothesis**: kv blocks shared by several slots through the prefix cache (system prompt, repo dump, common
+  transcript) are read once per cycle for all of them, with exact softmax merging. this cuts kv bandwidth when parallel
+  agents share long prefixes.
+- **why uncertain**: it only pays when slots actually share long prefixes, and the merge adds attention complexity.
+- **measure**: cycle time at 8 slots with a shared 30k prefix vs without.
+- **kill if**: your real workloads rarely share prefixes.
+
+### 2.9 prefix-cache tiers (host ram, then nvme, restart-proof)
+
+- **hypothesis**: agent steps resend the whole transcript, so a spilled prefix restored from ram or disk beats
+  re-prefill. adrien measured 0.45 s from disk against 7.5 s cold at 32k.
+- **why uncertain**: it only matters if the ~280k-token pool evicts under your workload, and it is a lot of code.
+- **measure first**: the pool eviction rate on real agent sessions.
+- **gate** (adrien's gotcha #3): a needle planted deep in a long context must be retrieved correctly after a restart.
+  the tier namespace keys on the image's checkpoint hash (gotcha #4).
+
+### 2.10 certified-bound lm_head pruning
+
+- **hypothesis**:
+  - score all rows with a low-precision shadow copy, bound each row's error, drop rows that provably can't make the
+    top-k, then recompute the survivors in bf16;
+  - exact for greedy and top-k sampling;
+  - saves up to ~0.6 gb per card per cycle.
+- **why uncertain**: the bounds may be too loose to prune much, and requests without top-k need the full softmax.
+- **kill if**: the survivor count is too high to save time.
+
+### 2.11 block drafter (dflash-style)
+
+- **hypothesis**: one drafter pass proposes a whole block. adrien's single-stream code went from ~209 (mtp) to
+  ~279–325 tok/s on 5090s.
+- **why uncertain**: it costs extra weight bytes per cycle, did not scale with batch for adrien (c4 aggregate ≈ c1),
+  and capped context. parallel requests are required here, so it likely loses.
+- **priority**: lowest. revisit only if single-stream speed is the main use.
+
+---
+
+## 3. risks
+
+- **clang cuda and the latest toolkit**: clang can trail the newest toolkit; use the newest pair it supports.
+- **stdexec on clang + libc++**: the module boundary may still need the narrow-abi quarantine.
+- **kernels are unverified until phase c**: phase a proves builds, resource budgets and host logic, not kernel
   correctness. the cpu reference exists so phase c catches mistakes on day one.
-- **the bf16 compute ceiling**: the lossless contract caps verify width at ~24 rows per cycle. measure the real
-  crossover on hardware and retune the row budget constant.
+- **the bf16 compute ceiling**: the lossless contract caps verify width at ~24 rows per cycle. retune on hardware.
 - **memory overclock without ecc**: errors can be silent. accept a clock only after a long golden-hash soak at
-  operating temperature.
-- **checkpoint drift**: the baker checks the checkpoint hash and the image header carries it, so a re-uploaded
-  checkpoint is refused, never half-loaded.
+  temperature.
+- **checkpoint drift**: the image header carries the checkpoint hash; a re-uploaded checkpoint is refused, never
+  half-loaded.
