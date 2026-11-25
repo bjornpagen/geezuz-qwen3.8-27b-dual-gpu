@@ -65,7 +65,7 @@ auto fake_stream_create(CUstream* stream, unsigned int flags) -> Status {
 	if (injected()) {
 		return Status::Unknown;
 	}
-	return flags != driver::stream_non_blocking ? Status::InvalidValue : create_object(stream, Kind::Stream);
+	return flags != driver::stream_non_blocking ? Status::InvalidValue : create_object(stream, Kind::Stream, flags);
 }
 
 auto fake_stream_destroy(CUstream stream) -> Status {
@@ -85,7 +85,7 @@ auto fake_event_create(CUevent* event, unsigned int flags) -> Status {
 	if (injected()) {
 		return Status::Unknown;
 	}
-	return flags != driver::event_disable_timing ? Status::InvalidValue : create_object(event, Kind::Event);
+	return flags != driver::event_disable_timing && flags != 0 ? Status::InvalidValue : create_object(event, Kind::Event, flags);
 }
 
 auto fake_event_destroy(CUevent event) -> Status {
@@ -106,6 +106,7 @@ auto fake_event_record(CUevent event, CUstream stream) -> Status {
 		return Status::InvalidHandle;
 	}
 	marker->pending = state().machine.pending_queries;
+	marker->stamp = state().clock;
 	return Status::Success;
 }
 
@@ -122,6 +123,27 @@ auto fake_event_query(CUevent event) -> Status {
 		--marker->pending;
 		return Status::NotReady;
 	}
+	return Status::Success;
+}
+
+auto fake_event_elapsed_time(float* milliseconds, CUevent start, CUevent end) -> Status {
+	if (injected()) {
+		return Status::Unknown;
+	}
+	auto const* const first = find_object(start, Kind::Event);
+	auto const* const last = find_object(end, Kind::Event);
+	if (!live_object(first) || !live_object(last)) {
+		return Status::InvalidHandle;
+	}
+	// An event created without timing, or never recorded, has no time to subtract.
+	auto const untimed = ((first->flags | last->flags) & driver::event_disable_timing) != 0;
+	if (untimed || !first->stamp.has_value() || !last->stamp.has_value()) {
+		return Status::InvalidHandle;
+	}
+	if (first->pending > 0 || last->pending > 0) {
+		return Status::NotReady;
+	}
+	*milliseconds = *last->stamp - *first->stamp;
 	return Status::Success;
 }
 
@@ -260,6 +282,7 @@ auto fake_func_set_attribute(CUfunction function, driver::FunctionAttribute attr
 		auto const* const first = static_cast<std::byte const*>(parameters[index]);
 		bytes.insert(bytes.end(), first, first + record->parameters[index]);
 	}
+	advance_clock();
 	state().launches.push_back(Launch{
 	    .ordinal = *ordinal,
 	    .entry = record->name,

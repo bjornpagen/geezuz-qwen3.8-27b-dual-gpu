@@ -26,6 +26,8 @@ using driver::PinnedSource;
 using driver::Program;
 using driver::Residency;
 using driver::Stream;
+using driver::TimedEvent;
+using driver::Timing;
 using driver::Transfer;
 using driver::Wire;
 

@@ -178,14 +178,12 @@ public:
 	}
 
 	[[nodiscard]] auto create_event() const -> core::Result<Event, DeviceError> {
-		auto handle = CUevent{};
-		return make_current()
-		    .and_then([&] {
-			    return call(api_.event_create, &handle, event_disable_timing);
-		    })
-		    .transform([&] {
-			    return Event{api_, ordinal_, handle};
-		    });
+		return create_marker<Timing::Off>(event_disable_timing);
+	}
+
+	/** A marker that keeps the time its work finished, for the profile build's timings. */
+	[[nodiscard]] auto create_timed_event() const -> core::Result<TimedEvent, DeviceError> {
+		return create_marker<Timing::On>(0U);
 	}
 
 	/**
@@ -264,6 +262,18 @@ private:
 			return Transfer<Destination, Source>{std::move(destination), std::move(source), started.error()};
 		}
 		return Transfer<Destination, Source>{std::move(destination), std::move(source), std::move(*event)};
+	}
+
+	template<Timing T>
+	[[nodiscard]] auto create_marker(unsigned int flags) const -> core::Result<Marker<T>, DeviceError> {
+		auto handle = CUevent{};
+		return make_current()
+		    .and_then([&] {
+			    return call(api_.event_create, &handle, flags);
+		    })
+		    .transform([&] {
+			    return Marker<T>{api_, ordinal_, handle};
+		    });
 	}
 
 	[[nodiscard]] auto make_current() const -> core::Result<void, DeviceError> {

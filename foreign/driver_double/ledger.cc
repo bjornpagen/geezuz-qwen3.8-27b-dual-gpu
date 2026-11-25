@@ -52,12 +52,17 @@ struct Registration {
 	Life life;
 };
 
-/** A stream or an event; an event recorded answers "not ready" to its next `pending` queries. */
+/**
+ * A stream or an event. A recorded event answers "not ready" to its next `pending` queries, and keeps the fake clock's
+ * time when it was recorded unless it was created without timing.
+ */
 struct Object {
 	Kind kind;
 	CUdevice ordinal;
 	Life life;
 	std::size_t pending;
+	unsigned int flags;
+	std::optional<float> stamp;
 };
 
 struct ModuleRecord {
@@ -93,6 +98,7 @@ struct State {
 	int sessions = 0;
 	std::vector<Violation> violations;
 	std::vector<Launch> launches;
+	float clock = 0.0F;
 };
 
 State* installed = nullptr;
@@ -213,13 +219,19 @@ template<class Handle>
 	return nullptr;
 }
 
+/** The fake runs work when it is enqueued; each copy or launch moves its clock on by the machine's step. */
+auto advance_clock() -> void {
+	state().clock += state().machine.milliseconds_per_operation;
+}
+
 template<class Handle>
-[[nodiscard]] auto create_object(Handle* handle, Kind kind) -> Status {
+[[nodiscard]] auto create_object(Handle* handle, Kind kind, unsigned int flags) -> Status {
 	auto const ordinal = current();
 	if (!ordinal) {
 		return Status::InvalidContext;
 	}
-	auto& object = state().objects.emplace_back(Object{.kind = kind, .ordinal = *ordinal, .life = Life::Live, .pending = 0});
+	auto& object = state().objects.emplace_back(
+	    Object{.kind = kind, .ordinal = *ordinal, .life = Life::Live, .pending = 0, .flags = flags, .stamp = std::nullopt});
 	*handle = reinterpret_cast<Handle>(&object);
 	return Status::Success;
 }

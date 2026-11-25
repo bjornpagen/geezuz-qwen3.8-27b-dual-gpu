@@ -9,7 +9,15 @@ import :error;
 namespace engine::driver {
 
 export class Context;
-export class Event;
+
+/** Whether a marker keeps a timestamp: timing costs a little on every record, so only the profiler asks for it. */
+export enum class Timing : std::uint8_t {
+	Off,
+	On,
+};
+
+export template<Timing T>
+class Marker;
 
 /** A non-blocking stream of one card: work on it is ordered, and it never waits on the legacy default stream. */
 export class Stream {
@@ -38,8 +46,9 @@ public:
 		}
 	}
 
-	/** Orders this stream's later work after `event`'s completion; the event may belong to the other card. */
-	[[nodiscard]] auto wait(Event const& event) const -> core::Result<void, DeviceError>;
+	/** Orders this stream's later work after `marker`'s completion; the marker may belong to the other card. */
+	template<Timing T>
+	[[nodiscard]] auto wait(Marker<T> const& marker) const -> core::Result<void, DeviceError>;
 
 	[[nodiscard]] auto ordinal() const -> CUdevice {
 		return ordinal_;
@@ -47,7 +56,8 @@ public:
 
 private:
 	friend class Context;
-	friend class Event;
+	template<Timing T>
+	friend class Marker;
 
 	Stream(Api const& api, CUdevice ordinal, CUstream handle)
 	    : destroy_{api.stream_destroy}, wait_event_{api.stream_wait_event}, ordinal_{ordinal}, handle_{handle} {}
@@ -64,29 +74,32 @@ export enum class EventState : std::uint8_t {
 	Complete,
 };
 
-/** A completion marker of one card, without timing. */
-export class Event {
+/** A completion marker of one card; with `Timing::On` it also keeps the time its work finished. */
+export template<Timing T>
+class Marker {
 public:
-	Event(Event const&) = delete;
-	auto operator=(Event const&) -> Event& = delete;
+	Marker(Marker const&) = delete;
+	auto operator=(Marker const&) -> Marker& = delete;
 
-	Event(Event&& other) noexcept
+	Marker(Marker&& other) noexcept
 	    : destroy_{std::exchange(other.destroy_, {})},
 	      record_{other.record_},
 	      query_{other.query_},
+	      elapsed_{other.elapsed_},
 	      ordinal_{other.ordinal_},
 	      handle_{std::exchange(other.handle_, nullptr)} {}
 
-	auto operator=(Event&& other) noexcept -> Event& {
+	auto operator=(Marker&& other) noexcept -> Marker& {
 		std::swap(destroy_, other.destroy_);
 		std::swap(record_, other.record_);
 		std::swap(query_, other.query_);
+		std::swap(elapsed_, other.elapsed_);
 		std::swap(ordinal_, other.ordinal_);
 		std::swap(handle_, other.handle_);
 		return *this;
 	}
 
-	~Event() {
+	~Marker() {
 		// A moved-from event holds nothing; a failed destroy at teardown has no remedy.
 		if (destroy_.function != nullptr) {
 			std::ignore = destroy_(handle_);
@@ -122,6 +135,25 @@ public:
 		}
 	}
 
+	/**
+	 * The time from `start` to this marker, both recorded on this card, in milliseconds at the driver's resolution
+	 * (about half a microsecond); nullopt while either one's work is still running.
+	 */
+	[[nodiscard]] auto since(Marker const& start) const
+	    -> core::Result<std::optional<std::chrono::duration<float, std::milli>>, DeviceError>
+	    requires(T == Timing::On)
+	{
+		core::invariant(start.ordinal_ == ordinal_);
+		auto milliseconds = 0.0F;
+		// Not ready is the driver's answer to a question, not a failure.
+		if (auto const status = elapsed_(&milliseconds, start.handle_, handle_); status == Status::NotReady) {
+			return std::optional<std::chrono::duration<float, std::milli>>{};
+		} else if (status != Status::Success) {
+			return std::unexpected(DeviceError{.reason = Failure{.symbol = elapsed_.symbol, .status = status}});
+		}
+		return std::optional{std::chrono::duration<float, std::milli>{milliseconds}};
+	}
+
 	[[nodiscard]] auto ordinal() const -> CUdevice {
 		return ordinal_;
 	}
@@ -129,19 +161,34 @@ public:
 private:
 	friend class Context;
 	friend class Stream;
+	template<Timing U>
+	friend class Marker;
 
-	Event(Api const& api, CUdevice ordinal, CUevent handle)
-	    : destroy_{api.event_destroy}, record_{api.event_record}, query_{api.event_query}, ordinal_{ordinal}, handle_{handle} {}
+	Marker(Api const& api, CUdevice ordinal, CUevent handle)
+	    : destroy_{api.event_destroy},
+	      record_{api.event_record},
+	      query_{api.event_query},
+	      elapsed_{api.event_elapsed_time},
+	      ordinal_{ordinal},
+	      handle_{handle} {}
 
 	decltype(Api::event_destroy) destroy_;
 	decltype(Api::event_record) record_;
 	decltype(Api::event_query) query_;
+	decltype(Api::event_elapsed_time) elapsed_;
 	CUdevice ordinal_;
 	CUevent handle_;
 };
 
-auto Stream::wait(Event const& event) const -> core::Result<void, DeviceError> {
-	return call(wait_event_, handle_, event.handle_, 0U);
+/** A completion marker without timing: what ordering and readiness use. */
+export using Event = Marker<Timing::Off>;
+
+/** A completion marker with a timestamp: what the profile build's per-phase timings use. */
+export using TimedEvent = Marker<Timing::On>;
+
+template<Timing T>
+auto Stream::wait(Marker<T> const& marker) const -> core::Result<void, DeviceError> {
+	return call(wait_event_, handle_, marker.handle_, 0U);
 }
 
 }

@@ -203,6 +203,7 @@ export struct Api {
 	Entry<"cuEventDestroy_v2", Status(CUevent)> event_destroy;
 	Entry<"cuEventRecord", Status(CUevent, CUstream)> event_record;
 	Entry<"cuEventQuery", Status(CUevent)> event_query;
+	Entry<"cuEventElapsedTime", Status(float*, CUevent, CUevent)> event_elapsed_time;
 	Entry<"cuModuleLoadDataEx", Status(CUmodule*, void const*, unsigned int, JitOption*, void**)> module_load_data_ex;
 	Entry<"cuModuleUnload", Status(CUmodule)> module_unload;
 	Entry<"cuModuleGetFunction", Status(CUfunction*, CUmodule, char const*)> module_get_function;

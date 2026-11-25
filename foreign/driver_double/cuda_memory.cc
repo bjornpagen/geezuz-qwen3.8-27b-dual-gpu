@@ -179,6 +179,7 @@ auto fake_memcpy_htod_async(CUdeviceptr destination, void const* source, std::si
 		return Status::InvalidValue;
 	}
 	std::ranges::copy(std::span{static_cast<std::byte const*>(source), bytes}, to->begin());
+	advance_clock();
 	return Status::Success;
 }
 
@@ -195,6 +196,7 @@ auto fake_memcpy_dtoh_async(void* destination, CUdeviceptr source, std::size_t b
 		return Status::InvalidValue;
 	}
 	std::ranges::copy(*from, static_cast<std::byte*>(destination));
+	advance_clock();
 	return Status::Success;
 }
 
@@ -226,6 +228,7 @@ auto fake_memcpy_peer_async(CUdeviceptr destination, CUcontext destination_conte
 		return Status::InvalidValue;
 	}
 	std::ranges::copy(*from, to->begin());
+	advance_clock();
 	return Status::Success;
 }
 

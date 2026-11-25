@@ -76,6 +76,7 @@ public:
 		            .event_destroy = {.function = fake_event_destroy},
 		            .event_record = {.function = fake_event_record},
 		            .event_query = {.function = fake_event_query},
+		            .event_elapsed_time = {.function = fake_event_elapsed_time},
 		            .module_load_data_ex = {.function = fake_module_load_data_ex},
 		            .module_unload = {.function = fake_module_unload},
 		            .module_get_function = {.function = fake_module_get_function},
