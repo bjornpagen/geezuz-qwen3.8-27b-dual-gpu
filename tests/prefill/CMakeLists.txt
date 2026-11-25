@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+add_library(engine_prefill_emulation)
+target_sources(engine_prefill_emulation PUBLIC FILE_SET CXX_MODULES FILES emulation.cc)
+target_link_libraries(engine_prefill_emulation
+	PUBLIC engine_language_profile engine_attn engine_core engine_deltanet engine_mma_model engine_model engine_prefill engine_prefill_device
+	engine_prims engine_schedule)
+
+engine_test(prefill.equality SOURCES equality.test.cc LINK engine_prefill_emulation engine_prefill engine_prefill_device engine_attn engine_model engine_prims)
+engine_test(prefill.sequence SOURCES sequence.test.cc LINK engine_prefill engine_prefill_device engine_attn engine_deltanet engine_model)
