@@ -115,25 +115,13 @@ export [[nodiscard]] auto status_body(Status const& status) -> std::string {
 	return json::encode([&status](auto& out) { json::write_object(out, [&status](auto& members) { put_status(members, status); }); });
 }
 
-/**
- * The framing `json::append` puts around a chunk: the http writer frames every event itself, so the service sends
- * what lies between.
- */
-constexpr std::string_view event_field = "data: ";
-constexpr std::string_view event_end = "\n\n";
+/** The sentinel that ends every OpenAI stream: the last event's data, and not JSON. */
+constexpr std::string_view done_sentinel = "[DONE]";
 
-[[nodiscard]] auto unframed(std::string_view framed) -> std::string {
-	core::invariant(framed.starts_with(event_field) && framed.ends_with(event_end));
-	return std::string{framed.substr(event_field.size(), framed.size() - event_field.size() - event_end.size())};
-}
-
-/**
- * Renders a stream's events into one buffer kept for the server's life, sized so that a chunk fits exactly when its
- * event fits http::max_event_bytes.
- */
+/** Renders a stream's events into one buffer kept for the server's life, of exactly one event's bound. */
 export class EventWriter {
 public:
-	EventWriter() : buffer_{http::max_event_bytes + event_field.size() + event_end.size()} {}
+	EventWriter() : buffer_{http::max_event_bytes} {}
 
 	/** The chunk's event, or how far it overflows one event. */
 	[[nodiscard]] auto chunk(json::ChunkHeader const& header, json::ChunkEvent const& event) -> core::Result<http::Event, json::Overflow> {
@@ -141,11 +129,11 @@ public:
 		if (auto appended = json::append(buffer_, header, event); !appended) {
 			return std::unexpected(appended.error());
 		}
-		return http::Event{.data = unframed(buffer_.text())};
+		return http::Event{.data = std::string{buffer_.text()}};
 	}
 
 	[[nodiscard]] static auto done() -> http::Event {
-		return http::Event{.data = unframed(json::done_event)};
+		return http::Event{.data = std::string{done_sentinel}};
 	}
 
 	/** An error that ends a stream already under way, in OpenAI's error shape. */
