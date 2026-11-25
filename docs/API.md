@@ -25,21 +25,21 @@ is not one JSON document within the request's bounds `invalid_json`; members tha
 request faults; 404 `model_not_found` and `response_not_found`; 503 `engine_loading`, `engine_busy` and
 `out_of_memory` (retryable), and `engine_failed` (not: the engine serves nothing more until it is restarted); 500
 `response_too_large`, and `server_error` for a request the engine failed under. A request whose grammar outgrows the
-engine's bounds while its reply is decoded ends there: a whole response is refused 400 `grammar_too_large`, a stream
+engine's bounds while its reply is decoded ends there: a whole response is refused 400 `grammar_overrun`, a stream
 ends with that `error` event; neither is stored. Every error body is `{"error": {"message", "type", "param", "code"}}`,
 `type` `invalid_request_error` for a 4xx and `server_error` for a 5xx.
 
 **D** marks an owner decision.
 
 Live today: engine.openai serves every route below over engine.http: it decodes and validates each create request
-whole at the boundary (engine.json's decoder, then the served model, tools, tool choice, budget, sampling, the chat
-template's rules and the stored response a continuation names), hands the engine a typed submission, and answers whole
-or streamed from the engine's typed outputs; engine.store holds stored responses. Its front in the engine
-(`openai::Front`) renders each submission with the chat format, runs its tokens through the reply parser, and starts
-the request's grammar from its typed constraints (tools, tool choice, `text.format`, thinking) through a seam the
-engine's grammar plugs into. Not live yet: compiling the grammar at the boundary, so that a schema or grammar feature
-the engine does not implement is a named 400 before the engine sees the request; until engine.grammar is wired in
-there, a request's tools, tool choice and format are carried to the engine but not yet enforced by a compiled grammar.
+whole at the boundary (engine.json's decoder, then the served model, tools, tool choice, the output grammar, budget,
+sampling, the chat template's rules and the stored response a continuation names), hands the engine a typed submission
+carrying its compiled grammar, and answers whole or streamed from the engine's typed outputs; engine.store holds stored
+responses. The request's tools, tool choice, `text.format` and reasoning are compiled by engine.grammar during
+validation, so a schema or grammar feature the engine does not implement is a named 400 (below) before the engine sees
+the request, and every reply decodes under its grammar: calls always parse, arguments always match their schema, and
+the tool choice and format are honoured. The engine's front (`openai::Front`) renders each submission with the chat
+format, starts the grammar's matcher, and runs the reply's tokens through the reply parser.
 
 ### readiness and bounds
 
@@ -144,7 +144,7 @@ user query (`no_user_query`, which an empty input also fails).
 
 | tool | here | notes |
 |---|---|---|
-| `function` | exact | `name` `[a-zA-Z0-9_-]{1,64}` (`invalid_tool_name`), distinct across tools (`duplicate_tool_name`); `parameters` required (an object schema, or `null` for none); `strict` required, at both values (every schema is enforced); `description` rendered; `defer_loading` neutral `false`; `allowed_callers` neutral `["direct"]`; `output_schema` neutral `null`; a definition longer than the 4 MiB the chat format reads back as one JSON text `tool_too_large`; an unsupported schema feature is to be refused by the grammar compiler (1.4b), not yet wired in |
+| `function` | exact | `name` `[a-zA-Z0-9_-]{1,64}` (`invalid_tool_name`), distinct across tools (`duplicate_tool_name`); `parameters` required (an object schema, or `null` for none); `strict` required, at both values (every schema is enforced); `description` rendered; `defer_loading` neutral `false`; `allowed_callers` neutral `["direct"]`; `output_schema` neutral `null`; a definition longer than the 4 MiB the chat format reads back as one JSON text `tool_too_large`; an unsupported schema feature is refused by the grammar compiler with its own code (see the output grammar) |
 | `custom` | exact | `format` `text` or `grammar` (`syntax` `lark` or `regex`, `definition`); reaches the model as a template tool with one string parameter `input`; `defer_loading`, `allowed_callers` as functions; its name and definition bounded as a function's |
 | `file_search`, `computer`, `computer_use_preview`, `web_search`, `web_search_preview`, `mcp`, `code_interpreter`, `programmatic_tool_calling`, `image_generation`, `local_shell`, `shell`, `namespace`, `tool_search`, `apply_patch` | refused `unsupported_parameter` | |
 
@@ -157,6 +157,48 @@ user query (`no_user_query`, which an empty input also fails).
 | `{type: custom, name}` | exact; the name must be a custom tool's (`unknown_tool`) |
 | `required` or a named tool without tools | refused `tool_choice_without_tools` |
 | `allowed_tools`, the hosted-tool types, `mcp`, `apply_patch`, `shell`, `programmatic_tool_calling` | refused `unsupported_parameter` |
+
+## the output grammar
+
+Every request decodes under a grammar compiled from its tools, tool choice, `text.format` and reasoning effort
+(`parallel_tool_calls` is always `true`), during validation, under fixed bounds. What the compiler does not implement,
+or what passes a bound, is a 400 with its own `code`; `param` names the member (`tools[i].parameters` for a function's
+schema, `tools[i].format` for a custom tool's regex, `tools` for a custom tool's lark grammar, `text.format.schema` for
+the format's schema, `tool_choice`), `null` for a bound of the grammar as a whole, and the message gives the compiler's
+location in the request.
+
+| code | refused |
+|---|---|
+| `schema_shape` | a schema that is neither an object nor a boolean |
+| `schema_keyword` | a keyword the engine does not implement |
+| `schema_value` | a keyword's value of the wrong shape (a `required` that is no list of strings, a negative `maxLength`) |
+| `schema_type` | a `type` naming no JSON type |
+| `schema_reference` | a `$ref` that is not `#`, `#/$defs/<name>` or `#/definitions/<name>`, or names no definition |
+| `schema_format` | a string `format` the engine does not implement |
+| `schema_one_of` | `oneOf` whose choices the engine cannot prove disjoint |
+| `schema_multiple_of` | `multipleOf` |
+| `schema_bound` | a numeric bound the engine cannot hold exactly (an exclusive real bound past 15 significant digits) |
+| `grammar_empty` | a grammar that admits no output: a schema no value satisfies, a lark grammar with no finite derivation |
+| `schema_open_argument` | a tool argument that may hold an object with additional properties (the chat format refuses repeated keys) |
+| `schema_string_union` | a tool argument whose type list mixes `string` with a type the chat format would read the text as |
+| `schema_recursive_argument` | a tool argument's recursive schema |
+| `tool_parameters` | a function's `parameters` that is not an object schema |
+| `tool_name`, `tool_duplicate`, `tool_unknown` | a tool or parameter name the chat format cannot write, two tools of one name, a choice naming no tool (the api's own checks refuse the last two first, as `duplicate_tool_name` and `unknown_tool`) |
+| `lark_syntax`, `lark_undefined`, `lark_recursive_terminal`, `lark_no_start`, `lark_priority`, `lark_template`, `lark_directive`, `lark_token`, `lark_option`, `lark_operator` | a custom tool's lark grammar: text that does not parse, a rule or terminal undefined or defined twice, a recursive terminal, no `start`, priorities, templates, a directive other than `%import common`, a special-token or grammar reference, a lexeme option other than `lazy` and `suffix`, `&` or `~` outside a terminal |
+| `regex_unexpected_end`, `regex_unbalanced_group`, `regex_nothing_to_repeat`, `regex_bad_repetition`, `regex_repetition_too_large`, `regex_bad_escape`, `regex_bad_class`, `regex_bad_character`, `regex_too_deep`, `regex_too_large`, `regex_lookaround`, `regex_lazy_quantifier`, `regex_anchor`, `regex_word_boundary`, `regex_backreference`, `regex_unicode_property`, `regex_unicode_case`, `regex_class_syntax`, `regex_group_syntax` | a regular expression (a custom tool's regex format, or a schema's `pattern`), each fault by name: malformed, or lookaround, lazy quantifiers, anchors without an exact meaning, word boundaries, backreferences, Unicode property classes, case folding past ascii, class set syntax and group flags, which the engine does not implement |
+| `schema_too_large` | a schema text past 256 KiB or nested past 32 levels, a `pattern` past 16 KiB, or a `minLength`/`maxLength` past 100,000 |
+| `schema_too_many` | more than 5,000 properties or 2,000 enum and const values across the request, or too many definitions |
+| `lark_too_large` | a lark grammar past 64 KiB or 1,000 rules and terminals; a custom tool's regex past 16 KiB |
+| `automaton_too_large` | a lexeme whose automaton passes 10,000 states, or all together 120,000 |
+| `grammar_too_large` | a grammar past 20,000 lexemes, 100,000 rules, 400,000 symbols or 2^20 expression nodes |
+
+The bound users meet first is the automaton's: a bounded string is one lexeme, whose states grow with its bound. As
+measured here, a function argument's string compiles up to `maxLength` 186 and a `json_schema` format's top-level
+string up to 281; past that the request is refused `automaton_too_large`. Patterns and enums of many long values meet
+the same bound.
+
+A request whose grammar outgrows the matcher's own bounds while the reply decodes (`grammar_overrun`) is described
+above. A caller without stored responses (the cli) refuses `previous_response_id` with `previous_response_unavailable`.
 
 ## the `Response` object
 
@@ -206,7 +248,7 @@ the client reads slower than the model writes, the pending deltas of one item me
 | `response.custom_tool_call_input.delta`, `.done` | likewise |
 | `response.completed`, `response.incomplete` | the final response |
 | `response.failed` | the response as it stood, `status` `failed`, when the engine failed under the stream |
-| `error` | `{type, code, message, param, sequence_number}`: a client that read too slowly (`stream_backlog`, its request cancelled), a response that outgrew one event or one body (`response_too_large`), or a grammar that outgrew its bounds (`grammar_too_large`); the sdk raises it |
+| `error` | `{type, code, message, param, sequence_number}`: a client that read too slowly (`stream_backlog`, its request cancelled), a response that outgrew one event or one body (`response_too_large`), or a grammar that outgrew its bounds while decoding (`grammar_overrun`); the sdk raises it |
 | `response.queued`, refusal, audio, summary, annotation, and every hosted-tool event | never |
 
 ## owner decisions
