@@ -538,7 +538,7 @@ private:
 					continue;
 				}
 				if (auto const refused = core::alternative<Refused>(assembly)) {
-					connection.outbound.adopt(encode_refusal(refused->error.kind, ids_.issue()));
+					connection.outbound.adopt(encode_refusal(refused->error, ids_.issue()));
 					connection.phase = Flushing{.persistence = Persistence::Close};
 					continue;
 				}

@@ -8,8 +8,9 @@ namespace engine::http_test_client {
 
 /**
  * The client side of the server tests, written from the protocol and not from the server: a response reader for
- * Content-Length and chunked bodies, and an event-stream decoder that follows the WHATWG parsing rules. It is the
- * oracle the server's bytes are checked against.
+ * Content-Length and chunked bodies, an event-stream decoder that follows the WHATWG parsing rules, and a query
+ * writer that spells parameters every way application/x-www-form-urlencoded allows. It is the oracle the server's
+ * bytes are checked against.
  */
 export struct Parsed {
 	int status;
@@ -205,6 +206,56 @@ export [[nodiscard]] auto normalized(std::string_view data) -> std::string {
 			}
 		} else {
 			out += data[index];
+		}
+	}
+	return out;
+}
+
+/** Bytes a form-urlencoded spelling may leave as they are. */
+[[nodiscard]] constexpr auto is_unreserved(char c) -> bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' ||
+	       c == '*';
+}
+
+/**
+ * One of the spellings application/x-www-form-urlencoded allows for `bytes`, drawn from `rng`: an unreserved byte as
+ * itself or escaped, a space as '+' or "%20", any other byte as '%' and two hex digits of either case.
+ */
+export [[nodiscard]] auto form_encoded(std::string_view bytes, std::mt19937_64& rng) -> std::string {
+	constexpr std::string_view upper = "0123456789ABCDEF";
+	constexpr std::string_view lower = "0123456789abcdef";
+	auto out = std::string{};
+	for (auto const c : bytes) {
+		auto const choice = rng() % 2;
+		if (is_unreserved(c) && choice == 0) {
+			out += c;
+		} else if (c == ' ' && choice == 0) {
+			out += '+';
+		} else {
+			auto const byte = std::bit_cast<std::uint8_t>(c);
+			out += '%';
+			out += (rng() % 2 == 0 ? upper : lower)[unsigned{byte} >> 4U];
+			out += (rng() % 2 == 0 ? upper : lower)[unsigned{byte} & 0xfU];
+		}
+	}
+	return out;
+}
+
+/** One query parameter as bytes, before it is spelled. */
+export struct Parameter {
+	std::string name;
+	std::string value;
+};
+
+/** A query for `parameters`, in order: `name=value` joined by '&', an empty value with or without its '='. */
+export [[nodiscard]] auto query_string(std::span<Parameter const> parameters, std::mt19937_64& rng) -> std::string {
+	auto out = std::string{};
+	for (auto const& parameter : parameters) {
+		out += out.empty() ? "" : "&";
+		out += form_encoded(parameter.name, rng);
+		if (!parameter.value.empty() || rng() % 2 == 0) {
+			out += '=';
+			out += form_encoded(parameter.value, rng);
 		}
 	}
 	return out;

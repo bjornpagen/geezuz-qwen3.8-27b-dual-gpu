@@ -107,10 +107,9 @@ struct Dispatch {
 };
 
 /**
- * The http server: one owner thread runs it, and it owns every connection. `B` bounds and pads the chat route's
- * body. The first SIGINT or SIGTERM (once
- * subscribed) or `stop` stops taking connections and requests and lets exchanges in flight finish; a second stop
- * closes everything at once, abandoning what is in flight.
+ * The http server: one owner thread runs it, and it owns every connection. `B` bounds and pads the body of a
+ * response to create. The first SIGINT or SIGTERM (once subscribed) or `stop` stops taking connections and requests
+ * and lets exchanges in flight finish; a second stop closes everything at once, abandoning what is in flight.
  */
 export template<std::movable Message, BodyBounds B>
 class Server {

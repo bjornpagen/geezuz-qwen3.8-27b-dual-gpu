@@ -7,6 +7,7 @@ import :error;
 import :head;
 import :limits;
 import :request;
+import :target;
 
 namespace engine::http {
 
@@ -40,20 +41,14 @@ export struct Refused {
 export template<BodyBounds B>
 using Assembly = std::variant<Partial, Continue, Assembled<B>, Refused>;
 
-/** The route a head named, carrying its body; only the chat route has one (every other route's is empty). */
+/** A route that takes no body, as the request it is. */
 template<BodyBounds B>
-[[nodiscard]] auto route_of(Target target, Body<B> body) -> Route<B> {
-	switch (target) {
-	case Target::ChatCompletions:
-		return ChatCompletions<B>{.body = std::move(body)};
-	case Target::Models:
-		return ListModels{};
-	case Target::Health:
-		return Health{};
-	case Target::Status:
-		return ServerStatus{};
-	}
-	return Health{};
+[[nodiscard]] auto whole_route(Bodiless bodiless) -> Route<B> {
+	return std::visit(
+	    [](auto& route) -> Route<B> {
+		    return std::move(route);
+	    },
+	    bodiless);
 }
 
 /**
@@ -108,9 +103,9 @@ public:
 				return Partial{};
 			}
 			auto assembled = Assembled<B>{
-			    .route = route_of(reading->head.target, std::move(reading->body)),
-			    .client_id = std::move(reading->head.client_id),
-			    .persistence = reading->head.persistence,
+			    .route = CreateResponse<B>{.body = std::move(reading->body)},
+			    .client_id = std::move(reading->client_id),
+			    .persistence = reading->persistence,
 			};
 			stage_ = Heading{};
 			return assembled;
@@ -129,34 +124,52 @@ public:
 			return Refused{.error = head.error()};
 		}
 		consume(end + 4);
-
-		auto body = Body<B>{head->body_length};
-		auto const ready = std::min(buffered_, body.length());
-		std::ranges::copy(std::span{buffer_}.first(ready), body.unread(0).begin());
-		consume(ready);
-		if (ready == body.length()) {
-			return Assembled<B>{
-			    .route = route_of(head->target, std::move(body)),
-			    .client_id = std::move(head->client_id),
-			    .persistence = head->persistence,
-			};
-		}
-		auto const expectation = head->expectation;
-		stage_ = Reading{.head = std::move(*head), .body = std::move(body), .filled = ready};
-		if (expectation == Expectation::Continue) {
-			return Continue{};
-		}
-		return Partial{};
+		return std::visit(
+		    [this, &head](auto& routed) {
+			    return this->start(*head, routed);
+		    },
+		    head->routed);
 	}
 
 private:
 	struct Heading {};
 
+	/** A response to create, its body being read. */
 	struct Reading {
-		Head head;
+		std::optional<RequestId> client_id;
+		Persistence persistence;
 		Body<B> body;
 		std::size_t filled;
 	};
+
+	/** Moves the route and the client's id out of `head`. */
+	[[nodiscard]] auto start(Head& head, Bodiless& route) -> Assembly<B> {
+		return Assembled<B>{
+		    .route = whole_route<B>(std::move(route)),
+		    .client_id = std::move(head.client_id),
+		    .persistence = head.persistence,
+		};
+	}
+
+	/** Takes what of the body arrived with the head, and reads the rest after it; moves the client's id out of `head`. */
+	[[nodiscard]] auto start(Head& head, Creating const& creating) -> Assembly<B> {
+		auto body = Body<B>{creating.body_length};
+		auto const ready = std::min(buffered_, body.length());
+		std::ranges::copy(std::span{buffer_}.first(ready), body.unread(0).begin());
+		consume(ready);
+		if (ready == body.length()) {
+			return Assembled<B>{
+			    .route = CreateResponse<B>{.body = std::move(body)},
+			    .client_id = std::move(head.client_id),
+			    .persistence = head.persistence,
+			};
+		}
+		stage_ = Reading{.client_id = std::move(head.client_id), .persistence = head.persistence, .body = std::move(body), .filled = ready};
+		if (creating.expectation == Expectation::Continue) {
+			return Continue{};
+		}
+		return Partial{};
+	}
 
 	/** Drops the first `count` held bytes, keeping what a pipelining client sent after them. */
 	auto consume(std::size_t count) -> void {

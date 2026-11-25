@@ -5,6 +5,7 @@ import std;
 import engine.core;
 import :error;
 import :limits;
+import :method;
 import :request;
 import :status;
 
@@ -38,12 +39,12 @@ constexpr std::string_view stream_end = "0\r\n\r\n";
 	return "close";
 }
 
-[[nodiscard]] auto encode_whole(StatusCode status, std::string_view type, std::string_view body, std::optional<std::string_view> allow,
+[[nodiscard]] auto encode_whole(StatusCode status, std::string_view type, std::string_view body, std::optional<Methods> allow,
                                 Persistence persistence, RequestId const& id) -> std::string {
 	auto text = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\nX-Request-Id: {}\r\n",
 	                        std::to_underlying(status), reason(status), type, body.size(), connection_value(persistence), id.text());
 	if (allow) {
-		text += std::format("Allow: {}\r\n", *allow);
+		text += std::format("Allow: {}\r\n", allow_value(*allow));
 	}
 	text += "\r\n";
 	text += body;
@@ -65,9 +66,9 @@ constexpr std::string_view stream_end = "0\r\n\r\n";
 }
 
 /** A refused request's response. Its connection always closes: the bytes after a refused head cannot be framed. */
-[[nodiscard]] auto encode_refusal(HttpErrorKind kind, RequestId const& id) -> std::string {
-	auto const body = error_document(explanation(kind), JsonText{"invalid_request_error"}, code_text(kind));
-	return encode_whole(status_of(kind), media_type(ContentType::Json), body, allowed_method(kind), Persistence::Close, id);
+[[nodiscard]] auto encode_refusal(HttpError const& error, RequestId const& id) -> std::string {
+	auto const body = error_document(explanation(error), JsonText{"invalid_request_error"}, code_text(error));
+	return encode_whole(status_of(error), media_type(ContentType::Json), body, allowed_methods(error), Persistence::Close, id);
 }
 
 /** The 500 that replaces a whole response longer than max_response_body_bytes. */

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-engine_test(http.inbound SOURCES inbound.test.cc LINK engine_http)
+engine_test(http.inbound SOURCES inbound.test.cc LINK engine_http engine_http_test_client)
 
-# The tests' http client: a response reader and event-stream decoder written from the protocol, the oracle the
-# server's bytes are checked against.
+# The tests' http client: a response reader, an event-stream decoder and a query writer written from the protocol,
+# the oracle the server's bytes and the request parser are checked against.
 add_library(engine_http_test_client)
 target_sources(engine_http_test_client PUBLIC FILE_SET CXX_MODULES FILES client.cc)
 target_link_libraries(engine_http_test_client PUBLIC engine_language_profile engine_net)

@@ -36,8 +36,8 @@ struct End {
 
 using Message = std::variant<Reply, Open, Emit, End>;
 
-/** How the test service answers a chat request. */
-enum class Chat : std::uint8_t {
+/** How the test service answers a request to create a response. */
+enum class Mode : std::uint8_t {
 	Echo,
 	Stream,
 	Defer,
@@ -46,7 +46,7 @@ enum class Chat : std::uint8_t {
 
 /** A test double for the openai service: it answers by route and records everything the server tells it. */
 struct Recorder {
-	Chat chat;
+	Mode mode;
 	std::vector<http::Exchange> exchanges;
 	std::vector<http::Request<bounds>> requests;
 	std::vector<http::Exchange> gone;
@@ -67,16 +67,19 @@ struct Recorder {
 		if (std::holds_alternative<http::ServerStatus>(request.route)) {
 			return http::Deferred{};
 		}
-		switch (chat) {
-		case Chat::Echo:
+		if (!std::holds_alternative<http::CreateResponse<bounds>>(request.route)) {
+			return http::Response{.status = http::StatusCode::Ok, .content_type = http::ContentType::Json, .body = "answered " + id};
+		}
+		switch (mode) {
+		case Mode::Echo:
 			return http::Response{.status = http::StatusCode::Ok,
 			                      .content_type = http::ContentType::Json,
-			                      .body = std::string{std::get<http::ChatCompletions<bounds>>(request.route).body.text()}};
-		case Chat::Stream:
+			                      .body = std::string{std::get<http::CreateResponse<bounds>>(request.route).body.text()}};
+		case Mode::Stream:
 			return http::OpenStream{};
-		case Chat::Defer:
+		case Mode::Defer:
 			return http::Deferred{};
-		case Chat::Oversized:
+		case Mode::Oversized:
 			return http::Response{.status = http::StatusCode::Ok,
 			                      .content_type = http::ContentType::Text,
 			                      .body = std::string(http::max_response_body_bytes + 1, 'x')};
@@ -165,7 +168,7 @@ struct Harness {
 	}
 };
 
-[[nodiscard]] auto harness(Chat chat, Timeouts timeouts) -> std::unique_ptr<Harness> {
+[[nodiscard]] auto harness(Mode mode, Timeouts timeouts) -> std::unique_ptr<Harness> {
 	auto server = http::Server<Message, bounds>::open(http::ServerConfig{
 	    .endpoint = net::Endpoint{.address = net::loopback, .port = 0},
 	    .read_timeout = timeouts.read,
@@ -179,19 +182,22 @@ struct Harness {
 	auto const poster = server->poster();
 	return std::make_unique<Harness>(Harness{
 	    .server = std::move(*server),
-	    .service = Recorder{.chat = chat, .exchanges = {}, .requests = {}, .gone = {}, .resumed = {}, .flows = {}, .deliveries = {}},
+	    .service = Recorder{.mode = mode, .exchanges = {}, .requests = {}, .gone = {}, .resumed = {}, .flows = {}, .deliveries = {}},
 	    .poster = poster,
 	});
 }
 
-[[nodiscard]] auto get(std::string_view path, std::string_view extra) -> std::string {
-	return std::format("GET {} HTTP/1.1\r\nHost: test\r\n{}\r\n", path, extra);
+[[nodiscard]] auto bodiless(std::string_view method, std::string_view target, std::string_view extra) -> std::string {
+	return std::format("{} {} HTTP/1.1\r\nHost: test\r\n{}\r\n", method, target, extra);
 }
 
-[[nodiscard]] auto chat(std::string_view body, std::string_view extra) -> std::string {
-	return std::format(
-	    "POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{}", body.size(),
-	    extra, body);
+[[nodiscard]] auto get(std::string_view target, std::string_view extra) -> std::string {
+	return bodiless("GET", target, extra);
+}
+
+[[nodiscard]] auto create(std::string_view body, std::string_view extra) -> std::string {
+	return std::format("POST /v1/responses HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{}",
+	                   body.size(), extra, body);
 }
 
 [[nodiscard]] auto responses(client::Client const& peer) -> client::Responses {
@@ -222,7 +228,7 @@ struct Harness {
 }
 
 [[nodiscard]] auto keep_alive_serves_requests_in_turn() -> bool {
-	auto h = harness(Chat::Echo, quick);
+	auto h = harness(Mode::Echo, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	if (!peer || !h->push(*peer, get("/health", "")) || !h->pump(*peer, has_responses(*peer, 1), 2000ms) ||
 	    !h->push(*peer, get("/v1/models", "X-Request-Id: client-7\r\n")) || !h->pump(*peer, has_responses(*peer, 2), 2000ms)) {
@@ -241,7 +247,7 @@ struct Harness {
 }
 
 [[nodiscard]] auto an_insane_client_id_is_replaced() -> bool {
-	auto h = harness(Chat::Echo, quick);
+	auto h = harness(Mode::Echo, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	auto const request = get("/health", "X-Request-Id: has spaces and/slash\r\n") + get("/health", "") + get("/health", "");
 	if (!peer || !h->push(*peer, request) || !h->pump(*peer, has_responses(*peer, 3), 2000ms)) {
@@ -259,7 +265,7 @@ struct Harness {
 }
 
 [[nodiscard]] auto connection_close_is_honoured() -> bool {
-	auto h = harness(Chat::Echo, quick);
+	auto h = harness(Mode::Echo, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	if (!peer || !h->push(*peer, get("/health", "Connection: close\r\n") + get("/health", "")) || !h->pump(*peer, closed(*peer), 4000ms)) {
 		return false;
@@ -340,37 +346,84 @@ using ErrorReader = engine::json::Reader<engine::json::request_bounds>;
 struct Refusal {
 	std::string request;
 	int status;
-	http::HttpErrorKind kind;
+	http::HttpError error;
+	/** The Allow field a 405 carries, written from the api's route list. */
+	std::optional<std::string_view> allow;
 };
+
+[[nodiscard]] auto wrong(std::initializer_list<http::Method> allowed) -> http::HttpError {
+	auto methods = http::Methods{};
+	for (auto const method : allowed) {
+		methods = methods.with(method);
+	}
+	return http::HttpError{http::WrongMethod{.allowed = methods}};
+}
 
 [[nodiscard]] auto refusals_are_named_and_close_the_connection() -> bool {
 	using enum http::HttpErrorKind;
+	using enum http::Method;
 	auto reader = ErrorReader::make();
 	if (!reader) {
 		return false;
 	}
+	auto const too_many = std::views::iota(std::size_t{0}, http::max_query_parameters + 1) | std::views::transform([](std::size_t index) {
+		                      return std::format("p{}=1", index);
+	                      }) |
+	                      std::views::join_with('&') | std::ranges::to<std::string>();
 	auto const refusals = std::array{
-	    Refusal{.request = get("/nowhere", ""), .status = 404, .kind = NotFound},
-	    Refusal{.request = get("/v1/chat/completions", ""), .status = 405, .kind = ExpectedPost},
-	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+	    Refusal{.request = get("/nowhere", ""), .status = 404, .error = {NotFound}, .allow = std::nullopt},
+	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}",
+		        .status = 404,
+		        .error = {NotFound},
+		        .allow = std::nullopt},
+	    Refusal{.request = get("/v1/responses", ""), .status = 405, .error = wrong({Post}), .allow = "POST"},
+	    Refusal{
+	        .request = bodiless("POST", "/v1/responses/resp_1", ""), .status = 405, .error = wrong({Get, Delete}), .allow = "GET, DELETE"},
+	    Refusal{
+	        .request = bodiless("PUT", "/v1/responses/resp_1", ""), .status = 405, .error = wrong({Get, Delete}), .allow = "GET, DELETE"},
+	    Refusal{.request = bodiless("DELETE", "/v1/responses/r/input_items", ""), .status = 405, .error = wrong({Get}), .allow = "GET"},
+	    Refusal{.request = get("/v1/responses/r/cancel", ""), .status = 405, .error = wrong({Post}), .allow = "POST"},
+	    Refusal{.request = bodiless("DELETE", "/health", ""), .status = 405, .error = wrong({Get}), .allow = "GET"},
+	    Refusal{.request = get("/v1/responses/resp.1", ""), .status = 400, .error = {InvalidResourceId}, .allow = std::nullopt},
+	    Refusal{.request = get("/v1/responses/r?after=%zz", ""), .status = 400, .error = {Malformed}, .allow = std::nullopt},
+	    Refusal{.request = get("/v1/responses/r/input_items?" + too_many, ""),
+		        .status = 400,
+		        .error = {TooManyQueryParameters},
+		        .allow = std::nullopt},
+	    Refusal{.request = get("/v1/models?limit=1", ""), .status = 400, .error = {QueryNotAllowed}, .allow = std::nullopt},
+	    Refusal{.request = bodiless("DELETE", "/v1/responses/r?x", ""), .status = 400, .error = {QueryNotAllowed}, .allow = std::nullopt},
+	    Refusal{.request = bodiless("DELETE", "/v1/responses/r", "Content-Length: 2\r\n") + "{}",
+		        .status = 400,
+		        .error = {BodyNotAllowed},
+		        .allow = std::nullopt},
+	    Refusal{.request = bodiless("POST", "/v1/responses/r/cancel", "Content-Length: 2\r\n") + "{}",
+		        .status = 400,
+		        .error = {BodyNotAllowed},
+		        .allow = std::nullopt},
+	    Refusal{.request = "POST /v1/responses HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
 		        .status = 411,
-		        .kind = ChunkedUpload},
-	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n\r\n", .status = 411, .kind = LengthRequired},
-	    Refusal{.request = std::format("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n{}", bounds.bytes + 1,
+		        .error = {ChunkedUpload},
+		        .allow = std::nullopt},
+	    Refusal{.request = bodiless("POST", "/v1/responses", ""), .status = 411, .error = {LengthRequired}, .allow = std::nullopt},
+	    Refusal{.request = std::format("POST /v1/responses HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n{}", bounds.bytes + 1,
 		                               std::string(4096, 'z')),
 		        .status = 413,
-		        .kind = BodyTooLarge},
-	    Refusal{.request = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}",
+		        .error = {BodyTooLarge},
+		        .allow = std::nullopt},
+	    Refusal{.request = "POST /v1/responses HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}",
 		        .status = 400,
-		        .kind = AmbiguousFraming},
-	    Refusal{.request = "GET /health HTTP/1.0\r\nHost: t\r\n\r\n", .status = 505, .kind = UnsupportedVersion},
-	    Refusal{
-	        .request = get("/health", "X-Big: " + std::string(http::max_head_bytes, 'a') + "\r\n"), .status = 431, .kind = HeadTooLarge},
-	    Refusal{.request = "GET /health HTTP/1.1\r\n\r\n", .status = 400, .kind = HostRequired},
-	    Refusal{.request = "G@T /health HTTP/1.1\r\nHost: t\r\n\r\n", .status = 400, .kind = Malformed},
+		        .error = {AmbiguousFraming},
+		        .allow = std::nullopt},
+	    Refusal{.request = "GET /health HTTP/1.0\r\nHost: t\r\n\r\n", .status = 505, .error = {UnsupportedVersion}, .allow = std::nullopt},
+	    Refusal{.request = get("/health", "X-Big: " + std::string(http::max_head_bytes, 'a') + "\r\n"),
+		        .status = 431,
+		        .error = {HeadTooLarge},
+		        .allow = std::nullopt},
+	    Refusal{.request = "GET /health HTTP/1.1\r\n\r\n", .status = 400, .error = {HostRequired}, .allow = std::nullopt},
+	    Refusal{.request = "G@T /health HTTP/1.1\r\nHost: t\r\n\r\n", .status = 400, .error = {Malformed}, .allow = std::nullopt},
 	};
 	for (auto const& refusal : refusals) {
-		auto h = harness(Chat::Echo, quick);
+		auto h = harness(Mode::Echo, quick);
 		auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 		if (!peer) {
 			return false;
@@ -380,48 +433,92 @@ struct Refusal {
 			return false;
 		}
 		auto const parsed = responses(*peer);
+		auto const allow = parsed.complete.empty()                       ? std::nullopt
+		                   : parsed.complete[0].fields.contains("allow") ? std::optional<std::string>{field(parsed.complete[0], "allow")}
+		                                                                 : std::nullopt;
 		if (parsed.complete.size() != 1 || parsed.complete[0].status != refusal.status ||
-		    field(parsed.complete[0], "connection") != "close" || !h->service.exchanges.empty() ||
-		    !is_error_object(*reader, parsed.complete[0], "invalid_request_error", http::error_code(refusal.kind))) {
-			std::println("refusal {} answered {}", refusal.status, parsed.complete.empty() ? 0 : parsed.complete[0].status);
-			return false;
-		}
-		if (refusal.status == 405 && field(parsed.complete[0], "allow") != "POST") {
+		    field(parsed.complete[0], "connection") != "close" || !h->service.exchanges.empty() || allow != refusal.allow ||
+		    !is_error_object(*reader, parsed.complete[0], "invalid_request_error", http::error_code(refusal.error))) {
+			std::println("refusal {} answered {}", http::error_code(refusal.error),
+			             parsed.complete.empty() ? 0 : parsed.complete[0].status);
 			return false;
 		}
 	}
 	return true;
 }
 
-/** A pipelined stream of valid requests, each carrying its own id so the responses are fully determined. */
-[[nodiscard]] auto pipelined(std::uint64_t seed, std::size_t count) -> std::string {
+/** A pipelined stream of valid requests over every route, and the routes the service must receive, in order. */
+struct Pipelined {
+	std::string bytes;
+	std::vector<http::Route<bounds>> routes;
+};
+
+/** Each request carries its own X-Request-Id, so the answers are fully determined. */
+[[nodiscard]] auto pipelined(std::uint64_t seed, std::size_t count) -> Pipelined {
 	auto rng = engine::testing::generator(seed);
-	auto bytes = std::string{};
+	auto out = Pipelined{.bytes = "", .routes = {}};
+	auto const random_bytes = [&rng](std::size_t length) {
+		auto text = std::string(length, '\0');
+		std::ranges::generate(text, [&rng] {
+			return static_cast<char>(rng() & 0xffU);
+		});
+		return text;
+	};
 	for (auto index = std::size_t{0}; index < count; ++index) {
-		auto const id = std::format("Id: r{}-{}", seed, index);
-		auto const extra = std::format("X-Request-{}\r\n", id);
-		switch (rng() % 3) {
+		auto const extra = std::format("X-Request-Id: r{}-{}\r\n", seed, index);
+		auto const id = http::ResourceId{.text = std::format("resp_{:x}", rng())};
+		auto sent = std::vector<client::Parameter>{};
+		for (auto parameter = rng() % 4; parameter > 0; --parameter) {
+			sent.push_back(client::Parameter{.name = random_bytes(1 + (rng() % 6)), .value = random_bytes(rng() % 9)});
+		}
+		auto const query = http::Query{.parameters = sent | std::views::transform([](client::Parameter const& parameter) {
+			                                             return http::QueryParameter{.name = parameter.name, .value = parameter.value};
+		                                             }) |
+		                                             std::ranges::to<std::vector>()};
+		auto const target = sent.empty() ? std::string{} : "?" + client::query_string(sent, rng);
+		switch (rng() % 7) {
 		case 0:
-			bytes += get("/health", extra);
+			out.bytes += get("/health", extra);
+			out.routes.emplace_back(http::Health{});
 			break;
 		case 1:
-			bytes += get("/v1/models?limit=1", extra);
+			out.bytes += get("/v1/models", extra);
+			out.routes.emplace_back(http::ListModels{});
+			break;
+		case 2:
+			out.bytes += get("/v1/responses/" + id.text + target, extra);
+			out.routes.emplace_back(http::RetrieveResponse{.id = id, .query = query});
+			break;
+		case 3:
+			out.bytes += bodiless("DELETE", "/v1/responses/" + id.text, extra);
+			out.routes.emplace_back(http::DeleteResponse{.id = id});
+			break;
+		case 4:
+			out.bytes += get("/v1/responses/" + id.text + "/input_items" + target, extra);
+			out.routes.emplace_back(http::ListInputItems{.id = id, .query = query});
+			break;
+		case 5:
+			out.bytes += bodiless("POST", "/v1/responses/" + id.text + "/cancel", extra);
+			out.routes.emplace_back(http::CancelResponse{.id = id});
 			break;
 		default: {
-			auto body = std::string(rng() % 300, '\0');
-			std::ranges::generate(body, [&rng] {
-				return static_cast<char>(rng() & 0xffU);
-			});
-			bytes += chat(body, extra);
+			auto const body = random_bytes(rng() % 300);
+			out.bytes += create(body, extra);
+			out.routes.emplace_back(http::CreateResponse<bounds>{.body = http::Body<bounds>::copy_of(body)});
 			break;
 		}
 		}
 	}
-	return bytes;
+	return out;
 }
 
-[[nodiscard]] auto answered(std::string_view bytes, std::size_t count, std::size_t piece) -> std::optional<std::vector<client::Parsed>> {
-	auto h = harness(Chat::Echo, quick);
+struct Answered {
+	std::vector<client::Parsed> responses;
+	std::vector<http::Route<bounds>> routes;
+};
+
+[[nodiscard]] auto answered(std::string_view bytes, std::size_t count, std::size_t piece) -> std::optional<Answered> {
+	auto h = harness(Mode::Echo, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	if (!peer) {
 		return std::nullopt;
@@ -435,25 +532,30 @@ struct Refusal {
 	if (!h->pump(*peer, has_responses(*peer, count), 5000ms)) {
 		return std::nullopt;
 	}
-	return responses(*peer).complete;
+	return Answered{.responses = responses(*peer).complete,
+	                .routes = h->service.requests | std::views::transform(&http::Request<bounds>::route) | std::ranges::to<std::vector>()};
 }
 
-/** The same pipelined bytes, sent whole or one byte per server turn, draw byte-identical answers. */
+/**
+ * The same pipelined bytes, sent whole, one byte per server turn and in 7-byte pieces, draw byte-identical answers,
+ * and the service receives exactly the routes generated, ids and decoded queries included.
+ */
 [[nodiscard]] auto socket_fragmentation_never_changes_the_answers(std::uint64_t seed) -> bool {
-	constexpr auto count = std::size_t{6};
-	auto const bytes = pipelined(seed, count);
-	auto const whole = answered(bytes, count, bytes.size());
-	auto const single = answered(bytes, count, 1);
-	auto const odd = answered(bytes, count, 7);
+	constexpr auto count = std::size_t{8};
+	auto const generated = pipelined(seed, count);
+	auto const whole = answered(generated.bytes, count, generated.bytes.size());
+	auto const single = answered(generated.bytes, count, 1);
+	auto const odd = answered(generated.bytes, count, 7);
 	auto const same = [](client::Parsed const& left, client::Parsed const& right) {
 		return left.status == right.status && left.body == right.body && left.fields == right.fields;
 	};
-	return whole && single && odd && whole->size() == count && std::ranges::equal(*whole, *single, same) &&
-	       std::ranges::equal(*whole, *odd, same);
+	return whole && single && odd && whole->responses.size() == count && std::ranges::equal(whole->responses, single->responses, same) &&
+	       std::ranges::equal(whole->responses, odd->responses, same) && whole->routes == generated.routes &&
+	       single->routes == generated.routes && odd->routes == generated.routes;
 }
 
 [[nodiscard]] auto a_deferred_answer_arrives_through_the_mailbox() -> bool {
-	auto h = harness(Chat::Defer, quick);
+	auto h = harness(Mode::Defer, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	if (!peer || !h->push(*peer, get("/status", "")) ||
 	    !h->pump(
@@ -487,9 +589,9 @@ struct Refusal {
 /** Events of random data, line breaks included, decode to exactly that data, and the connection then serves on. */
 [[nodiscard]] auto events_round_trip(std::uint64_t seed) -> bool {
 	auto rng = engine::testing::generator(seed);
-	auto h = harness(Chat::Stream, quick);
+	auto h = harness(Mode::Stream, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
-	if (!peer || !h->push(*peer, chat("{}", "")) ||
+	if (!peer || !h->push(*peer, create("{}", "")) ||
 	    !h->pump(
 	        *peer,
 	        [&] {
@@ -524,12 +626,15 @@ struct Refusal {
 	       });
 }
 
+/** An ordinary event's size: a delta the service coalesces when the client falls behind. */
+constexpr std::size_t delta_bytes = 4096;
+
 [[nodiscard]] auto event_data(std::size_t index) -> std::string {
-	return std::format("{:05}:{}", index, std::string(http::max_event_bytes - 16, 'e'));
+	return std::format("{:05}:{}", index, std::string(delta_bytes - 6, 'e'));
 }
 
 /**
- * Posts events of the longest size to a stream whose client does not read, until the server refuses one and no
+ * Posts ordinary events to a stream whose client does not read, until the server refuses one and no
  * drain follows: the window and the kernel's buffers are full. Returns the accepted events' data, or nullopt if
  * the server took 80 MiB without refusing (an unbounded buffer).
  */
@@ -565,9 +670,9 @@ struct Refusal {
  * service when the client has caught up, and every accepted event arrives in order with nothing lost or repeated.
  */
 [[nodiscard]] auto a_slow_client_is_held_to_the_window() -> bool {
-	auto h = harness(Chat::Stream, Timeouts{.read = 2000ms, .write = 5000ms});
+	auto h = harness(Mode::Stream, Timeouts{.read = 2000ms, .write = 5000ms});
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
-	if (!peer || !h->push(*peer, chat("{}", "")) ||
+	if (!peer || !h->push(*peer, create("{}", "")) ||
 	    !h->pump(
 	        *peer,
 	        [&] {
@@ -602,9 +707,9 @@ struct Refusal {
 }
 
 [[nodiscard]] auto a_stalled_client_is_abandoned_at_the_write_deadline() -> bool {
-	auto h = harness(Chat::Stream, Timeouts{.read = 2000ms, .write = 300ms});
+	auto h = harness(Mode::Stream, Timeouts{.read = 2000ms, .write = 300ms});
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
-	if (!peer || !h->push(*peer, chat("{}", "")) ||
+	if (!peer || !h->push(*peer, create("{}", "")) ||
 	    !h->pump(
 	        *peer,
 	        [&] {
@@ -638,9 +743,9 @@ enum class Departure : std::uint8_t {
 
 /** A client that leaves mid-stream is reported once, as the event the pipeline turns into cancellation. */
 [[nodiscard]] auto a_departing_client_abandons_its_stream(Departure departure) -> bool {
-	auto h = harness(Chat::Stream, quick);
+	auto h = harness(Mode::Stream, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
-	if (!peer || !h->push(*peer, chat("{}", "")) ||
+	if (!peer || !h->push(*peer, create("{}", "")) ||
 	    !h->pump(
 	        *peer,
 	        [&] {
@@ -674,9 +779,9 @@ enum class Departure : std::uint8_t {
 }
 
 [[nodiscard]] auto a_client_that_leaves_before_the_answer_abandons_it() -> bool {
-	auto h = harness(Chat::Defer, quick);
+	auto h = harness(Mode::Defer, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
-	if (!peer || !h->push(*peer, chat("{\"slow\":true}", "")) ||
+	if (!peer || !h->push(*peer, create("{\"slow\":true}", "")) ||
 	    !h->pump(
 	        *peer,
 	        [&] {
@@ -698,7 +803,7 @@ enum class Departure : std::uint8_t {
 }
 
 [[nodiscard]] auto an_idle_connection_is_closed_at_the_read_deadline() -> bool {
-	auto h = harness(Chat::Echo, Timeouts{.read = 200ms, .write = 2000ms});
+	auto h = harness(Mode::Echo, Timeouts{.read = 200ms, .write = 2000ms});
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	if (!peer || !h->push(*peer, "GET /health HTTP/1.1\r\nHo")) {
 		return false;
@@ -709,11 +814,11 @@ enum class Departure : std::uint8_t {
 }
 
 [[nodiscard]] auto continue_is_sent_before_the_body() -> bool {
-	auto h = harness(Chat::Echo, quick);
+	auto h = harness(Mode::Echo, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	constexpr std::string_view body = R"({"messages":[]})";
 	auto const head =
-	    std::format("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n", body.size());
+	    std::format("POST /v1/responses HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n", body.size());
 	if (!peer || !h->push(*peer, head) ||
 	    !h->pump(
 	        *peer,
@@ -729,10 +834,10 @@ enum class Departure : std::uint8_t {
 }
 
 [[nodiscard]] auto an_oversized_answer_is_a_500() -> bool {
-	auto h = harness(Chat::Oversized, quick);
+	auto h = harness(Mode::Oversized, quick);
 	auto peer = h ? client::connect(h->server.port()) : std::nullopt;
 	auto reader = ErrorReader::make();
-	if (!peer || !reader || !h->push(*peer, chat("{}", "")) || !h->pump(*peer, has_responses(*peer, 1), 2000ms)) {
+	if (!peer || !reader || !h->push(*peer, create("{}", "")) || !h->pump(*peer, has_responses(*peer, 1), 2000ms)) {
 		return false;
 	}
 	auto const parsed = responses(*peer);
@@ -742,10 +847,10 @@ enum class Departure : std::uint8_t {
 
 /** Stopping refuses new work, lets the open stream finish, closes its connection after it, and then stops. */
 [[nodiscard]] auto stop_drains_in_flight_streams() -> bool {
-	auto h = harness(Chat::Stream, quick);
+	auto h = harness(Mode::Stream, quick);
 	auto streaming = h ? client::connect(h->server.port()) : std::nullopt;
 	auto idle = h ? client::connect(h->server.port()) : std::nullopt;
-	if (!streaming || !idle || !h->push(*streaming, chat("{}", "")) ||
+	if (!streaming || !idle || !h->push(*streaming, create("{}", "")) ||
 	    !h->pump(
 	        *streaming,
 	        [&] {
@@ -779,12 +884,12 @@ enum class Departure : std::uint8_t {
 
 /** A second stop signal closes everything at once, abandoning what is in flight. */
 [[nodiscard]] auto a_second_signal_stops_hard() -> bool {
-	auto h = harness(Chat::Defer, quick);
+	auto h = harness(Mode::Defer, quick);
 	if (!h || !h->server.stop_on_signals()) {
 		return false;
 	}
 	auto peer = client::connect(h->server.port());
-	if (!peer || !h->push(*peer, chat("{}", "")) ||
+	if (!peer || !h->push(*peer, create("{}", "")) ||
 	    !h->pump(
 	        *peer,
 	        [&] {
@@ -811,12 +916,14 @@ auto main() -> int {
 		                      .holds = an_insane_client_id_is_replaced()},
 	    engine::testing::Case{.name = "Connection: close is answered and the next pipelined request is not read",
 		                      .holds = connection_close_is_honoured()},
-	    engine::testing::Case{
-	        .name = "404, 405, 411, 413, 400, 505, 431 are OpenAI error objects with stable codes, then the connection closes",
-	        .holds = refusals_are_named_and_close_the_connection()},
-	    engine::testing::Case{.name = "pipelined requests sent whole, byte by byte and in 7-byte pieces draw the same answers (seed 1)",
+	    engine::testing::Case{.name = "refusals, 405s with their Allow among them, are OpenAI error objects with stable codes, then the "
+		                              "connection closes",
+		                      .holds = refusals_are_named_and_close_the_connection()},
+	    engine::testing::Case{.name = "pipelined requests on every route, sent whole, byte by byte and in 7-byte pieces, draw the same "
+		                              "answers and reach the service as sent (seed 1)",
 		                      .holds = socket_fragmentation_never_changes_the_answers(1)},
-	    engine::testing::Case{.name = "pipelined requests sent whole, byte by byte and in 7-byte pieces draw the same answers (seed 2)",
+	    engine::testing::Case{.name = "pipelined requests on every route, sent whole, byte by byte and in 7-byte pieces, draw the same "
+		                              "answers and reach the service as sent (seed 2)",
 		                      .holds = socket_fragmentation_never_changes_the_answers(2)},
 	    engine::testing::Case{.name = "a deferred exchange is answered through the mailbox",
 		                      .holds = a_deferred_answer_arrives_through_the_mailbox()},

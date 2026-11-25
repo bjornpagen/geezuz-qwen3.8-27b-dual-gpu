@@ -3,6 +3,7 @@ export module engine.http:error;
 
 import std;
 import engine.core;
+import :method;
 import :status;
 
 namespace engine::http {
@@ -22,9 +23,12 @@ struct JsonText {
 	}
 };
 
-/** Why a request was refused. Each kind is one named response; none can succeed by sending the same bytes again. */
+/** Why a request was refused, when the reason is all a refusal says. None succeeds by sending the same bytes again. */
 export enum class HttpErrorKind : std::uint8_t {
-	/** The request line or a header field breaks the grammar (including bare LF and obsolete line folding). */
+	/**
+	 * The request line or a header field breaks the grammar (including bare LF and obsolete line folding), or the
+	 * query does: an escape that is not '%' and two hex digits, or a parameter without a name.
+	 */
 	Malformed,
 	/** The head does not end within max_head_bytes. */
 	HeadTooLarge,
@@ -42,24 +46,33 @@ export enum class HttpErrorKind : std::uint8_t {
 	ChunkedUpload,
 	/** Content-Length is not one decimal number, or appears twice. */
 	BadContentLength,
-	/** A chat request without Content-Length. */
+	/** A request to create a response without Content-Length. */
 	LengthRequired,
 	/** A Content-Length past the route's body bound. */
 	BodyTooLarge,
-	/** A body on a GET route. */
+	/** A body on a route that takes none. */
 	BodyNotAllowed,
 	/** An Expect other than 100-continue. */
 	UnsupportedExpectation,
 	/** No route has this path. */
 	NotFound,
-	/** The path names a POST route. */
-	ExpectedPost,
-	/** The path names a GET route. */
-	ExpectedGet,
+	/** The path's id is not 1 to max_resource_id_bytes letters, digits, '-' or '_'. */
+	InvalidResourceId,
+	/** More than max_query_parameters query parameters. */
+	TooManyQueryParameters,
+	/** A query parameter on a route that reads none. */
+	QueryNotAllowed,
+};
+
+/** The path names a route, but not for this method: a 405 whose Allow field lists `allowed`, the path's methods. */
+export struct WrongMethod {
+	Methods allowed;
+
+	[[nodiscard]] constexpr auto operator==(WrongMethod const&) const -> bool = default;
 };
 
 export struct [[nodiscard]] HttpError {
-	HttpErrorKind kind;
+	std::variant<HttpErrorKind, WrongMethod> cause;
 
 	[[nodiscard]] constexpr auto retry() const -> core::Retry {
 		return core::Retry::Permanent;
@@ -68,7 +81,7 @@ export struct [[nodiscard]] HttpError {
 	[[nodiscard]] constexpr auto operator==(HttpError const&) const -> bool = default;
 };
 
-export [[nodiscard]] constexpr auto status_of(HttpErrorKind kind) -> StatusCode {
+[[nodiscard]] constexpr auto status_of(HttpErrorKind kind) -> StatusCode {
 	switch (kind) {
 	case HttpErrorKind::Malformed:
 	case HttpErrorKind::HostRequired:
@@ -76,6 +89,9 @@ export [[nodiscard]] constexpr auto status_of(HttpErrorKind kind) -> StatusCode 
 	case HttpErrorKind::UnsupportedTransferCoding:
 	case HttpErrorKind::BadContentLength:
 	case HttpErrorKind::BodyNotAllowed:
+	case HttpErrorKind::InvalidResourceId:
+	case HttpErrorKind::TooManyQueryParameters:
+	case HttpErrorKind::QueryNotAllowed:
 		return StatusCode::BadRequest;
 	case HttpErrorKind::HeadTooLarge:
 	case HttpErrorKind::TooManyHeaders:
@@ -91,11 +107,21 @@ export [[nodiscard]] constexpr auto status_of(HttpErrorKind kind) -> StatusCode 
 		return StatusCode::ExpectationFailed;
 	case HttpErrorKind::NotFound:
 		return StatusCode::NotFound;
-	case HttpErrorKind::ExpectedPost:
-	case HttpErrorKind::ExpectedGet:
-		return StatusCode::MethodNotAllowed;
 	}
 	return StatusCode::BadRequest;
+}
+
+[[nodiscard]] constexpr auto status_of(WrongMethod const&) -> StatusCode {
+	return StatusCode::MethodNotAllowed;
+}
+
+/** The refusal's status. */
+export [[nodiscard]] constexpr auto status_of(HttpError const& error) -> StatusCode {
+	return std::visit(
+	    [](auto const& cause) {
+		    return status_of(cause);
+	    },
+	    error.cause);
 }
 
 [[nodiscard]] constexpr auto code_text(HttpErrorKind kind) -> JsonText {
@@ -128,24 +154,38 @@ export [[nodiscard]] constexpr auto status_of(HttpErrorKind kind) -> StatusCode 
 		return JsonText{"unsupported_expectation"};
 	case HttpErrorKind::NotFound:
 		return JsonText{"route_not_found"};
-	case HttpErrorKind::ExpectedPost:
-		return JsonText{"post_required"};
-	case HttpErrorKind::ExpectedGet:
-		return JsonText{"get_required"};
+	case HttpErrorKind::InvalidResourceId:
+		return JsonText{"invalid_resource_id"};
+	case HttpErrorKind::TooManyQueryParameters:
+		return JsonText{"too_many_query_parameters"};
+	case HttpErrorKind::QueryNotAllowed:
+		return JsonText{"query_not_allowed"};
 	}
 	return JsonText{"malformed_request"};
 }
 
+[[nodiscard]] constexpr auto code_text(WrongMethod const&) -> JsonText {
+	return JsonText{"method_not_allowed"};
+}
+
+[[nodiscard]] constexpr auto code_text(HttpError const& error) -> JsonText {
+	return std::visit(
+	    [](auto const& cause) {
+		    return code_text(cause);
+	    },
+	    error.cause);
+}
+
 /** The refusal's stable OpenAI error `code`, one per kind: clients and logs may match on it. */
-export [[nodiscard]] constexpr auto error_code(HttpErrorKind kind) -> std::string_view {
-	return code_text(kind).text;
+export [[nodiscard]] constexpr auto error_code(HttpError const& error) -> std::string_view {
+	return code_text(error).text;
 }
 
 /** The refusal's `message`: a sentence a person reads. */
 [[nodiscard]] constexpr auto explanation(HttpErrorKind kind) -> JsonText {
 	switch (kind) {
 	case HttpErrorKind::Malformed:
-		return JsonText{"the request line or a header field is malformed"};
+		return JsonText{"the request line, its query or a header field is malformed"};
 	case HttpErrorKind::HeadTooLarge:
 		return JsonText{"the request head is too large"};
 	case HttpErrorKind::TooManyHeaders:
@@ -163,7 +203,7 @@ export [[nodiscard]] constexpr auto error_code(HttpErrorKind kind) -> std::strin
 	case HttpErrorKind::BadContentLength:
 		return JsonText{"Content-Length must be one decimal number"};
 	case HttpErrorKind::LengthRequired:
-		return JsonText{"a chat request needs Content-Length"};
+		return JsonText{"creating a response needs Content-Length"};
 	case HttpErrorKind::BodyTooLarge:
 		return JsonText{"the request body is too large"};
 	case HttpErrorKind::BodyNotAllowed:
@@ -172,36 +212,32 @@ export [[nodiscard]] constexpr auto error_code(HttpErrorKind kind) -> std::strin
 		return JsonText{"only Expect: 100-continue is supported"};
 	case HttpErrorKind::NotFound:
 		return JsonText{"no route has this path"};
-	case HttpErrorKind::ExpectedPost:
-		return JsonText{"this route takes POST"};
-	case HttpErrorKind::ExpectedGet:
-		return JsonText{"this route takes GET"};
+	case HttpErrorKind::InvalidResourceId:
+		return JsonText{"the id in the path is not letters, digits, - or _ of a sane length"};
+	case HttpErrorKind::TooManyQueryParameters:
+		return JsonText{"the query has too many parameters"};
+	case HttpErrorKind::QueryNotAllowed:
+		return JsonText{"this route takes no query parameters"};
 	}
 	return JsonText{"the request is malformed"};
 }
 
-/** The Allow field a 405 carries; other refusals carry none. */
-[[nodiscard]] constexpr auto allowed_method(HttpErrorKind kind) -> std::optional<std::string_view> {
-	switch (kind) {
-	case HttpErrorKind::ExpectedPost:
-		return "POST";
-	case HttpErrorKind::ExpectedGet:
-		return "GET";
-	case HttpErrorKind::Malformed:
-	case HttpErrorKind::HeadTooLarge:
-	case HttpErrorKind::TooManyHeaders:
-	case HttpErrorKind::UnsupportedVersion:
-	case HttpErrorKind::HostRequired:
-	case HttpErrorKind::AmbiguousFraming:
-	case HttpErrorKind::UnsupportedTransferCoding:
-	case HttpErrorKind::ChunkedUpload:
-	case HttpErrorKind::BadContentLength:
-	case HttpErrorKind::LengthRequired:
-	case HttpErrorKind::BodyTooLarge:
-	case HttpErrorKind::BodyNotAllowed:
-	case HttpErrorKind::UnsupportedExpectation:
-	case HttpErrorKind::NotFound:
-		return std::nullopt;
+[[nodiscard]] constexpr auto explanation(WrongMethod const&) -> JsonText {
+	return JsonText{"this path does not take this method; Allow lists the methods it takes"};
+}
+
+[[nodiscard]] constexpr auto explanation(HttpError const& error) -> JsonText {
+	return std::visit(
+	    [](auto const& cause) {
+		    return explanation(cause);
+	    },
+	    error.cause);
+}
+
+/** The methods a 405's Allow field lists; other refusals carry no Allow. */
+[[nodiscard]] constexpr auto allowed_methods(HttpError const& error) -> std::optional<Methods> {
+	if (auto const wrong = core::alternative<WrongMethod>(error.cause)) {
+		return wrong->allowed;
 	}
 	return std::nullopt;
 }

@@ -6,31 +6,15 @@ import engine.core;
 import :error;
 import :limits;
 import :request;
+import :target;
 
 namespace engine::http {
 
-/** The route a head names, before its body is read. */
-enum class Target : std::uint8_t {
-	ChatCompletions,
-	Models,
-	Health,
-	Status,
-};
-
-/** The client sent `Expect: 100-continue` and waits for an interim response before its body. */
-enum class Expectation : std::uint8_t {
-	None,
-	Continue,
-};
-
 /** What a request head says once parsed: everything the server needs to read the body and answer. */
 struct Head {
-	Target target;
+	Routed routed;
 	std::optional<RequestId> client_id;
 	Persistence persistence;
-	/** Content-Length; zero for every GET and for a chat request that declares an empty body. */
-	std::size_t body_length;
-	Expectation expectation;
 };
 
 constexpr std::string_view crlf = "\r\n";
@@ -116,32 +100,6 @@ constexpr std::string_view crlf = "\r\n";
 	return trim_ows(comma == std::string_view::npos ? value : value.substr(comma + 1));
 }
 
-struct Mapping {
-	std::string_view path;
-	std::string_view method;
-	Target target;
-};
-
-constexpr auto mappings = std::array{
-    Mapping{.path = "/v1/chat/completions", .method = "POST", .target = Target::ChatCompletions},
-    Mapping{.path = "/v1/models", .method = "GET", .target = Target::Models},
-    Mapping{.path = "/health", .method = "GET", .target = Target::Health},
-    Mapping{.path = "/status", .method = "GET", .target = Target::Status},
-};
-
-/** The route for a method and request target; the query, which no route reads, is ignored. */
-[[nodiscard]] constexpr auto route(std::string_view method, std::string_view target) -> core::Result<Target, HttpError> {
-	auto const path = target.substr(0, target.find('?'));
-	auto const found = std::ranges::find(mappings, path, &Mapping::path);
-	if (found == mappings.end()) {
-		return std::unexpected(HttpError{HttpErrorKind::NotFound});
-	}
-	if (method != found->method) {
-		return std::unexpected(HttpError{found->method == "POST" ? HttpErrorKind::ExpectedPost : HttpErrorKind::ExpectedGet});
-	}
-	return found->target;
-}
-
 /** The fields the server reads, gathered from every header line. */
 struct Fields {
 	std::size_t hosts = 0;
@@ -225,29 +183,18 @@ template<std::size_t MaxBody>
 		return std::unexpected(HttpError{HttpErrorKind::BadContentLength});
 	}
 
-	auto const routed = route(method, target);
+	auto routed = route<MaxBody>(method, target, length, fields.expect ? Expectation::Continue : Expectation::None);
 	if (!routed) {
 		return std::unexpected(routed.error());
-	}
-	if (*routed == Target::ChatCompletions && !length) {
-		return std::unexpected(HttpError{HttpErrorKind::LengthRequired});
-	}
-	if (*routed != Target::ChatCompletions && length.value_or(0) != 0) {
-		return std::unexpected(HttpError{HttpErrorKind::BodyNotAllowed});
-	}
-	if (length.value_or(0) > MaxBody) {
-		return std::unexpected(HttpError{HttpErrorKind::BodyTooLarge});
 	}
 	if (fields.expect && !equal_fold(*fields.expect, "100-continue")) {
 		return std::unexpected(HttpError{HttpErrorKind::UnsupportedExpectation});
 	}
 
 	return Head{
-	    .target = *routed,
+	    .routed = std::move(*routed),
 	    .client_id = fields.ids == 1 ? RequestId::parse(fields.id) : std::nullopt,
 	    .persistence = fields.persistence,
-	    .body_length = length.value_or(0),
-	    .expectation = fields.expect && length.value_or(0) != 0 ? Expectation::Continue : Expectation::None,
 	};
 }
 

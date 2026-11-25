@@ -122,12 +122,67 @@ private:
 	friend class Inbound<B>;
 };
 
-/** POST /v1/chat/completions: the body is the client's json, unparsed. */
+/**
+ * The id a route's path names: the segment after `/v1/responses/`, 1 to max_resource_id_bytes of [A-Za-z0-9_-],
+ * owned. The service parses it further.
+ */
+export struct ResourceId {
+	std::string text;
+
+	[[nodiscard]] auto operator==(ResourceId const&) const -> bool = default;
+};
+
+/** One query parameter, percent-decoded (and '+' as space), owned. */
+export struct QueryParameter {
+	std::string name;
+	std::string value;
+
+	[[nodiscard]] auto operator==(QueryParameter const&) const -> bool = default;
+};
+
+/** A request's query: its parameters in the order sent, at most max_query_parameters, names repeating as sent. */
+export struct Query {
+	std::vector<QueryParameter> parameters;
+
+	[[nodiscard]] auto operator==(Query const&) const -> bool = default;
+};
+
+/** POST /v1/responses: the body is the client's json, unparsed. */
 export template<BodyBounds B>
-struct ChatCompletions {
+struct CreateResponse {
 	Body<B> body;
 
-	[[nodiscard]] auto operator==(ChatCompletions const&) const -> bool = default;
+	[[nodiscard]] auto operator==(CreateResponse const&) const -> bool = default;
+};
+
+/** GET /v1/responses/{id}. */
+export struct RetrieveResponse {
+	ResourceId id;
+	Query query;
+
+	[[nodiscard]] auto operator==(RetrieveResponse const&) const -> bool = default;
+};
+
+/** DELETE /v1/responses/{id}. */
+export struct DeleteResponse {
+	ResourceId id;
+
+	[[nodiscard]] auto operator==(DeleteResponse const&) const -> bool = default;
+};
+
+/** GET /v1/responses/{id}/input_items. */
+export struct ListInputItems {
+	ResourceId id;
+	Query query;
+
+	[[nodiscard]] auto operator==(ListInputItems const&) const -> bool = default;
+};
+
+/** POST /v1/responses/{id}/cancel; it takes no body. */
+export struct CancelResponse {
+	ResourceId id;
+
+	[[nodiscard]] auto operator==(CancelResponse const&) const -> bool = default;
 };
 
 /** GET /v1/models. */
@@ -145,9 +200,13 @@ export struct ServerStatus {
 	[[nodiscard]] constexpr auto operator==(ServerStatus const&) const -> bool = default;
 };
 
-/** Exactly the routes this server serves; a request that names no route never reaches a service. */
+/**
+ * Exactly the routes this server serves; a request that names no route never reaches a service. Only
+ * CreateResponse has a body, and only RetrieveResponse and ListInputItems read a query: every other route refuses one.
+ */
 export template<BodyBounds B>
-using Route = std::variant<ChatCompletions<B>, ListModels, Health, ServerStatus>;
+using Route =
+    std::variant<CreateResponse<B>, RetrieveResponse, DeleteResponse, ListInputItems, CancelResponse, ListModels, Health, ServerStatus>;
 
 /** A request the service handles. It owns every byte it carries. */
 export template<BodyBounds B>

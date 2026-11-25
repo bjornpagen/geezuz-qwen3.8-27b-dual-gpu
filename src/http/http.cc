@@ -3,6 +3,7 @@ export module engine.http;
 
 export import :limits;
 export import :status;
+export import :method;
 export import :error;
 export import :request;
 export import :inbound;

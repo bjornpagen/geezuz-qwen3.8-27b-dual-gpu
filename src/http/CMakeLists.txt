@@ -4,8 +4,10 @@ target_sources(engine_http PUBLIC FILE_SET CXX_MODULES FILES
 	http.cc
 	limits.cc
 	status.cc
+	method.cc
 	error.cc
 	request.cc
+	target.cc
 	head.cc
 	inbound.cc
 	write.cc
