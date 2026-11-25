@@ -92,8 +92,15 @@ inline constexpr DraftDepth max_draft_depth = DraftDepth::Four;
 // GDDR6X on each 3090.
 inline constexpr Count card_memory_bytes = Count{24} * 1024 * 1024 * 1024;
 
-/** Activations, partial-sum exchange buffers, rings and scratch per card. */
-inline constexpr Count workspace_bytes = 1'000'000'000;
+// The driver maps device memory in pages, so every allocation takes whole pages. 2 MiB is the granularity the driver
+// reports for device memory on current nvidia cards; like the reserve below, it is an assumption until bring-up reads
+// it on these cards.
+inline constexpr Count allocation_granularity = Count{2} * 1024 * 1024;
+
+/** The device memory an allocation of `bytes` takes: whole pages. */
+[[nodiscard]] constexpr auto allocated(Count bytes) -> Count {
+	return divide_up(bytes, allocation_granularity) * allocation_granularity;
+}
 
 // What the driver keeps of each card before the engine allocates: its context, the jit-compiled module and the
 // resident kernel's local memory. 512 MiB is an assumption, not a measurement; bring-up on the cards measures it and
@@ -664,8 +671,43 @@ inline constexpr Count snapshot_blocks = divide_up(slot_state_bytes, kv_block_by
 static_assert(rounds_to(deltanet_state_bytes_per_slot, gigabyte / 1000, 75), "deltanet state: 75 MB per slot per card");
 
 /**
- * Each card's memory, outermost first. The block pool is what remains, so it is derived, never chosen. Its blocks hold
- * kv or deltanet snapshots; snapshots may hold at most their share, kv any block they do not hold.
+ * The card's workspace: every allocation besides the weights, the slot state and the pool, each its own whole pages.
+ * Decode's and prefill's buffers coexist; neither aliases the other by phase. Prefill could reuse only the decode
+ * scratch nothing keeps across a stopped loop (attention's records and decode's rows, ~123 MB, ~55 blocks), never the
+ * exchange buffers the peer writes or the flags whose epochs both kernels keep; that reuse would make the two hosts
+ * share one allocation, for about one percent more pool.
+ *
+ * Each figure is a layout's size, derived where the layout is defined: the layouts are built from the schedule,
+ * attention, deltanet and sampling headers, which all include this one, so this header cannot compute them. It holds
+ * the figures as constants, and each layout asserts that its size is exactly its figure, so neither drifts.
+ */
+struct WorkspacePlan {
+	/** The decode kernel's workspace: the schedule's buffers (exchanges, flags, attention's records, the replay rings, the
+	 * rope table), then decode's rows, the slots' books and block tables. */
+	Count decode;
+	/** The lm_head row-to-token table: a u32 token id per row of the card's half. */
+	Count row_tokens;
+	/** The decode kernel's control block, which the host and both cards' kernels share. */
+	Count control;
+	/** Prefill's workspace: a chunk's rows, its cross-card exchange and each slot's carried final-norm row. */
+	Count prefill;
+};
+
+inline constexpr WorkspacePlan workspace_plan = {
+    .decode = 210'562'560,
+    .row_tokens = vocab_per_card * sizeof(unsigned),
+    .control = 384,
+    .prefill = 460'775'424,
+};
+
+/** The device memory the workspace takes: each allocation in whole pages. */
+inline constexpr Count workspace_bytes = allocated(workspace_plan.decode) + allocated(workspace_plan.row_tokens) +
+                                         allocated(workspace_plan.control) + allocated(workspace_plan.prefill);
+
+/**
+ * Each card's memory, outermost first, each allocation in whole pages. The block pool is what remains, so it is
+ * derived, never chosen. Its blocks hold kv or deltanet snapshots; snapshots may hold at most their share, kv any block
+ * they do not hold.
  */
 struct CardMemory {
 	Count driver_reserve;
@@ -676,14 +718,21 @@ struct CardMemory {
 };
 
 [[nodiscard]] consteval auto plan_card_memory() -> CardMemory {
-	auto const fixed = driver_reserve_bytes + weight_bytes_per_card + workspace_bytes + slots * slot_state_bytes;
-	return {
+	auto memory = CardMemory{
 	    .driver_reserve = driver_reserve_bytes,
-	    .weights = weight_bytes_per_card,
+	    .weights = allocated(weight_bytes_per_card),
 	    .workspace = workspace_bytes,
-	    .slot_state = slots * slot_state_bytes,
-	    .pool_blocks = (card_memory_bytes - fixed) / kv_block_bytes,
+	    .slot_state = allocated(slots * slot_state_bytes),
+	    .pool_blocks = 0,
 	};
+	auto const room = card_memory_bytes - memory.driver_reserve - memory.weights - memory.workspace - memory.slot_state;
+	// The pool is one allocation of whole blocks, so its last page can hold less than a block: take the most blocks
+	// whose pages fit.
+	memory.pool_blocks = room / kv_block_bytes;
+	while (allocated(memory.pool_blocks * kv_block_bytes) > room) {
+		--memory.pool_blocks;
+	}
+	return memory;
 }
 
 inline constexpr CardMemory card_memory = plan_card_memory();
@@ -700,7 +749,7 @@ inline constexpr Count snapshot_cap_blocks =
 /** Snapshots the pool holds at most. */
 inline constexpr Count snapshot_capacity = snapshot_cap_blocks / snapshot_blocks;
 
-static_assert(card_memory.driver_reserve + card_memory.weights + card_memory.workspace + card_memory.slot_state + pool_bytes <=
+static_assert(card_memory.driver_reserve + card_memory.weights + card_memory.workspace + card_memory.slot_state + allocated(pool_bytes) <=
                   card_memory_bytes,
               "everything a card holds fits its memory");
 static_assert(snapshot_capacity >= slots, "every slot can park its state in the prefix cache at once");

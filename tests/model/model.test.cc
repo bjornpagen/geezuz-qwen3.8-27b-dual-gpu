@@ -206,13 +206,36 @@ using model::Tensor;
 	       model::pool_bytes == model::pool_tokens * model::kv_bytes_per_token_per_card;
 }
 
-// The block pool takes every whole block the card has left: one block more would not fit.
+/** Whether `taken` is the fewest whole pages that hold `bytes`. */
+[[nodiscard]] auto fewest_pages(Count taken, Count bytes) -> bool {
+	auto const page = model::allocation_granularity;
+	return taken % page == 0 && taken >= bytes && taken < bytes + page;
+}
+
+// Every allocation the plan counts takes the fewest whole pages that hold it, the workspace each of its own.
+[[nodiscard]] auto allocations_take_whole_pages() -> bool {
+	auto const memory = model::card_memory;
+	auto const plan = model::workspace_plan;
+	auto const parts = std::array{plan.decode, plan.row_tokens, plan.control, plan.prefill};
+	auto pages = Count{0};
+	auto sound = true;
+	for (auto const bytes : parts) {
+		auto const taken = model::allocated(bytes);
+		sound = sound && fewest_pages(taken, bytes);
+		pages += taken;
+	}
+	return sound && memory.workspace == pages && fewest_pages(memory.weights, model::weight_bytes_per_card) &&
+	       fewest_pages(memory.slot_state, model::slots * model::slot_state_bytes) &&
+	       fewest_pages(model::allocated(model::pool_bytes), model::pool_bytes);
+}
+
+// The block pool takes every whole block the card has left: one block more would not fit in whole pages.
 [[nodiscard]] auto pool_takes_every_block_left() -> bool {
 	auto const memory = model::card_memory;
 	auto const fixed = memory.driver_reserve + memory.weights + memory.workspace + memory.slot_state;
 	auto const blocks = memory.pool_blocks;
-	return fixed + blocks * model::kv_block_bytes <= model::card_memory_bytes &&
-	       fixed + (blocks + 1) * model::kv_block_bytes > model::card_memory_bytes;
+	return fixed + model::allocated(blocks * model::kv_block_bytes) <= model::card_memory_bytes &&
+	       fixed + model::allocated((blocks + 1) * model::kv_block_bytes) > model::card_memory_bytes;
 }
 
 }
@@ -258,6 +281,10 @@ auto main() -> int {
 	    engine::testing::Case{
 	        .name = "kv bytes per position count every full-attention layer, the mtp head's included",
 	        .holds = kv_bytes_count_every_attention_layer(),
+	    },
+	    engine::testing::Case{
+	        .name = "every allocation the card's plan counts takes the fewest whole pages that hold it",
+	        .holds = allocations_take_whole_pages(),
 	    },
 	    engine::testing::Case{
 	        .name = "the block pool takes every whole block the card has left after its fixed contents",

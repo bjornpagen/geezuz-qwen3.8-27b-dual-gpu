@@ -1006,4 +1006,7 @@ static_assert(cycles_stream_every_byte(), "a cycle streams the main pass once an
 
 static_assert(image(0).stream_bytes % tile_bytes == 0, "the tile region is whole tiles");
 
+// The card's memory plan counts the weights in whole pages; the side data's alignment padding must not spill into one more.
+static_assert(model::allocated(image(0).bytes) == model::card_memory.weights, "the image takes exactly the pages the memory plan counts");
+
 }

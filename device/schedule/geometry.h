@@ -2,7 +2,8 @@
 //
 // How the cycle program lands on the machine: each phase's units split over the SMs, the per-SM transaction stream a
 // producer walks, the decode kernel's warp roles and shared memory, and the cross-SM and cross-card buffers and flags
-// in the workspace. Every geometry is a compile-time fact checked against the sm_86 limits and the model's workspace.
+// in the workspace. Every geometry is a compile-time fact checked against the sm_86 limits; the workspace buffers open
+// the decode kernel's workspace, whose size the card's memory plan counts.
 #pragma once
 
 #include "attn/arithmetic.h"
@@ -281,16 +282,5 @@ inline constexpr Count workspace_alignment = 256;
 	layout.bytes = layout.rope_table + attn::rope_table_bytes;
 	return layout;
 }
-
-[[nodiscard]] consteval auto workspaces_fit() -> bool {
-	for (auto const budget : model::row_budgets) {
-		if (workspace(budget).bytes > model::workspace_bytes) {
-			return false;
-		}
-	}
-	return true;
-}
-
-static_assert(workspaces_fit(), "the schedule's buffers fit the card's workspace");
 
 }

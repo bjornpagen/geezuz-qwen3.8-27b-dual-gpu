@@ -158,8 +158,8 @@ struct Planned {
 
 inline constexpr Workspace workspace = plan_workspace();
 
-// The decode loop's workspace shares the card's workspace budget; prefill takes at most two thirds of it.
-static_assert(workspace.bytes <= model::workspace_bytes * 2 / 3, "the prefill workspace leaves the decode loop its share");
+// The card's memory plan counts this size beside the decode loop's, so the pool is what is left after exactly both.
+static_assert(workspace.bytes == model::workspace_plan.prefill, "the memory plan holds the prefill workspace's size");
 static_assert(workspace.bytes % 16 == 0 && workspace.flags % 16 == 0, "the workspace zeroes in whole chunks");
 
 // ---------------------------------------------------------------------------------------------------------------------

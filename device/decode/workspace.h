@@ -3,8 +3,8 @@
 // The decode kernel's workspace on one card: the schedule's exchange buffers and flags first, exactly as
 // `schedule::workspace` lays them out (the peer stores into them at those offsets), then the activation rows the phases
 // hand each other, attention's records, the ranking lists, the replay rings and block tables, and what a slot keeps
-// from one cycle to the next. Every offset is a compile-time fact checked against the model's workspace budget. It uses
-// no standard headers so that it compiles unchanged as device code and inside a module purview.
+// from one cycle to the next. Every offset is a compile-time fact, and the whole is the size the card's memory plan
+// counts. It uses no standard headers so that it compiles unchanged as device code and inside a module purview.
 #pragma once
 
 #include "attn/geometry.h"
@@ -151,10 +151,12 @@ inline constexpr Count record_running = record_outputs + attn::max_record_rows(b
 
 static_assert(record_running + attn::max_record_rows(budget) * sizeof(attn::Running) <= workspace.exchange.attention_records + attn::record_bytes(budget));
 
-/** The card's lm_head row-to-token table and the control block are their own allocations; together they fit the budget. */
-inline constexpr Count row_token_bytes = model::vocab_per_card * sizeof(unsigned);
+/** The card's lm_head row-to-token table, its own allocation of the card's workspace. */
+inline constexpr Count row_token_bytes = model::workspace_plan.row_tokens;
 
-static_assert(workspace.bytes + row_token_bytes + sizeof(Control) <= model::workspace_bytes, "the decode workspace fits the card's budget");
+// The card's memory plan counts these sizes, so the pool is what is left after exactly them.
+static_assert(workspace.bytes == model::workspace_plan.decode, "the memory plan holds the decode workspace's size");
+static_assert(sizeof(Control) == model::workspace_plan.control, "the memory plan holds the control block's size");
 static_assert(lists_after(Op::Head, 0) >= lists_after(Op::DraftHead, 0) && lists_after(Op::Head, 2) <= lists_after(Op::Head, 0),
               "every fold's lists fit the buffer it writes");
 static_assert(sizeof(Descriptor) % 16 == 0, "the descriptor copies in whole chunks");

@@ -645,7 +645,7 @@ struct Flow {
 			}
 			end = offset + bytes;
 		}
-		return end == space.bytes && end <= model::workspace_bytes;
+		return end == space.bytes && end <= model::workspace_plan.decode;
 	});
 }
 
@@ -714,7 +714,7 @@ auto main() -> int {
 	        .holds = shapes_spend_the_budget(),
 	    },
 	    engine::testing::Case{
-	        .name = "the workspace buffers are aligned, disjoint and within the card's workspace",
+	        .name = "the workspace buffers are aligned, disjoint and within the decode workspace they open",
 	        .holds = workspace_buffers_are_disjoint(),
 	    },
 	};
