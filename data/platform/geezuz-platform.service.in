@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The cards' power limit and locked clocks. None of them survives a reboot or a driver reload, so they are applied on
+# every boot, once nvidia-persistenced has the driver loaded and holds it. @SM_LOCK_MHZ@ is the clock the sustained
+# clock benchmark accepted, one step below what 400 W sustains; docs/BRINGUP.md gives the step that fills it in and the
+# drop-ins that add the memory clock's setting.
+[Unit]
+Description=geezuz: power limit and locked clocks on both RTX 3090s
+Requires=nvidia-persistenced.service
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nvidia-smi -i 0 -pl 400
+ExecStart=/usr/bin/nvidia-smi -i 1 -pl 400
+ExecStart=/usr/bin/nvidia-smi -i 0 -lgc @SM_LOCK_MHZ@,@SM_LOCK_MHZ@
+ExecStart=/usr/bin/nvidia-smi -i 1 -lgc @SM_LOCK_MHZ@,@SM_LOCK_MHZ@
+
+[Install]
+WantedBy=multi-user.target

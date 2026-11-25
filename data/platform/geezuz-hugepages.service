@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Reserves the 2 MiB hugepages the engine's pinned host memory comes from, on numa node 0, where both cards' root ports
+# are. It runs early at boot, before memory fragments, because a reservation made later may fall short. 1280 pages:
+# 1213 for the embedding table (the host image's payload, 2,542,796,800 bytes) and 67 for the rings, masks and staging,
+# each of which rounds up to whole pages. docs/BRINGUP.md derives the numbers.
+[Unit]
+Description=geezuz: hugepages for pinned host memory on numa node 0
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/sh -c 'echo 1280 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages'
+ExecStart=/usr/bin/sh -c 'test "$(cat /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages)" -eq 1280'
+
+[Install]
+WantedBy=sysinit.target

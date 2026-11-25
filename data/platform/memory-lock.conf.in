@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Drop-in for geezuz-platform.service, installed only when the memory clock benchmark's first attempt held the cards'
+# memory at 9751 MHz under load: the SM and memory locks are set in one call per card, the form that attempt used. The
+# empty ExecStart= clears the unit's own lines before restating them.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/nvidia-smi -i 0 -pl 400
+ExecStart=/usr/bin/nvidia-smi -i 1 -pl 400
+ExecStart=/usr/bin/nvidia-smi -i 0 -lgc @SM_LOCK_MHZ@,@SM_LOCK_MHZ@ -lmc 9751,9751
+ExecStart=/usr/bin/nvidia-smi -i 1 -lgc @SM_LOCK_MHZ@,@SM_LOCK_MHZ@ -lmc 9751,9751
