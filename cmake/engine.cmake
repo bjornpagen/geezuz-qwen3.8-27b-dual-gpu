@@ -135,6 +135,24 @@ function(engine_test name)
 	set_tests_properties(${name} PROPERTIES TIMEOUT 120)
 endfunction()
 
+# engine_checkpoint_test(<name> SOURCES <file>... LINK <target>...)
+#
+# A test that reads the real checkpoint, registered with ctest as `<name>` under the `checkpoint` label and given the
+# checkpoint directory as its one argument. The default test presets exclude the label, because the checkpoint is 29 GB
+# that a build machine need not hold; `ctest --preset checkpoint` runs exactly these.
+set(ENGINE_CHECKPOINT_DIR "$ENV{HOME}/models/Qwen3.8-27B-FP8" CACHE PATH
+	"the Qwen3.8-27B-FP8 checkpoint directory the checkpoint-labelled tests read")
+function(engine_checkpoint_test name)
+	cmake_parse_arguments(PARSE_ARGV 1 arg "" "" "SOURCES;LINK")
+	if(NOT arg_SOURCES OR arg_UNPARSED_ARGUMENTS)
+		message(FATAL_ERROR "engine_checkpoint_test(<name> SOURCES <file>... LINK <target>...)")
+	endif()
+	add_executable(engine_test_${name} ${arg_SOURCES})
+	target_link_libraries(engine_test_${name} PRIVATE engine_testing engine_language_profile ${arg_LINK})
+	add_test(NAME ${name} COMMAND engine_test_${name} "${ENGINE_CHECKPOINT_DIR}")
+	set_tests_properties(${name} PROPERTIES TIMEOUT 3600 LABELS checkpoint)
+endfunction()
+
 # engine_death_test(<name> SOURCES <file>... LINK <target>...)
 #
 # A program that must abort, registered with ctest as `<name>`: an invariant violation must end the process in every

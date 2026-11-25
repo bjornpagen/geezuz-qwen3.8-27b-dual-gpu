@@ -55,11 +55,20 @@
       "name": "base",
       "hidden": true,
       "output": { "outputOnFailure": true },
-      "execution": { "noTestsAction": "error" }
+      "execution": { "noTestsAction": "error" },
+      "filter": { "exclude": { "label": "checkpoint" } }
     },
     { "name": "dev", "inherits": "base", "configurePreset": "dev" },
     { "name": "release", "inherits": "base", "configurePreset": "release" },
     { "name": "asan-ubsan", "inherits": "base", "configurePreset": "asan-ubsan" },
-    { "name": "profile", "inherits": "base", "configurePreset": "profile" }
+    { "name": "profile", "inherits": "base", "configurePreset": "profile" },
+    {
+      "name": "checkpoint",
+      "displayName": "tests that read the real checkpoint",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" },
+      "filter": { "include": { "label": "checkpoint" } }
+    }
   ]
 }
