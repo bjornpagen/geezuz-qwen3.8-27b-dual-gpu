@@ -1,4 +1,5 @@
 # bench/
 
-Dialect zone: benchmark clients, and `bench/ubench/` drivers for the device primitives' microbenchmarks. Each in its
-own directory with its own `CMakeLists.txt`. Report what was measured, on what, and how many runs. AGENTS.md §30.
+Dialect zone: benchmark clients. `bench/ubench/` (`engine.ubench`) holds the drivers and evaluations for every
+microbenchmark that settles a hardware question (docs/ADVERSARIAL.md's U1–U22) and one per required device primitive;
+`geezuz-ubench` runs them at bring-up. Report what was measured, on what, and how many runs. AGENTS.md §30.
