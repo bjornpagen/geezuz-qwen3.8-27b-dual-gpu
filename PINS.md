@@ -237,6 +237,11 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
   export using t = decltype(fn<int>());` and a unit does `import a; t x;`. under lldb a breakpoint on
   `StmtProfiler::VisitConceptSpecializationExpr` is hit while `VisitImplicitConceptSpecializationDecl` for the same
   declaration is still on the stack. full reproducers and the oracle are described in the toolchain lane's report.
+- stopgap (owner decision: wait for LLVM 24.1): the top-level `CMakeLists.txt` runs every compile step, clang-tidy
+  included, under `env MallocScribble=1` on darwin and `env MALLOC_PERTURB_=85` on linux, so fresh allocations hold a
+  fixed pattern and the uninitialized read is deterministic. measured on darwin: 29/100 crashes to 0/100 on the worst
+  file, ~1% cost. by analysis the worst effect is a duplicate non-canonical type node, not wrong code (not proven).
+  the linux form is untested until the box. it goes with the pin.
 - note: an earlier pin blamed `bugprone-reserved-identifier`; turning that check off did not stop the crashes. it stays
   off because `-Wreserved-identifier` enforces the same rule on every build.
 - retire: when the pinned clang on both machines contains f970f59a (LLVM 24.1, or a 23.1.x carrying the backport) and

@@ -112,6 +112,15 @@ set(CMAKE_LINKER_TYPE LLD)
 # compiler-chosen fused multiply-add: clang contracts a*b+c by default on both arm64 and x86-64.
 string(APPEND CMAKE_CXX_FLAGS " -ffp-contract=off")
 
+# PIN(clang-modules-noexcept-concept-profile): clang 23 reads uninitialized memory deserializing stdexec's noexcept
+# concept types and crashes at random. Filling fresh allocations with a fixed pattern makes the read deterministic and
+# harmless. The rule launcher wraps the whole compile step, so clang-tidy runs under it too.
+if(ENGINE_PLATFORM STREQUAL "darwin")
+	set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "env MallocScribble=1")
+else()
+	set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "env MALLOC_PERTURB_=85")
+endif()
+
 # The production host is one known cpu, an epyc 7v13 (zen 3), so host code targets exactly it and vector paths compile
 # in without runtime dispatch. Every arm64 cpu has the neon the development mac's vector paths need.
 if(ENGINE_PLATFORM STREQUAL "linux")
