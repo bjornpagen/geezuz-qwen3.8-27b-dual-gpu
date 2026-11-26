@@ -210,6 +210,8 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
   carries their finiteness, so the function reading `model::Shape` / `Range` fields holds no optional. any dialect unit
   importing both `engine.model` and `engine.schedule` keeps optionals out of functions that read model-struct fields.
 - also: `tests/soak/cards.test.cc`, which crashed the same way and carries the PIN comment.
+- also: in `tests/cards`, clang-tidy's optional-access dataflow crashed every time on `(**first).name` (a member read
+  through a dereferenced optional of a model-backed type); binding the member to a named reference first avoids it.
 - reproducer: a header `struct Range { Count begin; Count length; }`; module A `export extern "C++" { #include }` of
   it; module B including it in its global module fragment with `export using model::Range;`; a unit importing std, A
   and B whose function holds a `std::optional<uint8_t>` and returns `range.begin`. exit 139 with both imports, 0 with
