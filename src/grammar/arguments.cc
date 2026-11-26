@@ -2,6 +2,7 @@
 export module engine.grammar:arguments;
 
 import std;
+import engine.chat;
 import engine.core;
 import engine.regex;
 import :error;
@@ -11,76 +12,6 @@ import :strings;
 import :schema;
 
 namespace engine::grammar {
-
-/**
- * The type a tool-call argument's text is read as, in the order the chat format's response template tries them:
- * the argument becomes the first that applies, or else stays the text, as a string.
- */
-enum class Cast : std::uint8_t {
-	Integer,
-	Number,
-	Boolean,
-	Null,
-	Object,
-	Array,
-};
-
-[[nodiscard]] auto cast_named(std::string_view name) -> std::optional<Cast> {
-	auto const names = std::to_array<std::pair<std::string_view, Cast>>({
-	    {"integer", Cast::Integer},
-	    {"number", Cast::Number},
-	    {"boolean", Cast::Boolean},
-	    {"null", Cast::Null},
-	    {"object", Cast::Object},
-	    {"array", Cast::Array},
-	});
-	auto const found = std::ranges::find(names, name, &std::pair<std::string_view, Cast>::first);
-	if (found == names.end()) {
-		return std::nullopt;
-	}
-	return found->second;
-}
-
-/**
- * The casts a parameter's schema declares, as the chat format's response template collects them: the names in
- * `type`, then each `anyOf` and `oneOf` choice's, then `null` when `nullable` is truthy and absent so far. `$ref`
- * is not followed: the template does not follow it.
- */
-auto add_casts(std::vector<Cast>& casts, Value const& schema) -> void {
-	auto const object = core::alternative<Object>(schema.held);
-	if (!object) {
-		return;
-	}
-	auto const add_named = [&casts](Value const& name) {
-		if (auto const text = core::alternative<std::string>(name.held)) {
-			if (auto const cast = cast_named(*text)) {
-				casts.push_back(*cast);
-			}
-		}
-	};
-	if (auto const declared = object->find("type")) {
-		if (auto const list = core::alternative<Array>(declared->held)) {
-			std::ranges::for_each(*list, add_named);
-		} else {
-			add_named(*declared);
-		}
-	}
-	for (auto const union_name : {std::string_view{"anyOf"}, std::string_view{"oneOf"}}) {
-		if (auto const choices = object->find(union_name)) {
-			if (auto const list = core::alternative<Array>(choices->held)) {
-				for (auto const& choice : *list) {
-					add_casts(casts, choice);
-				}
-			}
-		}
-	}
-	if (auto const nullable = object->find("nullable")) {
-		auto const flag = core::alternative<bool>(nullable->held);
-		if (flag && *flag && !std::ranges::contains(casts, Cast::Null)) {
-			casts.push_back(Cast::Null);
-		}
-	}
-}
 
 /** Python's `str.isspace`, which the template's `strip` removes around a boolean or null argument. */
 [[nodiscard]] auto python_spaces() -> regex::CharClass {
@@ -99,13 +30,13 @@ auto add_casts(std::vector<Cast>& casts, Value const& schema) -> void {
 }
 
 /** The texts a cast reads as a boolean or null: those the string branch must leave out. */
-[[nodiscard]] auto captured_words(regex::Store& store, std::span<Cast const> casts) -> regex::Expr {
+[[nodiscard]] auto captured_words(regex::Store& store, std::span<chat::Cast const> casts) -> regex::Expr {
 	auto words = std::vector<regex::Expr>{};
-	if (std::ranges::contains(casts, Cast::Null)) {
+	if (std::ranges::contains(casts, chat::Cast::Null)) {
 		words.push_back(store.literal("null"));
 		words.push_back(store.literal("None"));
 	}
-	if (std::ranges::contains(casts, Cast::Boolean)) {
+	if (std::ranges::contains(casts, chat::Cast::Boolean)) {
 		auto parsed = regex::parse(store, "(?i:true|false)|1|0", regex::Matching::Whole);
 		core::invariant(parsed.has_value());
 		words.push_back(*parsed);
@@ -115,20 +46,20 @@ auto add_casts(std::vector<Cast>& casts, Value const& schema) -> void {
 }
 
 /** The cast that reads a JSON value of a type back as itself, and whether the list has it. */
-[[nodiscard]] auto reads_back(std::span<Cast const> casts, Type type) -> bool {
+[[nodiscard]] auto reads_back(std::span<chat::Cast const> casts, Type type) -> bool {
 	switch (type) {
 	case Type::Null:
-		return std::ranges::contains(casts, Cast::Null);
+		return std::ranges::contains(casts, chat::Cast::Null);
 	case Type::Boolean:
-		return std::ranges::contains(casts, Cast::Boolean);
+		return std::ranges::contains(casts, chat::Cast::Boolean);
 	case Type::Integer:
-		return std::ranges::contains(casts, Cast::Integer) || std::ranges::contains(casts, Cast::Number);
+		return std::ranges::contains(casts, chat::Cast::Integer) || std::ranges::contains(casts, chat::Cast::Number);
 	case Type::Number:
-		return std::ranges::contains(casts, Cast::Number);
+		return std::ranges::contains(casts, chat::Cast::Number);
 	case Type::Object:
-		return std::ranges::contains(casts, Cast::Object);
+		return std::ranges::contains(casts, chat::Cast::Object);
 	case Type::Array:
-		return std::ranges::contains(casts, Cast::Array);
+		return std::ranges::contains(casts, chat::Cast::Array);
 	case Type::String:
 		return false;
 	}
@@ -136,9 +67,9 @@ auto add_casts(std::vector<Cast>& casts, Value const& schema) -> void {
 }
 
 /** Whether a boolean cast comes before every numeric one: then it reads the numbers 0 and 1 as booleans. */
-[[nodiscard]] auto booleans_first(std::span<Cast const> casts) -> bool {
-	auto const boolean = std::ranges::find(casts, Cast::Boolean);
-	auto const numeric = std::ranges::find_if(casts, [](Cast cast) { return cast == Cast::Integer || cast == Cast::Number; });
+[[nodiscard]] auto booleans_first(std::span<chat::Cast const> casts) -> bool {
+	auto const boolean = std::ranges::find(casts, chat::Cast::Boolean);
+	auto const numeric = std::ranges::find_if(casts, [](chat::Cast cast) { return cast == chat::Cast::Integer || cast == chat::Cast::Number; });
 	return boolean != casts.end() && boolean < numeric;
 }
 
@@ -153,17 +84,16 @@ inline constexpr std::string_view parameter_close = "\n</parameter>\n";
  * parameter's schema admits. A string is written as itself; any other type as JSON, read back by the template's
  * cast for that type. A text two casts would read differently is left to the first, as the template does.
  */
-[[nodiscard]] auto argument(Builder& builder, Value const& root, Value const& schema, std::string const& path, Usage& usage) -> core::Result<Symbol, GrammarError> {
+[[nodiscard]] auto argument(Builder& builder, Value const& root, Value const& schema, std::span<chat::Cast const> casts, std::string const& path, Usage& usage)
+    -> core::Result<Symbol, GrammarError> {
 	auto& store = builder.store();
-	auto casts = std::vector<Cast>{};
-	add_casts(casts, schema);
 	auto const forbidden = builder.memo("call markers", [&store] { return any_literal(store, call_markers); });
 	auto compiler = SchemaCompiler{builder, root, "", Place{.markers = call_markers, .readback = Readback::ChatFormat, .top_numbers_excluded = regex::nothing}, usage};
 	auto strings = compiler.strings(schema, path, 0);
 	if (!strings) {
 		return std::unexpected(strings.error());
 	}
-	auto const numeric_or_container = std::ranges::any_of(casts, [](Cast cast) { return cast != Cast::Null && cast != Cast::Boolean; });
+	auto const numeric_or_container = std::ranges::any_of(casts, [](chat::Cast cast) { return cast != chat::Cast::Null && cast != chat::Cast::Boolean; });
 	if (*strings && numeric_or_container) {
 		return refuse(Refusal::SchemaStringUnion, path);
 	}
@@ -209,7 +139,16 @@ inline constexpr std::string_view parameter_close = "\n</parameter>\n";
  * order as `<parameter=NAME>\nTEXT\n</parameter>\n`, the required ones always, the others as the model chooses, and
  * then, when the schema allows other properties, more parameters of other names whose text stays a string.
  */
-[[nodiscard]] auto parameters(Builder& builder, Value const& root, std::string const& path, Usage& usage) -> core::Result<Symbol, GrammarError> {
+[[nodiscard]] auto parameters(Builder& builder, Value const& root, std::string_view schema_text, std::string const& path, Usage& usage) -> core::Result<Symbol, GrammarError> {
+	// The casts are the chat format's own: what its parser will read each argument's text as.
+	auto reader = SchemaReader::make();
+	if (!reader) {
+		return refuse_json(reader.error(), path);
+	}
+	auto const declared = chat::parameter_casts(*reader, schema_text);
+	if (!declared) {
+		return refuse_json(declared.error(), path);
+	}
 	auto const object = core::alternative<Object>(root.held);
 	if (!object) {
 		return refuse(Refusal::ToolParameters, path);
@@ -274,7 +213,9 @@ inline constexpr std::string_view parameter_close = "\n</parameter>\n";
 		if (!writable_name(property.name)) {
 			return refuse(Refusal::ToolName, at);
 		}
-		auto value = argument(builder, root, property.value, at, usage);
+		auto const named = std::ranges::find(*declared, property.name, &chat::ParameterCasts::name);
+		auto const casts = named == declared->end() ? std::span<chat::Cast const>{} : std::span<chat::Cast const>{named->casts};
+		auto value = argument(builder, root, property.value, casts, at, usage);
 		if (!value) {
 			return value;
 		}

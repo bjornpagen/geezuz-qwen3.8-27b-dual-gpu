@@ -205,7 +205,7 @@ struct Callable {
 		if (!document) {
 			return std::unexpected(document.error());
 		}
-		auto body = parameters(builder, *document, at + "/parameters", usage);
+		auto body = parameters(builder, *document, *function->parameters, at + "/parameters", usage);
 		if (!body) {
 			return body;
 		}
