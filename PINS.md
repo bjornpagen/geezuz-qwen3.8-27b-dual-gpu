@@ -98,7 +98,9 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
 - symptom: clang 23 still classifies `#embed` in C++26 as a C23 extension and warns under `-Wpedantic`
   (`-Wc23-extensions`), though `#embed` is standard C++26
 - sites: `cmake/engine.cmake` (`engine_embed_ptx`): `-Wno-c23-extensions` on exactly the foreign units that embed
-  ptx, nowhere else
+  ptx (attn, decode, deltanet, gemv, prefill, ptx, soak, ubench), nowhere else; and the same flag set by hand on the
+  foreign units that embed data (`tokenizer_image`, `draft_vocabulary`, `bake_data`, `ubench`'s embedded review, and
+  the test-only `tokenizer_fixtures`, `chat_fixtures`), each in its own `CMakeLists.txt`
 - retire: when clang treats `#embed` as standard in C++26 mode
 - upstream: not filed
 
