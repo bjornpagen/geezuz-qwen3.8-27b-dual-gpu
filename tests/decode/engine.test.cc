@@ -159,7 +159,8 @@ using Kernel = fake::RingKernel<dd::Descriptor, dd::Result, dd::ring_slots, Exit
 		auto const one = engine->parameters(Card::One);
 		auto const wired = zero.peer_workspace == one.workspace && one.peer_workspace == zero.workspace && zero.peer_control == one.control &&
 		                   one.peer_control == zero.control && zero.card == 0 && one.card == 1 && zero.embedding == one.embedding &&
-		                   zero.image != one.image && zero.pool != one.pool && zero.states != one.states && zero.ring != one.ring && zero.masks != one.masks;
+		                   zero.image != one.image && zero.pool != one.pool && zero.states != one.states && zero.ring != one.ring &&
+		                   zero.masks != one.masks && zero.logits != one.logits;
 		auto const memories = engine->memories(Card::One);
 		auto const lent = memories.image == one.image && memories.pool == one.pool && memories.states == one.states &&
 		                  memories.rotations == one.workspace + dd::workspace.exchange.rope_table && memories.tables == one.workspace + dd::workspace.tables &&

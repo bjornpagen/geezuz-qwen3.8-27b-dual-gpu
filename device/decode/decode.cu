@@ -4,7 +4,8 @@
 // resident ring's tickets until the exit ticket. A ticket applies the kv pool's commands and runs one decode cycle:
 // the schedule's phases in stream order, each task between two grid barriers, the cards exchanging fp32 partials and
 // ranked candidates over nvlink and both computing the same verdict. The kernel waits for nothing per cycle but the
-// ticket itself and, right before it ranks the lm_head's rows, the masks the host fills while the body streams.
+// ticket itself and, right before it ranks the lm_head's rows, the masks the host fills while the body streams. A
+// logits ticket runs the same verify pass and hands the lm_head's logits to the host where a cycle ranks them.
 #include "decode/machine.h"
 #include "decode/tasks.h"
 #include "decode/walk.h"
@@ -208,6 +209,9 @@ struct Runner {
 		case Task::Draft:
 			draft(m, shared->verify, point, *epochs);
 			break;
+		case Task::Logits:
+			hand_logits(m, epochs->ticket);
+			break;
 		}
 	}
 };
@@ -303,6 +307,9 @@ decode_loop(decode::Params params) {
 			break;
 		case Work::PromptEnd:
 			walk_prompt_end(descriptor.depth, runner);
+			break;
+		case Work::Logits:
+			walk_logits(runner);
 			break;
 		}
 		if (prims::block() == 0 && prims::thread_in_block() == 0) {

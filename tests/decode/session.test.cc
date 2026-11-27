@@ -6,7 +6,9 @@
 // has released the cycle's masks (as the kernel does before ranking), then answers from those masks: each verify row
 // commits the lowest token both cards' masks allow, a slot accepts a number of drafts its position decides, and its next
 // drafts follow from its last token. Both fakes compute that answer from both cards' mask buffers, so they agree unless
-// a test makes one of them lie.
+// a test makes one of them lie. For a logits ticket it writes each verify row's logits into its card's logits buffer,
+// each the value `encoded` gives the row and the token the card's lm_head row scores, so the host's reassembly in token
+// order is checked over every token of both cards.
 import std;
 import engine.core;
 import engine.decode;
@@ -78,7 +80,15 @@ template<class Poll>
 struct Seen {
 	std::vector<std::vector<dd::Command>> applied;
 	std::vector<dd::Descriptor> cycles;
+	std::vector<dd::Descriptor> logits;
 };
+
+/** The logit a fake loop gives row `row` for `token`: exact in fp32, and different for every row and token. */
+[[nodiscard]] constexpr auto encoded(std::size_t row, vocabulary::Token token) -> float {
+	return static_cast<float>((std::size_t{token} * dd::logits_rows) + row);
+}
+
+static_assert(model::vocab * dd::logits_rows < (std::size_t{1} << 24U), "every encoded logit is an exact fp32 integer");
 
 /** Whether a fake loop answers truly, or claims one more accepted draft than the truth allows. */
 enum class Honesty : std::uint8_t { Truthful, Lying };
@@ -88,6 +98,9 @@ struct FakeLoop {
 	std::array<std::reference_wrapper<dd::Masks const>, 2> masks;
 	std::reference_wrapper<Seen> seen;
 	Honesty honesty;
+	Card card;
+	/** The card's logits buffer, at the address the kernel is given: under the fake, a mapped buffer's host address. */
+	dd::LogitsBuffer* logits;
 	std::uint64_t ticket = 0;
 
 	[[nodiscard]] auto operator()(dd::Descriptor const& descriptor) -> dd::Result {
@@ -96,6 +109,19 @@ struct FakeLoop {
 		if (descriptor.work == dd::Work::Apply) {
 			seen.get().applied.emplace_back(std::span{descriptor.command}.first(descriptor.commands).begin(),
 			                                std::span{descriptor.command}.first(descriptor.commands).end());
+			return result;
+		}
+		if (descriptor.work == dd::Work::Logits) {
+			// No masks are awaited: a logits ticket ranks nothing.
+			seen.get().logits.push_back(descriptor);
+			auto& half = std::span{logits->half}[dd::logits_half(ticket)];
+			for (auto row = std::size_t{0}; row < descriptor.live; ++row) {
+				auto& values = std::span{half.rows}[row];
+				for (auto card_row = std::size_t{0}; card_row < model::vocab_per_card; ++card_row) {
+					auto const token = vocabulary::token(card, card_row);
+					std::span{values}[card_row] = token < model::sampled_vocabulary ? encoded(row, token) : std::numeric_limits<float>::quiet_NaN();
+				}
+			}
 			return result;
 		}
 		seen.get().cycles.push_back(descriptor);
@@ -158,8 +184,13 @@ template<class Scenario>
 	}
 	auto seen = std::array<Seen, 2>{};
 	auto const masks = std::array{std::cref(session->masks(Card::Zero)), std::cref(session->masks(Card::One))};
-	auto const zero = Kernel{session->addresses(Card::Zero).ring, FakeLoop{.masks = masks, .seen = seen[0], .honesty = Honesty::Truthful}};
-	auto const one = Kernel{session->addresses(Card::One).ring, FakeLoop{.masks = masks, .seen = seen[1], .honesty = card_one}};
+	auto const logits = [&](Card card) {
+		return std::bit_cast<dd::LogitsBuffer*>(session->addresses(card).logits);
+	};
+	auto const zero = Kernel{session->addresses(Card::Zero).ring,
+	                         FakeLoop{.masks = masks, .seen = seen[0], .honesty = Honesty::Truthful, .card = Card::Zero, .logits = logits(Card::Zero)}};
+	auto const one = Kernel{session->addresses(Card::One).ring,
+	                        FakeLoop{.masks = masks, .seen = seen[1], .honesty = card_one, .card = Card::One, .logits = logits(Card::One)}};
 	auto const held = scenario(*session, seen);
 	auto const ended = settled([&] { return session->try_shutdown(deadline_after()); });
 	return held && ended.has_value() == (ending == Ending::Clean) && driver.violations().empty();
@@ -654,6 +685,105 @@ struct CycleMasks {
 	return !later && later.error() == ended->error();
 }
 
+/** Whether `logits` holds `rows` rows of every token's encoded logit, in token order. */
+[[nodiscard]] auto every_token_in_place(decode::Logits const& logits, std::size_t rows) -> bool {
+	if (logits.rows.size() != rows) {
+		return false;
+	}
+	for (auto const [row, values] : std::views::enumerate(logits.rows)) {
+		if (values.size() != model::sampled_vocabulary) {
+			return false;
+		}
+		for (auto token = vocabulary::Token{0}; token < model::sampled_vocabulary; ++token) {
+			if (std::bit_cast<std::uint32_t>(values[token]) != std::bit_cast<std::uint32_t>(encoded(static_cast<std::size_t>(row), token))) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/**
+ * A logits ticket over a mix of continuing and fresh rows rides behind the queued commands, verifies no drafts but
+ * takes each continuing slot's pending replays, takes no masks, and hands back both cards' logits of every token in
+ * token order. Its slots are forgotten, so their next rows plan with nothing to replay or verify, and a cycle on them
+ * runs as usual.
+ */
+[[nodiscard]] auto logits_tickets_hand_back_every_token(std::uint64_t seed) -> bool {
+	return with_loops(Honesty::Truthful, [seed](decode::Session& session, std::array<Seen, 2>& seen) {
+		auto random = engine::testing::generator(seed);
+		auto const live = std::array{std::size_t{1}, std::size_t{4}, std::size_t{6}};
+		if (!run_cycle(session, live, random)) {
+			return false;
+		}
+		auto const lowered = queue_entries(session, 20, 400);
+		auto const batch = batch_of(session, live, random);
+		auto replays = std::vector<std::uint32_t>{};
+		for (auto const& row : batch.rows) {
+			auto const& held = session.ledger().held(row.slot);
+			auto const continues = held && held->request == row.request && held->position == row.position && held->token == row.token;
+			replays.push_back(continues ? held->state.pending : 0U);
+		}
+		auto const pending = session.begin_logits(batch);
+		if (!pending || pending->mask_count() != 0) {
+			return false;
+		}
+		for (auto row = std::size_t{0}; row < batch.rows.size(); ++row) {
+			if (!pending->drafts(row).empty()) {
+				return false;
+			}
+		}
+		auto const logits = settled([&] { return session.try_complete_logits(*pending); });
+		if (!logits || !every_token_in_place(*logits, batch.rows.size())) {
+			return false;
+		}
+		auto const ran = std::ranges::all_of(seen, [&](Seen const& card) {
+			if (card.logits.size() != 1) {
+				return false;
+			}
+			auto const& descriptor = card.logits.front();
+			auto const riding = std::span{descriptor.command}.first(descriptor.commands);
+			auto const same = std::ranges::equal(riding, lowered, [](dd::Command const& left, dd::Command const& right) {
+				return left.action == right.action && left.slot == right.slot && left.first == right.first && left.second == right.second;
+			});
+			auto const runs = std::span{descriptor.slots}.first(descriptor.live);
+			return same && descriptor.live == batch.rows.size() && std::ranges::equal(runs, replays, {}, [](dd::SlotRun const& run) {
+				return std::uint32_t{run.replays};
+			}) && std::ranges::all_of(runs, [](dd::SlotRun const& run) { return run.drafts == 0; });
+		});
+		auto const forgotten = std::ranges::all_of(batch.rows, [&](sched::Row const& row) {
+			return !session.ledger().held(row.slot).has_value();
+		});
+		if (!ran || !forgotten) {
+			return false;
+		}
+		auto next = session.begin(batch_of(session, live, random));
+		if (!next || !std::ranges::all_of(next->planned, [](decode::Planned const& plan) { return plan.run.drafts == 0 && plan.run.replays == 0; })) {
+			return false;
+		}
+		auto const masks = masks_for(next->mask_count(), random);
+		return session.publish(*next, masks, masks.masks.size()).has_value() && settled([&] { return session.try_complete(*next); }).has_value();
+	});
+}
+
+/** A shutdown with a logits ticket begun collects it (it waits for no masks) and forgets its slots. */
+[[nodiscard]] auto shutdown_from_a_begun_logits_ticket() -> bool {
+	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& seen) {
+		auto random = engine::testing::generator(15);
+		auto const live = std::array{std::size_t{2}, std::size_t{3}};
+		if (!run_cycle(session, live, random)) {
+			return false;
+		}
+		auto const pending = session.begin_logits(batch_of(session, live, random));
+		if (!pending) {
+			return false;
+		}
+		auto const ended = settled([&] { return session.try_shutdown(deadline_after()); });
+		return ended.has_value() && seen[0].logits.size() == 1 && seen[1].logits.size() == 1 && !session.ledger().held(kv::Slot::at(2)) &&
+		       !session.ledger().held(kv::Slot::at(3));
+	});
+}
+
 }
 
 auto main() -> int {
@@ -673,6 +803,11 @@ auto main() -> int {
 	    Case{.name = "a shutdown of stopped loops succeeds at once", .holds = shutdown_from_stopped()},
 	    Case{.name = "a shutdown that finds the cards disagreeing fails, skips the commands and still exits", .holds = shutdown_fails_on_disagreeing_cards()},
 	    Case{.name = "loops that never answer are abandoned at the deadline, and take nothing more", .holds = silent_loops_are_abandoned()},
+	    Case{.name = "a logits ticket hands back every token of both cards in token order, and forgets its slots (seed 1)",
+	         .holds = logits_tickets_hand_back_every_token(1)},
+	    Case{.name = "a logits ticket hands back every token of both cards in token order, and forgets its slots (seed 2)",
+	         .holds = logits_tickets_hand_back_every_token(2)},
+	    Case{.name = "a shutdown collects a begun logits ticket and forgets its slots", .holds = shutdown_from_a_begun_logits_ticket()},
 	};
 	return engine::testing::report(cases);
 }

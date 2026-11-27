@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // The persistent decode kernel as the host sees it: its ptx image and launch declaration, and the device headers it
-// shares with the host re-exported unchanged: what crosses the ring and the mask buffer, the workspace and shared
-// layouts, the ranking's keys, and the cycle's walk. The kernel's budget is the very value it `static_assert`s.
+// shares with the host re-exported unchanged: what crosses the ring, the mask buffer and the logits buffer, the
+// workspace and shared layouts, the ranking's keys, and the cycle's walk. The kernel's budget is the very value it
+// `static_assert`s.
 module;
 
 #include "decode/key.h"
@@ -30,6 +31,8 @@ export using device::Command;
 export using device::Control;
 export using device::Descriptor;
 export using device::Key;
+export using device::LogitsBuffer;
+export using device::LogitsHalf;
 export using device::MaskFlag;
 export using device::MaskHalf;
 export using device::Masks;
@@ -39,6 +42,7 @@ export using device::Result;
 export using device::Shared;
 export using device::SlotOutcome;
 export using device::SlotRun;
+export using device::Tail;
 export using device::Task;
 export using device::Work;
 export using device::Workspace;
@@ -47,6 +51,8 @@ export using device::budget;
 export using device::decode_budget;
 export using device::fold_lists;
 export using device::list_length;
+export using device::logits_halves;
+export using device::logits_rows;
 export using device::mask_halves;
 export using device::mask_words;
 export using device::max_commands;
@@ -66,12 +72,14 @@ export using device::folds;
 export using device::key_of;
 export using device::lists_after;
 export using device::logit_of;
+export using device::logits_half;
 export using device::mask_half;
 export using device::normalizes;
 export using device::ordered;
 export using device::ranked_rows;
 export using device::segments;
 export using device::walk_cycle;
+export using device::walk_logits;
 export using device::walk_prompt_end;
 
 constexpr char text[] = {

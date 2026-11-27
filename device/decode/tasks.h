@@ -930,6 +930,26 @@ struct Ranked {
 	return workspace.lists[level % 2];
 }
 
+/**
+ * A logits ticket's tail: every verify row's fp32 logits over the card's lm_head rows, copied as the lm_head left them
+ * into the host's logits buffer for the ticket. The rows sit one after another in both, so the copy is one run of
+ * chunks over the whole grid. The barrier after this task and the answer's system-scope release publish the copy.
+ */
+__attribute__((device)) inline void hand_logits(Machine const& machine, unsigned long long ticket) {
+	PassRows const rows = pass_rows(machine, Pass{.kind = PassKind::Verify, .draft = 0});
+	expect(rows.rows <= logits_rows);
+	auto const once = prims::policy<Eviction::First>();
+	auto const written = prims::policy<Eviction::Normal>();
+	auto const* from = machine.local<Chunk const>(workspace.logits);
+	/* SAFETY: a half's rows are whole chunks, contiguous, and the mapped buffer is chunk-aligned. */
+	auto* to = reinterpret_cast<Chunk*>(&at<LogitsBuffer>(machine.params.logits)->half[logits_half(ticket)].rows[0][0]);
+	Count const chunks = Count{rows.rows} * model::vocab_per_card * sizeof(float) / 16;
+	Count const threads = static_cast<Count>(decode_budget.threads);
+	for (Count chunk = Count{prims::block()} * threads + prims::thread_in_block(); chunk < chunks; chunk += Count{sms} * threads) {
+		prims::store(to + chunk, prims::load(from + chunk, once), written);
+	}
+}
+
 /** Waits until the host has released this cycle's masks; it has had the whole body to fill them. */
 __attribute__((device)) inline void await_masks(Machine const& machine, unsigned long long ticket) {
 	if (prims::thread_in_block() == 0) {

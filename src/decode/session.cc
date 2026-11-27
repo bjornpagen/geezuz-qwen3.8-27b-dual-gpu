@@ -7,7 +7,8 @@
 // (each card's half in its own row order) and releases them; the kernels acquire them only right before they rank the
 // lm_head's rows, so the host has the whole body (~15 ms) to compute them. `try_complete` polls for both cards'
 // answers, which must agree, and settles the ledger once both are in; it never blocks, so the pipeline polls it on its
-// run loop.
+// run loop. A logits ticket (`begin_logits`, `try_complete_logits`) runs the same verify pass and hands back the
+// lm_head's logits in token order instead of a verdict, for the determinism harness and the rulers.
 export module engine.decode:session;
 
 import std;
@@ -18,6 +19,7 @@ import engine.device;
 import engine.kv;
 import engine.model;
 import engine.sched;
+import engine.vocabulary;
 import :commands;
 import :error;
 import :ledger;
@@ -31,6 +33,8 @@ using decode_device::Result;
 export using Ring = device::Ring<Descriptor, Result, decode_device::ring_slots>;
 /** Each card's mask buffer: two halves by ticket parity, each a mask per verify row in the card's row order. */
 export using MaskBuffer = device::MappedArray<decode_device::Masks, 1>;
+/** Each card's logits buffer: two halves by ticket parity, each a logits ticket's rows in the card's row order. */
+export using LogitsMemory = device::MappedArray<decode_device::LogitsBuffer, 1>;
 
 static_assert(model::card_mask_words * 2 == decode_device::mask_words, "a host word is two of the card's words, low first");
 
@@ -47,14 +51,14 @@ concept MaskRows = requires(M const& masks, std::size_t index, model::Card card)
 };
 
 /**
- * A ticket the cards are running: a decode cycle over a batch, or a prompt's end over its one row. It carries the ticket
- * both cards hold, what it runs, and each row's plan.
+ * A ticket the cards are running: a decode cycle over a batch, a prompt's end over its one row, or a logits ticket over
+ * a batch's committed tokens. It carries the ticket both cards hold, what it runs, and each row's plan.
  */
 export struct Pending {
 	std::uint64_t ticket;
 	decode_device::Work work;
 	model::DraftDepth depth;
-	/** Masks each row takes: a cycle's every verify row at the full depth, a prompt's end its one row. */
+	/** Masks each row takes: a cycle's every verify row at the full depth, a prompt's end its one row, a logits ticket none. */
 	std::size_t width;
 	std::vector<sched::Row> rows;
 	std::vector<Planned> planned;
@@ -75,6 +79,15 @@ export struct Pending {
 export struct HostAddresses {
 	std::uint64_t ring;
 	std::uint64_t masks;
+	std::uint64_t logits;
+};
+
+/**
+ * A logits ticket's outcome: each batch row's logits over the sampled vocabulary in token order (padding rows
+ * excluded), both cards' halves put back together: what the reference's dumps and golden hashes take.
+ */
+export struct Logits {
+	std::vector<std::vector<float>> rows;
 };
 
 [[nodiscard]] constexpr auto card_index(model::Card card) -> std::size_t {
@@ -138,10 +151,14 @@ struct Awaited {
 /** The loops serve tickets and none is begun. */
 struct Idle {};
 
-/** Whether a begun ticket's masks have been released to the cards, which wait for them before they rank. */
+/**
+ * Whether a begun ticket's masks have been released to the cards, which wait for them before they rank; a logits
+ * ticket ranks nothing and takes none.
+ */
 enum class Masking : std::uint8_t {
 	Unpublished,
 	Published,
+	Unmasked,
 };
 
 /**
@@ -150,6 +167,7 @@ enum class Masking : std::uint8_t {
  */
 struct Ticketed {
 	std::uint64_t ticket;
+	decode_device::Work work;
 	std::vector<kv::Slot> slots;
 	std::size_t verify_rows;
 	Masking masking;
@@ -193,17 +211,26 @@ public:
 		auto masks_one = masks_zero.and_then([&](MaskBuffer const&) {
 			return devices.context(model::Card::One).allocate_mapped<decode_device::Masks, 1>();
 		});
-		if (!masks_one) {
-			return fail(masks_one.error());
+		auto logits_zero = masks_one.and_then([&](MaskBuffer const&) {
+			return devices.context(model::Card::Zero).allocate_mapped<decode_device::LogitsBuffer, 1>();
+		});
+		auto logits_one = logits_zero.and_then([&](LogitsMemory const&) {
+			return devices.context(model::Card::One).allocate_mapped<decode_device::LogitsBuffer, 1>();
+		});
+		if (!logits_one) {
+			return fail(logits_one.error());
 		}
 		return Session{
 		    {std::move(*zero), std::move(*one)},
 		    {std::move(*masks_zero), std::move(*masks_one)},
+		    {std::move(*logits_zero), std::move(*logits_one)},
 		};
 	}
 
 	[[nodiscard]] auto addresses(model::Card card) const -> HostAddresses {
-		return {.ring = rings_.at(card_index(card)).device_address(), .masks = masks_.at(card_index(card)).device_address()};
+		return {.ring = rings_.at(card_index(card)).device_address(),
+		        .masks = masks_.at(card_index(card)).device_address(),
+		        .logits = logits_.at(card_index(card)).device_address()};
 	}
 
 	/**
@@ -246,6 +273,31 @@ public:
 	}
 
 	/**
+	 * Starts a logits ticket on both cards over the batch's rows, after the queued commands: each row's committed token
+	 * runs through the verify pass exactly as a cycle runs it, with no drafts, and the lm_head's logits come back in
+	 * place of a verdict. Returns at once, like `begin`.
+	 *
+	 * Afterwards each row's slot holds its trunk state exactly as after a cycle that committed the row's token with no
+	 * drafts: its kv at the row's position written, its deltanet state through it, its pending replays taken. Nothing is
+	 * sampled and no mtp pass runs, so the slot keeps no drafts and the mtp head's kv at that position is not written;
+	 * the ledger forgets the slot, which plans its next row as one whose state covers exactly its position, as after
+	 * prefill. Teacher forcing walks a prompt by giving each next ticket the next token at the next position. The mtp
+	 * kv left unwritten only lowers a later cycle's acceptance, never changes a committed token: verification is exact.
+	 */
+	[[nodiscard]] auto begin_logits(sched::Batch batch) -> core::Result<Pending, DecodeError> {
+		if (auto refused = check(batch)) {
+			return fail(*refused);
+		}
+		auto pending = Pending{
+		    .ticket = 0, .work = decode_device::Work::Logits, .depth = batch.depth, .width = 0, .rows = std::move(batch.rows), .planned = {}};
+		pending.planned.reserve(pending.rows.size());
+		for (auto const& row : pending.rows) {
+			pending.planned.push_back(ledger_.plan_alone(row));
+		}
+		return post(std::move(pending));
+	}
+
+	/**
 	 * Starts a prompt's end on both cards: the lm_head over its last row (whose final norm prefill left in the prompt
 	 * row), the sample under the row's one mask, and the mtp head's drafts from it at `depth`. `prompt` is the prompt's
 	 * last row: its slot, request, position, token and rule. Returns at once, like `begin`.
@@ -278,6 +330,8 @@ public:
 	 */
 	template<MaskRows M>
 	[[nodiscard]] auto publish(Pending const& pending, M const& masks, std::size_t count) -> core::Result<void, DecodeError> {
+		// A logits ticket ranks nothing: there is no mask for it to take.
+		core::invariant(pending.work != decode_device::Work::Logits);
 		if (!begun(pending)) {
 			return fail(Refused{.reason = Refusal::WrongTicket, .ticket = pending.ticket});
 		}
@@ -350,6 +404,43 @@ public:
 	}
 
 	/**
+	 * A logits ticket's logits once both cards have answered every ticket ahead of it and it, nullopt while they have
+	 * not. Each card holds its own half of the vocabulary, so there is nothing for the two to agree on; the slots are
+	 * forgotten, as `begin_logits` says. Never blocks.
+	 */
+	[[nodiscard]] auto try_complete_logits(Pending const& pending) -> std::optional<core::Result<Logits, DecodeError>> {
+		core::invariant(pending.work == decode_device::Work::Logits && begun(pending));
+		if (auto failed = pump(); failed) {
+			state_ = Broken{.error = *failed};
+			return std::unexpected(*failed);
+		}
+		auto const& ticketed = std::get<Ticketed>(state_);
+		if (!ticketed.answers) {
+			return std::nullopt;
+		}
+		auto const half = decode_device::logits_half(pending.ticket);
+		auto logits = Logits{.rows = {}};
+		logits.rows.reserve(pending.rows.size());
+		for (auto row = std::size_t{0}; row < pending.rows.size(); ++row) {
+			auto& tokens = logits.rows.emplace_back(model::sampled_vocabulary);
+			for (auto const card : device::card_pair) {
+				auto const& values = std::span{std::span{logits_.at(card_index(card)).host()[0].half}[half].rows}[row];
+				for (auto const [card_row, token] : std::views::enumerate(row_tokens_.at(card_index(card)))) {
+					// A padding row scores no token the tokenizer has.
+					if (token < model::sampled_vocabulary) {
+						tokens[token] = std::span{values}[core::narrow<std::size_t>(card_row)];
+					}
+				}
+			}
+		}
+		for (auto const& row : pending.rows) {
+			ledger_.forget(row.slot);
+		}
+		state_ = Idle{};
+		return logits;
+	}
+
+	/**
 	 * Stops both loops with nothing begun, the one way the cards are left consistent for prefill: the first call queues
 	 * every queued pool command as command-only tickets and the exit tickets behind them, so a prefill that follows the
 	 * stop sees every block table and slot state the scheduler set up (cards caught disagreeing get no more commands).
@@ -391,7 +482,9 @@ public:
 				return give_up_at(give_up, ticketed->ticket);
 			}
 			auto const& [zero, one] = *ticketed->answers;
-			if (auto disagree = disagreement(ticketed->ticket, ticketed->slots, zero, one)) {
+			// A logits ticket's answers carry no verdict to compare: each card holds its own half of the logits.
+			auto const disagree = ticketed->work == decode_device::Work::Logits ? std::nullopt : disagreement(ticketed->ticket, ticketed->slots, zero, one);
+			if (disagree) {
 				health_ = Health::Suspect;
 				trouble = DecodeError{.reason = *disagree};
 			}
@@ -448,8 +541,13 @@ public:
 	}
 
 private:
-	Session(std::array<Ring, model::cards> rings, std::array<MaskBuffer, model::cards> masks)
-	    : rings_{std::move(rings)}, masks_{std::move(masks)}, descriptor_{std::make_unique<Descriptor>()}, begun_descriptor_{std::make_unique<Descriptor>()} {}
+	Session(std::array<Ring, model::cards> rings, std::array<MaskBuffer, model::cards> masks, std::array<LogitsMemory, model::cards> logits)
+	    : rings_{std::move(rings)},
+	      masks_{std::move(masks)},
+	      logits_{std::move(logits)},
+	      row_tokens_{vocabulary::row_tokens(model::Card::Zero), vocabulary::row_tokens(model::Card::One)},
+	      descriptor_{std::make_unique<Descriptor>()},
+	      begun_descriptor_{std::make_unique<Descriptor>()} {}
 
 	[[nodiscard]] static auto took(Result const& answer) -> std::chrono::nanoseconds {
 		return std::chrono::nanoseconds{core::narrow<std::int64_t>(answer.finished - answer.started)};
@@ -557,9 +655,10 @@ private:
 			slots.push_back(row.slot);
 		}
 		state_ = Ticketed{.ticket = pending.ticket,
+		                  .work = pending.work,
 		                  .slots = std::move(slots),
 		                  .verify_rows = verify_rows(pending),
-		                  .masking = Masking::Unpublished,
+		                  .masking = pending.work == decode_device::Work::Logits ? Masking::Unmasked : Masking::Unpublished,
 		                  .answers = std::nullopt};
 		if (auto failed = pump(); failed) {
 			state_ = Broken{.error = *failed};
@@ -695,6 +794,9 @@ private:
 
 	std::array<Ring, model::cards> rings_;
 	std::array<MaskBuffer, model::cards> masks_;
+	std::array<LogitsMemory, model::cards> logits_;
+	/** Each card's lm_head row-to-token table, for putting a logits ticket's halves back in token order. */
+	std::array<std::vector<vocabulary::Token>, model::cards> row_tokens_;
 	/** Descriptor staging, 8.7 KB each: a command-only ticket's, built as it is submitted, and the begun ticket's. */
 	std::unique_ptr<Descriptor> descriptor_;
 	std::unique_ptr<Descriptor> begun_descriptor_;

@@ -46,6 +46,8 @@ enum class Task : unsigned char {
 	MtpNorm,
 	/** Both cards' draft candidates merged and the next draft proposed. */
 	Draft,
+	/** Each verify row's logits copied to the host's logits buffer: a logits ticket's tail, in place of the ranking. */
+	Logits,
 };
 
 /** One task of the walk, with the phase it belongs to. */
@@ -138,6 +140,15 @@ enum class HeadInput : unsigned char {
 	PromptRow,
 };
 
+/**
+ * What follows the lm_head's matmul: the ranking and the verdict, or (for a logits ticket) the logits handed to the host,
+ * which ends the walk.
+ */
+enum class Tail : unsigned char {
+	Verdict,
+	Logits,
+};
+
 /** Adapts the schedule's walk to `Visit`: each step of it becomes a phase of the cycle and that phase's tasks. */
 template<class Visit>
 struct Phases {
@@ -146,6 +157,7 @@ struct Phases {
 	Count row_tiles;
 	Count image_phase;
 	HeadInput head;
+	Tail tail;
 
 	constexpr void run(Task task, Step step, Count level) {
 		visit->task(Point{.task = task, .step = step, .pass = pass, .image_phase = image_phase, .row_tiles = row_tiles, .level = level});
@@ -153,6 +165,10 @@ struct Phases {
 	}
 
 	constexpr void operator()(Step step) {
+		// A logits ticket's walk ends with its logits: nothing after the lm_head runs.
+		if (tail == Tail::Logits && step.op == Op::Verify) {
+			return;
+		}
 		visit->phase(step, pass, image_phase, row_tiles);
 		if (step.op == Op::Head && head == HeadInput::PromptRow) {
 			run(Task::PromptRow, step, 0);
@@ -185,6 +201,10 @@ struct Phases {
 		case Op::Head:
 		case Op::DraftHead:
 			run(Task::Gemv, step, 0);
+			if (tail == Tail::Logits) {
+				run(Task::Logits, step, 0);
+				break;
+			}
 			run(Task::RankSegments, step, 0);
 			for (auto level = Count{1}; level <= folds(step.op); ++level) {
 				run(Task::RankGroups, step, level);
@@ -216,7 +236,8 @@ constexpr void walk_drafts(model::DraftDepth depth, Visit& visit) {
 		                         .pass = {.kind = catch_up ? PassKind::CatchUp : PassKind::Step, .draft = draft},
 		                         .row_tiles = catch_up ? row_tiles : schedule::step_row_tiles,
 		                         .image_phase = schedule::verify_phases,
-		                         .head = HeadInput::VerifyRows};
+		                         .head = HeadInput::VerifyRows,
+		                         .tail = Tail::Verdict};
 		schedule::walk_mtp(mtp);
 	}
 }
@@ -228,9 +249,30 @@ constexpr void walk_drafts(model::DraftDepth depth, Visit& visit) {
  */
 template<class Visit>
 constexpr void walk_cycle(model::DraftDepth depth, Visit& visit) {
-	auto verify = Phases<Visit>{.visit = &visit, .pass = {.kind = PassKind::Verify, .draft = 0}, .row_tiles = row_tiles, .image_phase = 0, .head = HeadInput::VerifyRows};
+	auto verify = Phases<Visit>{.visit = &visit,
+	                            .pass = {.kind = PassKind::Verify, .draft = 0},
+	                            .row_tiles = row_tiles,
+	                            .image_phase = 0,
+	                            .head = HeadInput::VerifyRows,
+	                            .tail = Tail::Verdict};
 	schedule::walk_verify(verify);
 	walk_drafts(depth, visit);
+}
+
+/**
+ * Walks a logits ticket: the cycle's verify pass phase for phase and task for task up to the lm_head's matmul, the
+ * same code over the same rows, then the logits to the host where the cycle ranks them. Nothing after runs: no
+ * verdict, no mtp pass.
+ */
+template<class Visit>
+constexpr void walk_logits(Visit& visit) {
+	auto verify = Phases<Visit>{.visit = &visit,
+	                            .pass = {.kind = PassKind::Verify, .draft = 0},
+	                            .row_tiles = row_tiles,
+	                            .image_phase = 0,
+	                            .head = HeadInput::VerifyRows,
+	                            .tail = Tail::Logits};
+	schedule::walk_verify(verify);
 }
 
 /**
@@ -243,7 +285,8 @@ constexpr void walk_prompt_end(model::DraftDepth depth, Visit& visit) {
 	                          .pass = {.kind = PassKind::Verify, .draft = 0},
 	                          .row_tiles = row_tiles,
 	                          .image_phase = schedule::verify_phases - 2,
-	                          .head = HeadInput::PromptRow};
+	                          .head = HeadInput::PromptRow,
+	                          .tail = Tail::Verdict};
 	head(Step{.op = Op::Head, .stream = model::Stream::Head, .layer = 0});
 	head(Step{.op = Op::Verify, .stream = model::Stream::Head, .layer = 0});
 	walk_drafts(depth, visit);

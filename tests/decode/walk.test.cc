@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The host's interpretation of the decode kernel's walk: the same `walk_cycle` the kernel interprets, here counting
-// what it does. Its phases must be the schedule's `cycle<D, B>` phase for phase; every task ends in a grid barrier;
-// the partial and candidate exchanges are the schedule's count; and the exchange slots and epochs both cards derive
-// alternate and grow across cycles of any depths, which is what lets two receive slots serve every exchange.
+// The host's interpretation of the decode kernel's walk: the same `walk_cycle` (and `walk_prompt_end`, `walk_logits`)
+// the kernel interprets, here counting what it does. Its phases must be the schedule's `cycle<D, B>` phase for phase;
+// every task ends in a grid barrier; the partial and candidate exchanges are the schedule's count; and the exchange
+// slots and epochs both cards derive alternate and grow across cycles of any depths, which is what lets two receive
+// slots serve every exchange.
 import std;
 import engine.decode_device;
 import engine.model;
@@ -154,6 +155,8 @@ template<DraftDepth D>
 			return point.step.op == Op::Verify;
 		case Task::Draft:
 			return point.step.op == Op::Draft;
+		case Task::Logits:
+			return point.step.op == Op::Head;
 		case Task::MtpGather:
 		case Task::MtpNorm:
 			return point.step.op == Op::MtpIn;
@@ -249,6 +252,49 @@ template<DraftDepth D>
 	return cycle.tasks[tasks_skipped].task == Task::Norm;
 }
 
+/**
+ * A logits ticket runs the cycle's verify pass phase for phase and task for task (the same tasks over the same rows,
+ * so the same arithmetic) up to the lm_head's matmul, then hands the logits over where the cycle ranks them, and stops:
+ * no verdict and no mtp pass. Its walk is the cycle's prefix through that matmul and one more task.
+ */
+template<DraftDepth D>
+[[nodiscard]] auto logits_is_the_cycles_prefix() -> bool {
+	auto const cycle = walk(D);
+	auto logits = Recorder{};
+	dd::walk_logits(logits);
+	auto const ranking = std::ranges::find_if(cycle.tasks, [](dd::Point const& point) {
+		return point.task == Task::RankSegments && point.step.op == Op::Head;
+	});
+	auto const shared = static_cast<std::size_t>(ranking - cycle.tasks.begin());
+	auto const head = std::ranges::find_if(cycle.phases, [](Visited const& phase) {
+		return phase.step.op == Op::Head;
+	});
+	auto const phases = static_cast<std::size_t>(head - cycle.phases.begin()) + 1;
+	if (ranking == cycle.tasks.end() || logits.tasks.size() != shared + 1 || logits.phases.size() != phases || !logits.barrier_after_each_task ||
+	    logits.barriers != logits.tasks.size()) {
+		return false;
+	}
+	for (auto index = std::size_t{0}; index < phases; ++index) {
+		auto const& mine = logits.phases[index];
+		auto const& theirs = cycle.phases[index];
+		if (mine.step.op != theirs.step.op || mine.step.layer != theirs.step.layer || mine.step.stream != theirs.step.stream ||
+		    mine.pass.kind != theirs.pass.kind || mine.image_phase != theirs.image_phase || mine.row_tiles != theirs.row_tiles) {
+			return false;
+		}
+	}
+	for (auto index = std::size_t{0}; index < shared; ++index) {
+		auto const& mine = logits.tasks[index];
+		auto const& theirs = cycle.tasks[index];
+		if (mine.task != theirs.task || mine.step.op != theirs.step.op || mine.step.layer != theirs.step.layer || mine.pass.kind != theirs.pass.kind ||
+		    mine.image_phase != theirs.image_phase || mine.row_tiles != theirs.row_tiles || mine.level != theirs.level) {
+			return false;
+		}
+	}
+	auto const& tail = logits.tasks.back();
+	return cycle.tasks[shared - 1].task == Task::Gemv && cycle.tasks[shared - 1].step.op == Op::Head && tail.task == Task::Logits &&
+	       tail.step.op == Op::Head && tail.image_phase == cycle.tasks[shared - 1].image_phase;
+}
+
 }
 
 auto main() -> int {
@@ -270,6 +316,10 @@ auto main() -> int {
 	    Case{.name = "each pass reads its own stream's image phases", .holds = passes_read_their_images()},
 	    Case{.name = "a prompt's end is the cycle's suffix from the lm_head, depth one", .holds = prompt_end_is_the_cycles_suffix<DraftDepth::One>()},
 	    Case{.name = "a prompt's end is the cycle's suffix from the lm_head, depth four", .holds = prompt_end_is_the_cycles_suffix<DraftDepth::Four>()},
+	    Case{.name = "a logits ticket is a depth-one cycle's prefix through the lm_head, then the hand-off",
+	         .holds = logits_is_the_cycles_prefix<DraftDepth::One>()},
+	    Case{.name = "a logits ticket is a depth-four cycle's prefix through the lm_head, then the hand-off",
+	         .holds = logits_is_the_cycles_prefix<DraftDepth::Four>()},
 	};
 	return engine::testing::report(cases);
 }

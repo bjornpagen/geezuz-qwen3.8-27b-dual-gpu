@@ -52,31 +52,12 @@ export class Ledger {
 public:
 	/** The row's plan at `depth`: its book's drafts and its pending replays if it continues the slot, none otherwise. */
 	[[nodiscard]] auto plan(sched::Row const& row, model::DraftDepth depth) const -> Planned {
-		auto const& held = slots_.at(row.slot.index());
-		auto const continued = continues(held, row) ? held : std::nullopt;
-		auto const drafts =
-		    continued.has_value() ? std::min<std::uint32_t>(continued->drafted, core::narrow<std::uint32_t>(model::drafts(depth))) : 0U;
-		auto const stored = continued.has_value() ? continued->state : deltanet::settled(deltanet::Committed{.tokens = row.position});
-		auto const state = deltanet::run(stored, drafts);
-		core::invariant(deltanet::first_position(state) == row.position);
-		auto planned = Planned{
-		    .run =
-		        {
-		            .slot = core::narrow<unsigned>(row.slot.index()),
-		            .position = core::narrow<unsigned>(row.position),
-		            .token = row.token,
-		            .drafts = core::narrow<unsigned char>(drafts),
-		            .replays = core::narrow<unsigned char>(state.replays),
-		            .unused = {},
-		            .rule = row.rule,
-		        },
-		    .state = state,
-		    .drafts = {},
-		};
-		if (continued.has_value()) {
-			std::ranges::copy(std::span{continued->drafts}.first(drafts), planned.drafts.begin());
-		}
-		return planned;
+		return plan_with(row, core::narrow<std::uint32_t>(model::drafts(depth)));
+	}
+
+	/** The row's plan with no drafts, its pending replays still taken: a logits ticket runs each committed token alone. */
+	[[nodiscard]] auto plan_alone(sched::Row const& row) const -> Planned {
+		return plan_with(row, 0);
 	}
 
 	/**
@@ -152,6 +133,34 @@ public:
 	}
 
 private:
+	/** The row's plan verifying at most `most` of its book's drafts. */
+	[[nodiscard]] auto plan_with(sched::Row const& row, std::uint32_t most) const -> Planned {
+		auto const& held = slots_.at(row.slot.index());
+		auto const continued = continues(held, row) ? held : std::nullopt;
+		auto const drafts = continued.has_value() ? std::min<std::uint32_t>(continued->drafted, most) : 0U;
+		auto const stored = continued.has_value() ? continued->state : deltanet::settled(deltanet::Committed{.tokens = row.position});
+		auto const state = deltanet::run(stored, drafts);
+		core::invariant(deltanet::first_position(state) == row.position);
+		auto planned = Planned{
+		    .run =
+		        {
+		            .slot = core::narrow<unsigned>(row.slot.index()),
+		            .position = core::narrow<unsigned>(row.position),
+		            .token = row.token,
+		            .drafts = core::narrow<unsigned char>(drafts),
+		            .replays = core::narrow<unsigned char>(state.replays),
+		            .unused = {},
+		            .rule = row.rule,
+		        },
+		    .state = state,
+		    .drafts = {},
+		};
+		if (continued.has_value()) {
+			std::ranges::copy(std::span{continued->drafts}.first(drafts), planned.drafts.begin());
+		}
+		return planned;
+	}
+
 	std::array<std::optional<Continuation>, model::slots> slots_{};
 };
 

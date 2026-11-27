@@ -81,6 +81,13 @@ enum class Work : unsigned char {
 	 * slot's run names the prompt's last position and carries no drafts.
 	 */
 	PromptEnd,
+	/**
+	 * Apply the commands, then run the cycle's verify pass up to the lm_head's matmul exactly as a cycle runs it, and
+	 * write each verify row's fp32 logits over the card's lm_head rows into the logits buffer instead of ranking them:
+	 * no verdict, no sample, no mtp pass, no masks awaited. Every live slot's run carries no drafts, so the verify rows
+	 * are the slots' committed tokens, one per slot.
+	 */
+	Logits,
 };
 
 /** One live slot's part of a cycle. */
@@ -160,6 +167,29 @@ struct Masks {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// The logits buffer: a logits ticket's verify rows' fp32 logits in the card's lm_head row order, padding rows included,
+// written by the kernel before it answers the ticket. A logits ticket runs one verify row per live slot.
+
+inline constexpr Count logits_rows = model::slots;
+
+/** Two halves by ticket parity, as the masks: the host may still read one ticket's logits while the next runs. */
+inline constexpr Count logits_halves = 2;
+
+struct LogitsHalf {
+	float rows[logits_rows][model::vocab_per_card];
+};
+
+struct LogitsBuffer {
+	LogitsHalf half[logits_halves];
+};
+
+[[nodiscard]] constexpr auto logits_half(unsigned long long ticket) -> Count {
+	return static_cast<Count>(ticket % logits_halves);
+}
+
+static_assert(model::vocab_per_card * sizeof(float) % 16 == 0, "a row of logits copies in whole chunks");
+
+// ---------------------------------------------------------------------------------------------------------------------
 // The control block, zeroed once when the engine opens: a loop that exits leaves its barrier's arrivals at zero, its
 // generation may stand anywhere, and each launch meets the peer on its own epoch, so a relaunch needs no zeroing.
 
@@ -200,9 +230,10 @@ struct Params {
 	Address pool;
 	/** The slots' deltanet state images. */
 	Address states;
-	/** The resident ring's slots and the mask buffer, in mapped host memory. */
+	/** The resident ring's slots, the mask buffer and the logits buffer, in mapped host memory. */
 	Address ring;
 	Address masks;
+	Address logits;
 	/**
 	 * Which launch of the loops this is, from 1: the cards meet at start by publishing it to each other, so a relaunch
 	 * needs no control block zeroed again.

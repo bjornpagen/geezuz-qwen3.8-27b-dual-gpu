@@ -357,6 +357,7 @@ public:
 		    .states = own(zero_.states, one_.states),
 		    .ring = host.ring,
 		    .masks = host.masks,
+		    .logits = host.logits,
 		    .launch = launches_,
 		    .card = static_cast<unsigned>(std::to_underlying(card)),
 		    .unused = 0,
@@ -437,6 +438,16 @@ public:
 		return session_.begin_prompt_end(std::move(prompt), depth);
 	}
 
+	/**
+	 * Submits a logits ticket over the batch's committed tokens (and the queued commands ahead of it) and returns at once:
+	 * the determinism harness's and the rulers' source of the engine's logits. What the slots hold afterwards is what
+	 * `Session::begin_logits` says.
+	 */
+	[[nodiscard]] auto begin_logits(sched::Batch batch) -> core::Result<Pending, DecodeError> {
+		core::invariant(loops_ == Loops::Running);
+		return session_.begin_logits(std::move(batch));
+	}
+
 	template<MaskRows M>
 	[[nodiscard]] auto publish(Pending const& pending, M const& masks, std::size_t count) -> core::Result<void, DecodeError> {
 		return session_.publish(pending, masks, count);
@@ -450,6 +461,11 @@ public:
 	/** The prompt's sampled token once both cards have answered; nullopt while either has not. Never blocks. */
 	[[nodiscard]] auto try_complete_prompt_end(Pending const& pending) -> std::optional<core::Result<sched::ChunkDone, DecodeError>> {
 		return session_.try_complete_prompt_end(pending);
+	}
+
+	/** Each row's logits over the sampled vocabulary in token order once both cards have answered; nullopt until then. */
+	[[nodiscard]] auto try_complete_logits(Pending const& pending) -> std::optional<core::Result<Logits, DecodeError>> {
+		return session_.try_complete_logits(pending);
 	}
 
 	/**
