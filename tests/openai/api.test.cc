@@ -545,8 +545,10 @@ auto set(Request& request, Member const& member) -> void {
 }
 
 /**
- * A string bound the grammar's automata cannot hold is refused by name, before admission: `maxLength` 100 on a tool
- * argument compiles, 1,000 grows one lexeme's automaton past its state bound; past the regex repetition bound it is too large outright.
+ * A string bound the grammar cannot serve is refused by name, before admission, and one it can is served: a plain
+ * string's `maxLength` is counted beside its automaton up to the schema bound, 100,000; a `pattern` writes the bound
+ * into the automaton, so 20,000 grows one lexeme's automaton past its state bound; past 100,000 it is too large
+ * outright. The automaton's state bound is refused as the grammar's as a whole, with no member named.
  */
 [[nodiscard]] auto string_bounds_are_refused_by_name() -> bool {
 	auto h = serving();
@@ -554,22 +556,26 @@ auto set(Request& request, Member const& member) -> void {
 	if (!h || !reading) {
 		return false;
 	}
-	auto const with_length = [](std::size_t length) {
+	auto const with_string = [](std::string_view facets) {
 		return std::format(
-		    R"({{"input":"hi","tools":[{{"type":"function","name":"f","strict":true,"parameters":{{"type":"object","properties":{{"s":{{"type":"string","maxLength":{}}}}}}}}}]}})",
-		    length);
+		    R"({{"input":"hi","tools":[{{"type":"function","name":"f","strict":true,"parameters":{{"type":"object","properties":{{"s":{{"type":"string",{}}}}}}}}}]}})",
+		    facets);
 	};
 	h->service.engine().queue(Script{{openai::Accepted{}, stopped({1}, usage(1, 0, 1, 0))}});
-	auto const fits = ask(*h, create(with_length(100), ""));
-	auto const grows = ask(*h, create(with_length(1000), ""));
-	auto const huge = ask(*h, create(with_length(200'000), ""));
+	auto const fits = ask(*h, create(with_string(R"("maxLength":100000)"), ""));
+	auto const grows = ask(*h, create(with_string(R"("pattern":"^[a-z]+$","maxLength":20000)"), ""));
+	auto const huge = ask(*h, create(with_string(R"("maxLength":100001)"), ""));
 	if (!fits || !grows || !huge) {
 		return false;
 	}
 	auto const grown = refusal_of(*reading, *grows);
 	auto const outright = refusal_of(*reading, *huge);
-	return fits->status == 200 && grown.status == 400 && grown.code == "automaton_too_large" && outright.status == 400 &&
-	       outright.code == "schema_too_large" && outright.param == "tools[0].parameters" && h->service.engine().submissions().size() == 1;
+	if (fits->status != 200 || grown.code != "automaton_too_large" || outright.code != "schema_too_large" || outright.param != "tools[0].parameters") {
+		std::println("string bounds: {} / {} {} '{}' / {} {} '{}'", fits->status, grown.status, grown.code, grown.param, outright.status, outright.code, outright.param);
+	}
+	return fits->status == 200 && grown.status == 400 && grown.code == "automaton_too_large" &&
+	       outright.status == 400 && outright.code == "schema_too_large" && outright.param == "tools[0].parameters" &&
+	       h->service.engine().submissions().size() == 1;
 }
 
 /** A tool whose definition outgrows one JSON fragment of the chat format is refused at the boundary, not rendered. */
@@ -1155,7 +1161,7 @@ auto main() -> int {
 		                      .holds = mutated_requests_are_refused_by_name(2)},
 	    engine::testing::Case{.name = "the efforts the template lacks are refused listing the four it has",
 		                      .holds = unserved_efforts_name_the_served_ones()},
-	    engine::testing::Case{.name = "string bounds past the grammar's automata are refused by name", .holds = string_bounds_are_refused_by_name()},
+	    engine::testing::Case{.name = "string bounds the grammar cannot serve are refused by name, and the rest served", .holds = string_bounds_are_refused_by_name()},
 	    engine::testing::Case{.name = "a tool too large for the chat format is refused at the boundary",
 		                      .holds = oversized_tools_are_refused()},
 	    engine::testing::Case{.name = "a stream is the sdk's events, in order, numbered from 0",
