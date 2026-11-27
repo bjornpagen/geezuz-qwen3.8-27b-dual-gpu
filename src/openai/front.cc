@@ -219,22 +219,10 @@ public:
 		return snapshot;
 	}
 
-	/**
-	 * The engine's last update, after it failed. The engine's error carries its cards' own, which the api does not
-	 * know, so the reason says only whether restarting the engine could help.
-	 */
-	template<class E>
-	    requires requires(E const& error) {
-		    { error.retry() } -> std::same_as<core::Retry>;
-	    }
-	[[nodiscard]] auto failed(E const& error) const -> Update {
-		switch (error.retry()) {
-		case core::Retry::Transient:
-			return EngineFailed{.reason = "the engine stopped serving after a transient failure of its cards or its thread"};
-		case core::Retry::Permanent:
-			return EngineFailed{.reason = "the engine stopped serving after a permanent failure of its cards or its thread"};
-		}
-		std::unreachable();
+	/** The engine's last update, after it failed: the reason is the engine's own description of what failed. */
+	template<pipeline::Describable CardError>
+	[[nodiscard]] auto failed(pipeline::EngineError<CardError> const& error) const -> Update {
+		return EngineFailed{.reason = pipeline::describe(error)};
 	}
 
 private:

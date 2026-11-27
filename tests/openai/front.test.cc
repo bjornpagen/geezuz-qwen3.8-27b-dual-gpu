@@ -32,6 +32,11 @@ struct [[nodiscard]] CardFailure {
 	[[nodiscard]] constexpr auto operator==(CardFailure const&) const -> bool = default;
 };
 
+/** What the cards' own component would say of the failure: here, which cards disagreed. */
+[[nodiscard]] auto describe(CardFailure const& failure) -> std::string {
+	return std::format("the cards disagree on ticket 7 (retry class {})", std::to_underlying(failure.retried));
+}
+
 static_assert(pipeline::Front<openai::Front, CardFailure>);
 
 [[nodiscard]] auto object(std::string_view text) -> json::JsonText {
@@ -364,7 +369,10 @@ auto hear(Heard& heard, std::vector<openai::Output> const& outputs) -> void {
 	       ended.ended.size() == 1 && ended.ended[0].closing == openai::Closing::Closed;
 }
 
-/** The front answers the engine's verdicts and posts its batches, snapshots and failure as the service reads them. */
+/**
+ * The front answers the engine's verdicts and posts its batches, snapshots and failure as the service reads them; a
+ * failure's reason is the engine's description of it, the cards' own words included.
+ */
 [[nodiscard]] auto the_front_maps_the_engine() -> bool {
 	auto front = openai::Front::make();
 	if (!front) {
@@ -380,7 +388,8 @@ auto hear(Heard& heard, std::vector<openai::Output> const& outputs) -> void {
 	       front->cancelled() == openai::Output{openai::Cancelled{}} &&
 	       front->overran(fault) == openai::Output{openai::Overran{.fault = fault}} &&
 	       front->batch(batch) == openai::Update{openai::Outputs{.items = batch}} && front->status(snapshot) == openai::Update{snapshot} &&
-	       std::holds_alternative<openai::EngineFailed>(failed) && std::get<openai::EngineFailed>(failed).reason.contains("transient");
+	       std::holds_alternative<openai::EngineFailed>(failed) && std::get<openai::EngineFailed>(failed).reason == pipeline::describe(transient) &&
+	       std::get<openai::EngineFailed>(failed).reason.contains("the cards disagree on ticket 7");
 }
 
 }
