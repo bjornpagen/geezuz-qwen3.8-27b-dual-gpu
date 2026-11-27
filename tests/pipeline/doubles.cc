@@ -176,8 +176,31 @@ export using Output = std::variant<Accepted, Refused, Committed, Ended, Cancelle
 
 export using Batch = std::vector<pipeline::Addressed<Output>>;
 
+/**
+ * The cards double's own error: what its fake cards failed with. The product's cards have their own, described by
+ * their component; this one is described here, so the engine's failure reads as it would.
+ */
+export struct [[nodiscard]] CardsFailure {
+	device::DeviceError device;
+
+	[[nodiscard]] auto retry() const -> core::Retry {
+		return device.retry();
+	}
+
+	[[nodiscard]] auto operator==(CardsFailure const&) const -> bool = default;
+};
+
+export [[nodiscard]] auto describe(CardsFailure const& failure) -> std::string {
+	if (auto const call = core::alternative<device::Failure>(failure.device.reason)) {
+		return std::format("the fake cards' {} failed with status {}", call->symbol, std::to_underlying(call->status));
+	}
+	return "the fake driver refused the machine";
+}
+
+static_assert(pipeline::Describable<CardsFailure>);
+
 export struct Failed {
-	pipeline::EngineError<device::DeviceError> error;
+	pipeline::EngineError<CardsFailure> error;
 
 	[[nodiscard]] auto operator==(Failed const&) const -> bool = default;
 };
@@ -246,13 +269,13 @@ struct FrontDouble {
 		return snapshot;
 	}
 
-	[[nodiscard]] auto failed(pipeline::EngineError<device::DeviceError> const& error) const -> Update {
+	[[nodiscard]] auto failed(pipeline::EngineError<CardsFailure> const& error) const -> Update {
 		return Failed{.error = error};
 	}
 };
 
-static_assert(pipeline::Front<FrontDouble<ScriptedGrammars>, device::DeviceError>);
-static_assert(pipeline::Front<FrontDouble<CompiledGrammars>, device::DeviceError>);
+static_assert(pipeline::Front<FrontDouble<ScriptedGrammars>, CardsFailure>);
+static_assert(pipeline::Front<FrontDouble<CompiledGrammars>, CardsFailure>);
 
 /** The completion a seed scripts: `length` tokens below script_range, then the end of the turn. */
 export [[nodiscard]] auto script(std::uint64_t seed, std::size_t length) -> std::vector<Token> {
@@ -284,14 +307,14 @@ export struct Breakdown {
 template<std::movable T>
 struct Decided {
 	using sender_concept = ex::sender_t;
-	using completion_signatures = ex::completion_signatures<ex::set_value_t(T), ex::set_error_t(device::DeviceError)>;
+	using completion_signatures = ex::completion_signatures<ex::set_value_t(T), ex::set_error_t(CardsFailure)>;
 
-	core::Result<T, device::DeviceError> outcome;
+	core::Result<T, CardsFailure> outcome;
 
 	template<class Receiver>
 	struct Operation {
 		Receiver receiver;
-		core::Result<T, device::DeviceError> outcome;
+		core::Result<T, CardsFailure> outcome;
 
 		auto start() & noexcept -> void {
 			if (outcome) {
@@ -337,7 +360,7 @@ export enum class Rules : std::uint8_t {
 export template<kv::Geometry G, Rules R>
 class CardsDouble {
 public:
-	using Error = device::DeviceError;
+	using Error = CardsFailure;
 
 	CardsDouble(device::Devices devices, std::map<std::uint64_t, std::vector<Token>> scripts, std::optional<Breakdown> breakdown)
 	    : devices_{std::make_unique<device::Devices>(std::move(devices))},
@@ -466,13 +489,16 @@ private:
 				posted = behind->post(Update{Batch{}});
 			}
 		}
-		return {.outcome = std::unexpected(breakdown_error())};
+		return {.outcome = std::unexpected(CardsFailure{.device = breakdown_error()})};
 	}
 
 	/** Both cards have finished what their streams hold: the step's completion as the engine waits for it. */
 	[[nodiscard]] auto both() const {
 		return ex::when_all(card_scheduler::Card{devices_->context(model::Card::Zero), streams_[0]}.schedule(),
-		                    card_scheduler::Card{devices_->context(model::Card::One), streams_[1]}.schedule());
+		                    card_scheduler::Card{devices_->context(model::Card::One), streams_[1]}.schedule()) |
+		       ex::let_error([](device::DeviceError error) {
+			       return ex::just_error(CardsFailure{.device = std::move(error)});
+		       });
 	}
 
 	/** The completion's index of the token at sequence position `position`. */

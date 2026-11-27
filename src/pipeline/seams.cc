@@ -221,6 +221,24 @@ struct [[nodiscard]] EngineError {
 	[[nodiscard]] auto operator==(EngineError const&) const -> bool = default;
 };
 
+/** A card error an operator can read: its component describes it, found beside it. */
+export template<class E>
+concept Describable = requires(E const& error) {
+	{ describe(error) } -> std::convertible_to<std::string>;
+};
+
+/**
+ * One sentence for an operator on why the engine stopped: the cards' own description of their failure, or the
+ * reactor's of the wait that failed. It is what the api reports when the engine dies mid-run.
+ */
+export template<Describable CardError>
+[[nodiscard]] auto describe(EngineError<CardError> const& error) -> std::string {
+	if (auto const net = core::alternative<net::NetError>(error.cause)) {
+		return std::format("the engine's thread could not wait for work: {}", net::describe(*net));
+	}
+	return std::format("the cards failed: {}", std::string{describe(std::get<CardError>(error.cause))});
+}
+
 /**
  * The api in front of the engine: what a submission becomes on the engine's thread (rendered, tokenized, its grammar's
  * parser started), the outputs that answer it, and the updates the engine posts to the api's service.

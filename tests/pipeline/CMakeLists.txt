@@ -16,3 +16,5 @@ target_link_libraries(engine_pipeline_doubles
 engine_test(pipeline.engine SOURCES engine.test.cc
 	LINK engine_pipeline engine_pipeline_doubles engine_device engine_driver_double engine_grammar engine_http engine_kv engine_net engine_sched
 	engine_tokenizer)
+
+engine_test(pipeline.describe SOURCES describe.test.cc LINK engine_core engine_pipeline engine_pipeline_doubles engine_net)

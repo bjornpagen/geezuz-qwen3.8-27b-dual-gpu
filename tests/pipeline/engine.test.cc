@@ -153,7 +153,7 @@ public:
 	}
 
 	/** Stops the engine and returns why it ended. */
-	[[nodiscard]] auto stop() -> engine::core::Result<void, pipeline::EngineError<device::DeviceError>> {
+	[[nodiscard]] auto stop() -> engine::core::Result<void, pipeline::EngineError<doubles::CardsFailure>> {
 		return pipeline_.stop();
 	}
 
@@ -669,7 +669,7 @@ static_assert(flood.jobs > sched::max_requests, "the flood outgrows the schedule
 		    return true;
 	    },
 	    0ms);
-	return behind && failed && !stopped && stopped.error() == pipeline::EngineError<device::DeviceError>{.cause = doubles::breakdown_error()} &&
+	return behind && failed && !stopped && stopped.error() == pipeline::EngineError<doubles::CardsFailure>{.cause = doubles::CardsFailure{.device = doubles::breakdown_error()}} &&
 	       bench->failures() == 1 && bench->after_failure() == 0;
 }
 
