@@ -1,6 +1,7 @@
 # PLAN: geezuz rewritten as one engine for one model on one box
 
-status: proposed, awaiting approval. no engine code has changed yet.
+status: part 1 is being built on `main` (trunk-based: one branch, every commit green). the code builds, lints and
+passes its host tests on the development mac; nothing has run on a gpu. what is not yet built is listed in 1.10.
 
 this plan has two parts:
 - **part 1, must do**: the mandated cleanup, plus the performance work that is certain from first principles. it
@@ -653,19 +654,26 @@ the linux box.
 **done means**: `dev`, `release` and `lint` build with zero warnings, the static device gates pass, and the cpu tests
 pass. nothing claims runtime kernel correctness until phase c.
 
-**lanes for parallel subagents.** lanes implement and hand over a change that builds. the coordinator merges onto
-`main`, runs every check on the merged tree, and sends exact fixes back. commits go straight to `main`.
+**how the work lands.** trunk-based: `main` is the only branch. a change lands in small commits, each built and
+tested on a fresh snapshot of `main`; the full gate (four presets, every test, the checkpoint suite) runs before a
+push. unfinished work is never parked on a branch or in a commit.
 
-| lane | work | depends on |
-|---|---|---|
-| L0 scaffold | AGENTS.md and CLAUDE.md, the cpp-starter 80/20, cmake gate, presets, language profile, clang-tidy profiles, zones, compile-fail harness, PINS.md | — (first) |
-| L1 cull | delete everything in 1.1 with no successor yet; move what survives into the zones | L0 |
-| L2 model + image + bake | `device/model.h`, `engine.model`, `engine.image`, `engine.bake` | L0 |
-| L3 tokenizer + chat | `engine.tokenizer`, `engine.chat`, fixtures | L0 |
-| L4 server | `engine.json`, `engine.http`, `engine.openai`, `engine.pipeline`, `engine.sched` + fake-engine simulation | L0, L5 |
-| L5 kv + prefix | `engine.kv`, `engine.prefix`, ported fuzz and scenario tests | L0, L2 |
-| L6 device | e4m3/bf16 primitives, fp8 gemv/gemm, attention, deltanet, decode step 1 then step 2, prefill, driver-api loader, resident ring, static gates | L0, L2 |
-| L7 reference + harness | `geezuz-ref`, rulers, decode-path ruler, determinism tooling | L0, L2, L3 |
+**built** (each a module with its tests; `src/README.md` and the zone READMEs list them): the scaffold and rules, the
+model description, the image format and baker, tokenizer and chat format, sampling, grammars, json, http, the
+responses api and its store, kv pool and prefix cache, the scheduler, the driver boundary, device primitives, the
+schedule, gemv, attention and deltanet kernels, decode step 1, prefill, the cards adapter and pipeline, the cpu
+reference and rulers, the microbenchmarks, the soak tool, the programs, and docs/HARDWARE.md, ADVERSARIAL.md, API.md
+and BRINGUP.md.
+
+**not yet built in phase a** (each needed before the phase that uses it):
+- the engine side of the determinism harness: golden logit hashes from the cards, and the soak's golden-hash leg
+  (phase c);
+- the per-phase profiler behind the `profile` preset (phase b's baseline breakdown);
+- the production weight-hash scrub (phase d, with the overclock);
+- the engine thread pinned to a cpu0 core, and a throughput benchmark client in `bench/` (phase c);
+- a continued response keeps only its generation-start snapshot point.
+
+step 2 of 1.6 (the dataflow core) is deliberately not started: it is cut over only against a gpu-validated step 1.
 
 ### phase b: hardware bring-up
 
