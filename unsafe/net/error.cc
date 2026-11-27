@@ -62,6 +62,56 @@ export struct [[nodiscard]] NetError {
 	[[nodiscard]] constexpr auto operator==(NetError const&) const -> bool = default;
 };
 
+/** The call a stage names, as an operator reads it. */
+[[nodiscard]] constexpr auto call_of(Stage stage) -> std::string_view {
+	switch (stage) {
+	case Stage::Socket:
+		return "opening a socket";
+	case Stage::Option:
+		return "setting a socket option";
+	case Stage::Bind:
+		return "binding the listening address";
+	case Stage::Listen:
+		return "listening";
+	case Stage::Resolve:
+		return "resolving an address";
+	case Stage::Accept:
+		return "accepting a connection";
+	case Stage::Connect:
+		return "connecting";
+	case Stage::Queue:
+		return "opening the readiness queue";
+	case Stage::Watch:
+		return "watching a descriptor";
+	case Stage::Wait:
+		return "waiting for readiness";
+	case Stage::Signal:
+		return "subscribing to the stop signals";
+	}
+	std::unreachable();
+}
+
+[[nodiscard]] constexpr auto reason_of(Cause cause) -> std::string_view {
+	switch (cause) {
+	case Cause::Exhausted:
+		return "descriptors, buffers or memory ran out";
+	case Cause::AddressInUse:
+		return "the address is still in use";
+	case Cause::Refused:
+		return "nothing listens at the address";
+	case Cause::Denied:
+		return "the process lacks the privilege";
+	case Cause::Invalid:
+		return "the system refused the call";
+	}
+	std::unreachable();
+}
+
+/** One sentence for an operator: the call that failed, why, and the system's error number. */
+export [[nodiscard]] auto describe(NetError const& error) -> std::string {
+	return std::format("{} failed: {} (errno {})", call_of(error.stage), reason_of(error.cause), error.code);
+}
+
 [[nodiscard]] auto cause_of(int code) -> Cause {
 	switch (code) {
 	case EMFILE:
