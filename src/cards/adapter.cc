@@ -190,9 +190,24 @@ struct Tail {
 	}
 };
 
+/** A logits ticket's answer, polled: the ticket begun (or refused, which fails it at once). */
+template<decode::Catalogs C>
+struct LogitsAnswer {
+	std::reference_wrapper<decode::Engine<C>> engine;
+	core::Result<decode::Pending, decode::DecodeError> begun;
+
+	[[nodiscard]] auto operator()() -> std::optional<core::Result<decode::Logits, decode::DecodeError>> {
+		if (!begun) {
+			return core::Result<decode::Logits, decode::DecodeError>{std::unexpected(begun.error())};
+		}
+		return engine.get().try_complete_logits(*begun);
+	}
+};
+
 /** Each poll the cards hand out is a poll the card scheduler watches. */
 static_assert(card_scheduler::Poll<Ready<pipeline::Drafts>> && card_scheduler::Poll<Yield<decode::ModelCatalogs>> &&
-              card_scheduler::Poll<Answer<decode::ModelCatalogs>> && card_scheduler::Poll<Tail<decode::ModelCatalogs>>);
+              card_scheduler::Poll<Answer<decode::ModelCatalogs>> && card_scheduler::Poll<Tail<decode::ModelCatalogs>> &&
+              card_scheduler::Poll<LogitsAnswer<decode::ModelCatalogs>>);
 
 /**
  * Both cards, owned: the decode engine (behind a pointer, so the senders' borrows of it survive a move of the cards)
@@ -279,6 +294,15 @@ public:
 			answer.refused = std::move(published).error();
 		}
 		return card_scheduler::polled(std::move(answer));
+	}
+
+	/**
+	 * Runs a logits ticket over the batch's rows: each row's token at its position through the verify pass with no
+	 * drafts, and the lm_head's logits back in place of a verdict. Completes with one row of logits per batch row, over
+	 * the sampled vocabulary in token order. The rows' slots afterwards hold their trunk state through their tokens.
+	 */
+	[[nodiscard]] auto logits(sched::Batch batch) {
+		return card_scheduler::polled(LogitsAnswer<C>{.engine = *engine_, .begun = engine_->begin_logits(std::move(batch))});
 	}
 
 	/**

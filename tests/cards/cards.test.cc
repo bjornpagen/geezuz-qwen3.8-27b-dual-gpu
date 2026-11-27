@@ -23,6 +23,7 @@ import engine.pipeline;
 import engine.sampling;
 import engine.sched;
 import engine.testing;
+import engine.vocabulary;
 
 namespace {
 
@@ -49,6 +50,7 @@ struct SyntheticCatalogs {
 using Engine = decode::Engine<SyntheticCatalogs>;
 using Cards = cards::BasicCards<SyntheticCatalogs>;
 using Error = decode::DecodeError;
+using engine::model::Card;
 
 static_assert(pipeline::Cards<Cards, kv::model_geometry>);
 
@@ -85,10 +87,22 @@ template<image::Catalog C>
 	return 50'000 + static_cast<unsigned>(position * 8 + index);
 }
 
+/**
+ * The logit the model loop gives `token` after the input `input` at `position`: an exact fp32 integer, distinct for
+ * nearly every token, so a row computed for the wrong position or input, or put back in the wrong order, reads wrong.
+ */
+[[nodiscard]] constexpr auto forced_logit(std::uint64_t token, std::uint64_t position, std::uint64_t input) -> float {
+	return static_cast<float>(((token * 131) + (position * 17) + (input * 7)) % 1'000'003);
+}
+
 /** What one launch of the loop on one card saw, read only after its thread has been joined. */
 struct Seen {
 	std::vector<dd::Command> applied;
 	std::vector<dd::Work> work;
+	/** Tickets served, the exit's included: a ticket's number picks its half of the logits buffer. */
+	std::uint64_t tickets = 0;
+	/** Each logits ticket's rows, as (slot, position, token). */
+	std::vector<std::vector<std::array<unsigned, 3>>> forced;
 };
 
 /**
@@ -97,12 +111,21 @@ struct Seen {
  */
 struct ModelLoop {
 	std::reference_wrapper<Seen> seen;
+	/** The card's logits buffer, at the address its loop is given: under the fake, a mapped buffer's host address. */
+	dd::LogitsBuffer* logits;
+	/** The token each of the card's lm_head rows holds. */
+	std::reference_wrapper<std::vector<unsigned> const> row_tokens;
 
 	[[nodiscard]] auto operator()(dd::Descriptor const& descriptor) const -> dd::Result {
 		auto result = dd::Result{};
+		seen.get().tickets += 1;
 		seen.get().work.push_back(descriptor.work);
 		std::ranges::copy(std::span{descriptor.command}.first(descriptor.commands), std::back_inserter(seen.get().applied));
 		if (descriptor.work == dd::Work::Apply) {
+			return result;
+		}
+		if (descriptor.work == dd::Work::Logits) {
+			force(descriptor);
 			return result;
 		}
 		for (auto index = std::size_t{0}; index < descriptor.live; ++index) {
@@ -120,6 +143,20 @@ struct ModelLoop {
 		result.started = 1000;
 		result.finished = 2000;
 		return result;
+	}
+
+	/** Writes each row's logits into this card's half of the buffer the ticket's number picks, in the card's row order. */
+	auto force(dd::Descriptor const& descriptor) const -> void {
+		auto& half = std::span{logits->half}[dd::logits_half(seen.get().tickets)];
+		auto& rows = seen.get().forced.emplace_back();
+		for (auto index = std::size_t{0}; index < descriptor.live; ++index) {
+			auto const& run = std::span{descriptor.slots}[index];
+			rows.push_back({run.slot, run.position, run.token});
+			auto values = std::span{std::span{half.rows}[index]};
+			for (auto const [row, token] : std::views::enumerate(row_tokens.get())) {
+				values[core::narrow<std::size_t>(row)] = forced_logit(token, run.position, run.token);
+			}
+		}
 	}
 };
 
@@ -141,7 +178,10 @@ public:
 			std::ranges::copy(launch.parameters, bytes.begin());
 			auto const params = std::bit_cast<dd::Params>(bytes);
 			auto& seen = seen_.emplace_back();
-			kernels_.push_back(std::make_unique<Kernel>(params.ring, ModelLoop{.seen = seen}));
+			auto const card = params.card == 0 ? Card::Zero : Card::One;
+			kernels_.push_back(std::make_unique<Kernel>(params.ring, ModelLoop{.seen = seen,
+			                                                                    .logits = std::bit_cast<dd::LogitsBuffer*>(params.logits),
+			                                                                    .row_tokens = row_tokens_.at(std::to_underlying(card))}));
 			order_.push_back(seen_launches_);
 		}
 		return kernels_.size();
@@ -162,6 +202,8 @@ public:
 	}
 
 private:
+	/** Each card's lm_head row-to-token map, as the cards are given it. */
+	std::array<std::vector<unsigned>, model::cards> row_tokens_ = {engine::vocabulary::row_tokens(Card::Zero), engine::vocabulary::row_tokens(Card::One)};
 	std::size_t seen_launches_ = 0;
 	std::deque<Seen> seen_;
 	std::vector<std::unique_ptr<Kernel>> kernels_;
@@ -311,6 +353,22 @@ struct Cycled {
 		                                  .read = sched::Read::Part,
 		                                  .rule = rule()};
 		auto const read = run(ex::when_all(cards.prefill(pipeline::Prefill{pipeline::Reading{.chunk = reading}}), until(loops, driver, 6)));
+
+		// A logits ticket over a continuing slot and a fresh one: every token's logit in token order, from both cards'
+		// halves, each row's at its own position and input; and the continuing slot's drafts are gone afterwards.
+		auto const forced = sched::Batch{.depth = model::DraftDepth::One, .rows = {row(0, 18, truth(18)), row(3, 5, 9)}};
+		auto const logits = run(cards.logits(forced));
+		auto const expected_row = [](sched::Row const& asked) {
+			auto values = std::vector<float>(model::sampled_vocabulary);
+			for (auto token = std::size_t{0}; token < values.size(); ++token) {
+				values[token] = forced_logit(token, asked.position, asked.token);
+			}
+			return values;
+		};
+		check(logits.has_value() && std::get<0>(*logits).rows.size() == 2 && std::get<0>(*logits).rows[0] == expected_row(forced.rows[0]) &&
+		      std::get<0>(*logits).rows[1] == expected_row(forced.rows[1]));
+		auto const after_logits = cycle(cards, sched::Batch{.depth = model::DraftDepth::Two, .rows = {row(0, 19, 77)}});
+		check(after_logits && after_logits->drafts.rows[0].count == 0 && after_logits->done.rows[0].tokens[0] == truth(20));
 		check(read.has_value() && !std::get<0>(*read).sampled.has_value());
 	}
 	loops.join();
@@ -323,7 +381,10 @@ struct Cycled {
 	auto const between = std::ranges::any_of(std::views::iota(loops.launch_of(1) + 1, loops.launch_of(2)), [&](std::size_t index) {
 		return launches[index].entry != "decode_loop";
 	});
-	return held && lowered && between && driver.violations().empty() && driver.nothing_live();
+	// Both cards ran the logits ticket on the loops the last chunk relaunched, each row as asked.
+	auto const asked = std::vector<std::vector<std::array<unsigned, 3>>>{{{0, 18, truth(18)}, {3, 5, 9}}};
+	auto const ran = loops.seen(4).forced == asked && loops.seen(5).forced == asked;
+	return held && lowered && between && ran && driver.violations().empty() && driver.nothing_live();
 }
 
 }

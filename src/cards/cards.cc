@@ -8,3 +8,4 @@ export module engine.cards;
 export import :adapter;
 export import :start;
 export import :serving;
+export import :harness;
