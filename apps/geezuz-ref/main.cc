@@ -12,8 +12,8 @@
 //   geezuz-ref golden record <checkpoint> <golden> <prompts> <reason>
 //   geezuz-ref golden compare <golden> <candidate>
 //
-// <input> is `ids <id>...` or `text <file>` (plain text, special-token spellings read as characters). A prompts file
-// holds one prompt per line: a name without spaces, one space, the text.
+// <input> is `ids <id>...` or `text <file>`; text, and a golden record's prompts file, are read as `ref::parse_prompts` and
+// `ref::prompt_tokens` define, the same for the engine's side of the harness.
 import std;
 import engine.core;
 import engine.file;
@@ -109,15 +109,11 @@ using Outcome = std::expected<T, Failure>;
 	if (!tokenizer) {
 		return failure("the built-in tokenizer does not load");
 	}
-	auto const pieces = std::array{engine::tokenizer::Piece{engine::tokenizer::Text{.utf8 = text, .spelling = engine::tokenizer::Spelling::Characters}}};
-	auto ids = tokenizer->encode(pieces);
-	if (!ids) {
-		return failure("the text is not utf-8");
+	auto tokens = ref::prompt_tokens(*tokenizer, text);
+	if (!tokens) {
+		return failure(std::format("the text has no tokens: failure {} at byte {}", std::to_underlying(tokens.error().failure), tokens.error().offset));
 	}
-	if (ids->empty()) {
-		return failure("the text encodes to no tokens");
-	}
-	return std::move(*ids);
+	return std::move(*tokens);
 }
 
 /** A decimal count, all of `text`. */
@@ -337,29 +333,14 @@ auto print_candidates(std::string_view label, std::span<ref::Ranked const> best)
 	return failure("the run diverges from the reference");
 }
 
-struct Prompt {
-	std::string name;
-	std::string text;
-};
-
-[[nodiscard]] auto read_prompts(std::string_view path) -> Outcome<std::vector<Prompt>> {
-	auto const text = read_text(path);
-	if (!text) {
-		return std::unexpected(text.error());
-	}
-	auto prompts = std::vector<Prompt>{};
-	for (auto const line : std::views::split(std::string_view{*text}, '\n')) {
-		auto const view = std::string_view{line.begin(), line.end()};
-		if (view.empty()) {
-			continue;
+[[nodiscard]] auto read_prompts(std::string_view path) -> Outcome<std::vector<ref::Prompt>> {
+	return read_text(path).and_then([path](std::string const& text) -> Outcome<std::vector<ref::Prompt>> {
+		auto prompts = ref::parse_prompts(text);
+		if (!prompts) {
+			return failure(std::format("{} is not a prompt set: failure {} on line {}", path, std::to_underlying(prompts.error().failure), prompts.error().line));
 		}
-		auto const space = view.find(' ');
-		if (space == std::string_view::npos || space == 0 || space + 1 == view.size()) {
-			return failure(std::format("a prompt line is `<name> <text>`: {}", view));
-		}
-		prompts.push_back({.name = std::string{view.substr(0, space)}, .text = std::string{view.substr(space + 1)}});
-	}
-	return prompts;
+		return std::move(*prompts);
+	});
 }
 
 [[nodiscard]] auto read_golden(std::string_view path) -> Outcome<ref::Golden> {

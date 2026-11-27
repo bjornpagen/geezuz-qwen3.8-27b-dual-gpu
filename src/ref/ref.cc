@@ -15,5 +15,6 @@ export import :model;
 export import :numeric;
 export import :plan;
 export import :project;
+export import :prompts;
 export import :rulers;
 export import :sums;
