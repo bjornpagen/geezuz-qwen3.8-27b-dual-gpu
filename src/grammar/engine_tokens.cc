@@ -17,15 +17,12 @@ namespace engine::grammar {
  */
 export inline constexpr Layout engine_layout{.tokens = model::sampled_vocabulary, .rows = model::vocab};
 
-/** Words of one card's half of a row-order mask. */
-export inline constexpr std::size_t card_words = model::vocab_per_card / 64;
-
 static_assert(model::vocab_per_card % 64 == 0, "each card's rows start on a word");
 static_assert(tokenizer::vocabulary == model::sampled_vocabulary, "the mask covers exactly the tokens the tokenizer has");
 
-/** One card's words of a row-order mask, in its lm_head row order. */
-export [[nodiscard]] auto card_rows(MaskView const& mask, model::Card card) -> std::span<std::uint64_t const> {
-	return mask.rows.subspan(std::size_t{std::to_underlying(card)} * card_words, card_words);
+/** One card's words of a row-order mask, in its lm_head row order: the width the cards take their masks in. */
+export [[nodiscard]] auto card_rows(MaskView const& mask, model::Card card) -> std::span<std::uint64_t const, model::card_mask_words> {
+	return mask.rows.subspan(std::size_t{std::to_underlying(card)} * model::card_mask_words).first<model::card_mask_words>();
 }
 
 /**

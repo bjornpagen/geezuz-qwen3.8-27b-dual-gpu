@@ -15,8 +15,6 @@ export using Token = tokenizer::Id;
 /** Words of a row-order mask: both cards' lm_head rows, as the grammar lays them out. */
 export inline constexpr std::size_t row_words = model::cards * model::card_mask_words;
 
-// The grammar lays its row masks out by its own width; the cards read the model's.
-static_assert(grammar::card_words == model::card_mask_words, "the grammar's card half is the cards' mask width");
 static_assert(row_words == model::divide_up(grammar::engine_layout.rows, 64), "the row layout is each card's half, word-aligned");
 
 /** The bit of `token`'s lm_head row in the row layout: card c's row r is bit c * vocab_per_card + r. */
