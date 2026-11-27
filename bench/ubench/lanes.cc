@@ -274,6 +274,71 @@ struct DeltanetRows {
 	}
 };
 
+/* PIN(clang-tidy-optional-merged-record): device params are built from plain addresses where no result is held */
+
+/** The deltanet benchmark's buffers by device address, and the side data and rows built from them. */
+struct DeltanetBuffers {
+	std::uint64_t keys;
+	std::uint64_t queries;
+	std::uint64_t values;
+	std::uint64_t gates;
+	std::uint64_t state;
+	std::uint64_t outputs;
+	std::uint64_t cycles;
+	std::uint64_t images;
+	std::uint64_t rings;
+	deltanet::Weights prompt_weights;
+	deltanet::Rows prompt_rows;
+	deltanet::Weights cycle_weights;
+	deltanet::Rows cycle_rows;
+};
+
+/** The chain probes' parameters: every chain of a layer through `probe_tokens` tokens. */
+[[nodiscard]] auto probe_params(DeltanetBuffers const& buffers) -> deltanet::ProbeParams {
+	using Probe = deltanet::ProbeParams;
+	return {
+	    .keys = field_at<decltype(Probe::keys)>(buffers.keys),
+	    .queries = field_at<decltype(Probe::queries)>(buffers.queries),
+	    .values = field_at<decltype(Probe::values)>(buffers.values),
+	    .gates = field_at<decltype(Probe::gates)>(buffers.gates),
+	    .state = field_at<decltype(Probe::state)>(buffers.state),
+	    .outputs = field_at<decltype(Probe::outputs)>(buffers.outputs),
+	    .cycles = field_at<decltype(Probe::cycles)>(buffers.cycles),
+	    .tokens = probe_tokens,
+	};
+}
+
+/** One slot's prompt chunk of `prefill_tokens` tokens at layer 0. */
+[[nodiscard]] auto prefill_params(DeltanetBuffers const& buffers) -> deltanet::PrefillParams {
+	auto params = deltanet::PrefillParams{
+	    .images = field_at<decltype(deltanet::PrefillParams::images)>(buffers.images),
+	    .weights = buffers.prompt_weights,
+	    .rows = buffers.prompt_rows,
+	    .layer = 0,
+	    .live = 1,
+	    .slots = {},
+	};
+	params.slots[0] = {.slot = 0, .tokens = prefill_tokens, .first_row = 0};
+	return params;
+}
+
+/** Every slot live with `decode_rows_per_slot` rows at layer 0. */
+[[nodiscard]] auto decode_params(DeltanetBuffers const& buffers) -> deltanet::DecodeParams {
+	auto params = deltanet::DecodeParams{
+	    .images = field_at<decltype(deltanet::DecodeParams::images)>(buffers.images),
+	    .rings = field_at<decltype(deltanet::DecodeParams::rings)>(buffers.rings),
+	    .weights = buffers.cycle_weights,
+	    .rows = buffers.cycle_rows,
+	    .layer = 0,
+	    .live = static_cast<unsigned>(model::slots),
+	    .slots = {},
+	};
+	for (auto slot = 0U; slot < static_cast<unsigned>(model::slots); ++slot) {
+		params.slots[slot] = {.slot = slot, .replays = 0, .rows = decode_rows_per_slot, .first_row = slot * decode_rows_per_slot};
+	}
+	return params;
+}
+
 /** The probes, the one-slot prefill and the 8-slot decode core on one card. */
 [[nodiscard]] auto deltanet_on(CardView view) -> Result<DeltanetReading> {
 	auto const program = lift(view.context.load<deltanet::DecodeCore, deltanet::Prefill, deltanet::PrefillWindow, ProbeEight, ProbeWarp>());
@@ -291,37 +356,24 @@ struct DeltanetRows {
 	if (auto const failed = first_failure(program, keys, queries, values, gates, state, outputs, counts, images, rings, prompt, cycle)) {
 		return std::unexpected(*failed);
 	}
-	auto const probe = deltanet::ProbeParams{
-	    .keys = deltanet::address<float const>(keys->address()),
-	    .queries = deltanet::address<float const>(queries->address()),
-	    .values = deltanet::address<float const>(values->address()),
-	    .gates = deltanet::address<deltanet::Gates const>(gates->address()),
-	    .state = deltanet::address<float>(state->address()),
-	    .outputs = deltanet::address<float>(outputs->address()),
-	    .cycles = deltanet::address<unsigned long long>(counts->device().address()),
-	    .tokens = probe_tokens,
+	auto const buffers = DeltanetBuffers{
+	    .keys = keys->address(),
+	    .queries = queries->address(),
+	    .values = values->address(),
+	    .gates = gates->address(),
+	    .state = state->address(),
+	    .outputs = outputs->address(),
+	    .cycles = counts->device().address(),
+	    .images = images->address(),
+	    .rings = rings->address(),
+	    .prompt_weights = prompt->weights(),
+	    .prompt_rows = prompt->rows_view(),
+	    .cycle_weights = cycle->weights(),
+	    .cycle_rows = cycle->rows_view(),
 	};
-	auto prefill = deltanet::PrefillParams{
-	    .images = deltanet::address<unsigned char>(images->address()),
-	    .weights = prompt->weights(),
-	    .rows = prompt->rows_view(),
-	    .layer = 0,
-	    .live = 1,
-	    .slots = {},
-	};
-	prefill.slots[0] = {.slot = 0, .tokens = prefill_tokens, .first_row = 0};
-	auto decode = deltanet::DecodeParams{
-	    .images = deltanet::address<unsigned char>(images->address()),
-	    .rings = deltanet::address<unsigned char>(rings->address()),
-	    .weights = cycle->weights(),
-	    .rows = cycle->rows_view(),
-	    .layer = 0,
-	    .live = static_cast<unsigned>(model::slots),
-	    .slots = {},
-	};
-	for (auto slot = 0U; slot < static_cast<unsigned>(model::slots); ++slot) {
-		decode.slots[slot] = {.slot = slot, .replays = 0, .rows = decode_rows_per_slot, .first_row = slot * decode_rows_per_slot};
-	}
+	auto const probe = probe_params(buffers);
+	auto const prefill = prefill_params(buffers);
+	auto const decode = decode_params(buffers);
 	auto reading = DeltanetReading{.card = view.card, .eight_lane_cycles_per_token = 0, .warp_cycles_per_token = 0, .eight_lane_milliseconds = 0,
 	                               .prefill_milliseconds = 0, .decode_core_milliseconds = 0};
 	auto const timed = [&]<class K>(K::Params const& params) -> Result<double> {
@@ -407,6 +459,50 @@ export [[nodiscard]] auto evaluate_split_k_attention(std::span<AttentionPoint co
 	return outcome;
 }
 
+/* PIN(clang-tidy-optional-merged-record): device params are built from plain addresses where no result is held */
+
+/** The attention benchmark's buffers by device address. */
+struct AttentionBuffers {
+	std::uint64_t blocks;
+	std::uint64_t tables;
+	std::uint64_t query;
+	std::uint64_t key;
+	std::uint64_t value;
+	std::uint64_t gate;
+	std::uint64_t query_norm;
+	std::uint64_t key_norm;
+	std::uint64_t rotations;
+	std::uint64_t record_outputs;
+	std::uint64_t running;
+};
+
+/** The decode core's parameters at layer 0: `attention_live(rows)` slots of `rows` rows, each at `attention_context`. */
+template<unsigned rows>
+[[nodiscard]] auto core_params(AttentionBuffers const& buffers) -> attn_device::CoreParams {
+	auto params = attn_device::CoreParams{
+	    .cycle = {.live = attention_live(rows), .work = {}},
+	    .kv = {.blocks = buffers.blocks, .tables = buffers.tables, .layer = 0, .unused = 0},
+	    .rows = {.query = buffers.query, .key = buffers.key, .value = buffers.value, .gate = buffers.gate},
+	    .preparation = {.query = buffers.query_norm, .key = buffers.key_norm, .rotations = buffers.rotations},
+	    .records = {.output = buffers.record_outputs, .running = buffers.running},
+	};
+	for (auto slot = 0U; slot < attention_live(rows); ++slot) {
+		params.cycle.work[slot] = {.slot = slot, .position = attention_context - rows, .rows = rows, .first_row = slot * rows};
+	}
+	return params;
+}
+
+/** Every slot's block table: slot s holds blocks [s * blocks per slot, (s + 1) * blocks per slot) in order. */
+[[nodiscard]] auto block_tables() -> std::vector<std::uint32_t> {
+	auto table = std::vector<std::uint32_t>(static_cast<std::size_t>(model::slots) * model::kv_table_blocks);
+	for (auto slot = std::size_t{0}; slot < model::slots; ++slot) {
+		for (auto block = std::size_t{0}; block < attention_blocks_per_slot; ++block) {
+			table.at(slot * model::kv_table_blocks + block) = static_cast<std::uint32_t>(slot * attention_blocks_per_slot + block);
+		}
+	}
+	return table;
+}
+
 template<unsigned rows>
 [[nodiscard]] auto attention_on(CardView view) -> Result<AttentionPoint> {
 	using Exact = engine::attn::DecodeCore<rows>;
@@ -427,22 +523,20 @@ template<unsigned rows>
 	if (auto const failed = first_failure(program, blocks, tables, query, key, value, gate, query_norm, key_norm, rotations, record_outputs, running)) {
 		return std::unexpected(*failed);
 	}
-	auto table = std::vector<std::uint32_t>(static_cast<std::size_t>(model::slots) * model::kv_table_blocks);
-	for (auto slot = std::size_t{0}; slot < model::slots; ++slot) {
-		for (auto block = std::size_t{0}; block < attention_blocks_per_slot; ++block) {
-			table.at(slot * model::kv_table_blocks + block) = static_cast<std::uint32_t>(slot * attention_blocks_per_slot + block);
-		}
-	}
-	auto params = attn_device::CoreParams{
-	    .cycle = {.live = live, .work = {}},
-	    .kv = {.blocks = blocks->address(), .tables = tables->device().address(), .layer = 0, .unused = 0},
-	    .rows = {.query = query->address(), .key = key->address(), .value = value->address(), .gate = gate->address()},
-	    .preparation = {.query = query_norm->address(), .key = key_norm->address(), .rotations = rotations->address()},
-	    .records = {.output = record_outputs->address(), .running = running->address()},
-	};
-	for (auto slot = 0U; slot < live; ++slot) {
-		params.cycle.work[slot] = {.slot = slot, .position = attention_context - rows, .rows = rows, .first_row = slot * rows};
-	}
+	auto const params = core_params<rows>({
+	    .blocks = blocks->address(),
+	    .tables = tables->device().address(),
+	    .query = query->address(),
+	    .key = key->address(),
+	    .value = value->address(),
+	    .gate = gate->address(),
+	    .query_norm = query_norm->address(),
+	    .key_norm = key_norm->address(),
+	    .rotations = rotations->address(),
+	    .record_outputs = record_outputs->address(),
+	    .running = running->address(),
+	});
+	auto const table = block_tables();
 	auto const time = [&]<class K> -> Result<double> {
 		return best_time<K>(view, *program, nothing, params);
 	};
