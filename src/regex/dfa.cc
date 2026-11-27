@@ -91,6 +91,15 @@ public:
 		return std::ranges::all_of(row, [](State next) { return next == dead; });
 	}
 
+	/** The class of a byte: bytes of one class lead every state to the same state. */
+	[[nodiscard]] auto byte_class(std::uint8_t byte) const -> std::uint32_t {
+		return classes_.at(byte);
+	}
+
+	[[nodiscard]] auto class_count() const -> std::uint32_t {
+		return class_count_;
+	}
+
 	[[nodiscard]] auto states() const -> std::size_t {
 		return accepting_.size();
 	}

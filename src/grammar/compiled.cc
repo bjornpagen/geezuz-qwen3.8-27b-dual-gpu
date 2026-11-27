@@ -7,6 +7,7 @@ import engine.regex;
 import :error;
 import :builder;
 import :strings;
+import :counting;
 
 namespace engine::grammar {
 
@@ -50,6 +51,8 @@ struct CompiledLexeme {
 	regex::Automaton automaton;
 	Mode mode;
 	Placement placement;
+	/** Its length bound, counted beside the automaton, if it has one. */
+	std::optional<Counting> counting;
 };
 
 /** A region's two guards, run over all of its text: free of forbidden words; a prefix of that and the closing. */
@@ -93,6 +96,15 @@ public:
 		return lexemes_[lexeme.index];
 	}
 
+	/** The automaton of one unit, for a grammar with counted lexemes of that unit. */
+	[[nodiscard]] auto unit(Unit unit) const -> regex::Automaton const& {
+		return units_.at(std::to_underlying(unit)).value();
+	}
+
+	[[nodiscard]] auto remainders(Counting const& counting) const -> Remainders const& {
+		return remainders_[counting.table];
+	}
+
 	[[nodiscard]] auto guard(Region region) const -> GuardAutomata const& {
 		return guards_[region.index];
 	}
@@ -133,6 +145,8 @@ private:
 
 	std::vector<CompiledLexeme> lexemes_;
 	std::vector<GuardAutomata> guards_;
+	std::array<std::optional<regex::Automaton>, 2> units_;
+	std::vector<Remainders> remainders_;
 	std::vector<std::optional<Lexeme>> closings_;
 	std::vector<Slot> slots_;
 	std::vector<Rule> rules_;
@@ -210,19 +224,50 @@ auto Grammar::compile(Builder builder, Nonterminal start) -> core::Result<Gramma
 	auto const bounds = builder.bounds();
 	auto const all_rules = builder.rule_specs();
 	auto& store = builder.store();
+	auto out = Grammar{};
 	// Every lexeme's automaton first: one whose language is empty makes its rules derive nothing.
 	auto states = std::size_t{0};
 	auto const budget = [&] { return std::min(bounds.lexeme_states, bounds.states - std::min(states, bounds.states)); };
 	auto automata = std::vector<std::optional<regex::Automaton>>{};
+	auto countings = std::vector<std::optional<Counting>>{};
 	auto lexeme_live = std::vector<bool>{};
+	// Tables by language and unit: lexemes that differ only in their bound share one.
+	auto tables = std::map<std::pair<std::uint32_t, Unit>, std::optional<std::uint32_t>>{};
 	for (auto const& spec : builder.lexeme_specs()) {
 		auto automaton = regex::Automaton::build(store, spec.expr, budget());
 		if (!automaton) {
 			return refuse(Refusal::AutomatonTooLarge, "");
 		}
+		auto counting = std::optional<Counting>{};
+		if (spec.count) {
+			auto& unit = out.units_.at(std::to_underlying(spec.count->unit));
+			if (!unit) {
+				unit = regex::Automaton::build(store, unit_language(store, spec.count->unit), budget()).value();
+			}
+			auto const key = std::pair{spec.expr.id, spec.count->unit};
+			if (!tables.contains(key)) {
+				auto table = remainders_of(*automaton, *unit);
+				tables[key] = table ? std::optional<std::uint32_t>{core::narrow<std::uint32_t>(out.remainders_.size())} : std::nullopt;
+				if (table) {
+					out.remainders_.push_back(std::move(*table));
+				}
+			}
+			if (auto const table = tables.at(key)) {
+				counting = Counting{.unit = spec.count->unit, .min = spec.count->min, .max = spec.count->max, .table = *table};
+			} else {
+				// A language whose remaining counts the table cannot hold: the bound goes into the automaton.
+				automaton = regex::Automaton::build(store, spec.count->fallback, budget());
+				if (!automaton) {
+					return refuse(Refusal::AutomatonTooLarge, "");
+				}
+			}
+		}
 		states += automaton->states();
-		lexeme_live.push_back(automaton->start() != regex::dead);
+		auto const live = counting ? counting->feasible(out.remainders_[counting->table], automaton->start(), out.units_.at(std::to_underlying(counting->unit))->start(), 0)
+		                           : automaton->start() != regex::dead;
+		lexeme_live.push_back(live);
 		automata.emplace_back(std::move(*automaton));
+		countings.push_back(counting);
 	}
 	auto const derives = productive(all_rules, builder.nonterminal_count(), lexeme_live);
 	if (!derives[start.index]) {
@@ -265,12 +310,11 @@ auto Grammar::compile(Builder builder, Nonterminal start) -> core::Result<Gramma
 			}
 		}
 	}
-	auto out = Grammar{};
 	auto const regions = builder.region_specs();
 	for (auto const lexeme : used_lexemes) {
 		auto const& spec = builder.lexeme_specs()[lexeme.index];
 		auto const placement = spec.region ? Placement{Inside{.region = spec.region.value()}} : Placement{Free{}};
-		out.lexemes_.push_back(CompiledLexeme{.automaton = std::move(automata[lexeme.index]).value(), .mode = spec.mode, .placement = placement});
+		out.lexemes_.push_back(CompiledLexeme{.automaton = std::move(automata[lexeme.index]).value(), .mode = spec.mode, .placement = placement, .counting = countings[lexeme.index]});
 	}
 	out.closings_.assign(out.lexemes_.size(), std::nullopt);
 	for (auto const [number, lexeme] : std::views::enumerate(used_lexemes)) {
@@ -293,7 +337,8 @@ auto Grammar::compile(Builder builder, Nonterminal start) -> core::Result<Gramma
 		out.closings_[inner.index] = Lexeme{.index = core::narrow<std::uint32_t>(out.lexemes_.size())};
 		out.lexemes_.push_back(CompiledLexeme{.automaton = std::move(*automaton),
 		                                      .mode = Mode::Lazy,
-		                                      .placement = Closing{.region = *spec.region, .inner = inner, .close = Lexeme{.index = *close}}});
+		                                      .placement = Closing{.region = *spec.region, .inner = inner, .close = Lexeme{.index = *close}},
+		                                      .counting = std::nullopt});
 	}
 	out.closings_.resize(out.lexemes_.size(), std::nullopt);
 	for (auto const& region : regions) {

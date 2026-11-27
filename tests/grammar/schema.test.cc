@@ -94,6 +94,44 @@ using Texts = std::vector<std::string_view>;
 	return true;
 }
 
+/**
+ * A length bound is counted beside the automaton, not written into it: a bound of any size up to the schema limit
+ * compiles to an automaton no larger than the unbounded string's, in content and in a tool argument alike.
+ */
+[[nodiscard]] auto bounds_do_not_grow_automata() -> bool {
+	auto const unbounded = grammar::compile_schema(R"({"type": "string"})");
+	auto const huge = grammar::compile_schema(R"({"type": "string", "minLength": 3, "maxLength": 100000})");
+	auto const argument = grammar::compile(grammar::OutputRequest{
+	    .reasoning = grammar::Reasoning::Direct,
+	    .tools = {grammar::FunctionTool{.name = "f", .parameters = R"({"type": "object", "properties": {"s": {"type": "string", "maxLength": 100000}}, "additionalProperties": false})"}},
+	    .tool_choice = grammar::Calls::Auto,
+	    .parallel = grammar::Parallel::Many,
+	    .format = grammar::PlainText{}});
+	if (!unbounded || !huge || !argument) {
+		std::println("  a bounded string was refused");
+		return false;
+	}
+	// Counting adds the unit automaton's few states; the bound itself adds none.
+	return huge->state_count() <= unbounded->state_count() + 32 && argument->state_count() < 2000;
+}
+
+/** A string exactly `count` characters long, as JSON text. */
+[[nodiscard]] auto string_of(std::size_t count) -> std::string {
+	return "\"" + std::string(count, 'a') + "\"";
+}
+
+/** The bounds hold exactly far past the counts the remaining-count table holds bit by bit. */
+[[nodiscard]] auto long_bounds_are_exact(grammar::Vocabulary const& bytes) -> bool {
+	auto compiled = grammar::compile_schema(R"({"type": "string", "minLength": 700, "maxLength": 1200})");
+	if (!compiled) {
+		return false;
+	}
+	auto const verdict = [&](std::string const& text) { return support::judge(*compiled, bytes, text); };
+	return verdict(string_of(700)) == support::Verdict::Accepted && verdict(string_of(1200)) == support::Verdict::Accepted &&
+	       verdict(string_of(950)) == support::Verdict::Accepted && verdict(string_of(699)) == support::Verdict::Refused &&
+	       verdict(string_of(1201)) == support::Verdict::Refused && verdict("\"" + std::string(699, 'a')) == support::Verdict::Prefix;
+}
+
 inline constexpr std::string_view person = R"({
   "type": "object",
   "properties": {
@@ -153,6 +191,11 @@ auto main() -> int {
 	    {.name = "unbounded numbers take exponents and no negative zero",
 	     .holds = behaves(bytes, R"({"type": "number"})", {"1e5", "-2.5E-3", "0", "123.456"}, {"FINAL_REJECT:-0", "FINAL_REJECT:-0.0", "1e100", "01", "FINAL_REJECT:1."})},
 	    {.name = "strings: lengths count characters", .holds = behaves(bytes, R"({"type": "string", "minLength": 2, "maxLength": 3})", {R"("ab")", R"("é😀")", R"("abc")"}, {R"("abcd")", R"("a")"})},
+	    {.name = "strings: a length bound counts each character once, escapes and multi-byte ones included",
+	     .holds = behaves(bytes, R"({"type": "string", "minLength": 2, "maxLength": 3})", {R"("é😀")", R"("\n\t")", R"("a\u001eb")", R"("ab")", R"("\"\\\/")"},
+	                      {R"("a")", R"("\u001e")", R"("abcd")", R"("é😀éa")", R"("\n\n\n\n")", "FINAL_REJECT:\"a"})},
+	    {.name = "strings: large bounds are counted, not built into automata", .holds = bounds_do_not_grow_automata()},
+	    {.name = "strings: bounds far past the counting table are exact", .holds = long_bounds_are_exact(bytes)},
 	    {.name = "strings: escapes only for control characters",
 	     .holds = behaves(bytes, R"({"type": "string"})", {R"("a\"b\\c\n")", R"("\u001e")", R"("é")"}, {R"("\u00e9")", "\"\x01\"", R"("\x")"})},
 	    {.name = "strings: patterns search unless anchored",

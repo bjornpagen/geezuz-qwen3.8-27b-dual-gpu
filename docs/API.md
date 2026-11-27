@@ -192,10 +192,11 @@ location in the request.
 | `automaton_too_large` | a lexeme whose automaton passes 10,000 states, or all together 120,000 |
 | `grammar_too_large` | a grammar past 20,000 lexemes, 100,000 rules, 400,000 symbols or 2^20 expression nodes |
 
-The bound users meet first is the automaton's: a bounded string is one lexeme, whose states grow with its bound. As
-measured here, a function argument's string compiles up to `maxLength` 186 and a `json_schema` format's top-level
-string up to 281; past that the request is refused `automaton_too_large`. Patterns and enums of many long values meet
-the same bound.
+A string's `minLength` and `maxLength` are counted while it decodes, beside its automaton, so they reach 100,000 at no
+cost in states, in a function's arguments and a `json_schema` format alike, a string-or-`null` type included. A
+string with a `pattern` or `format` has its bound written into its automaton instead, whose states grow with it: as
+measured here, `^[a-z]+$` compiles up to `maxLength` 9,996 at the top level and 9,984 as a function argument; past
+that the request is refused `automaton_too_large`. Patterns and enums of many long values meet the same bound.
 
 A request whose grammar outgrows the matcher's own bounds while the reply decodes (`grammar_overrun`) is described
 above. A caller without stored responses (the cli) refuses `previous_response_id` with `previous_response_unavailable`.

@@ -39,17 +39,26 @@ export inline constexpr std::string_view json_whitespace = R"((?:\x20|\n[\x20\t]
 	})));
 }
 
-/**
- * Every JSON string's text, quotes included: plain characters and escapes. A `\u` escape names a control character
- * only, the characters that must be escaped: a printable character is written as itself (as llguidance does), so a
- * value has one spelling and no escape can name a lone surrogate.
- */
-[[nodiscard]] auto any_json_string(regex::Store& store) -> regex::Expr {
+/** One character of a JSON string's text: a plain character or an escape, each standing for one character of the value. */
+[[nodiscard]] auto json_string_unit(regex::Store& store) -> regex::Expr {
 	auto const plain = regex::characters(store, plain_characters());
 	auto const short_escape = store.concat(store.byte('\\'), regex_of(store, R"(["\\/bfnrt])"));
 	auto const unicode_escape = store.concat(store.literal("\\u"), regex_of(store, "00[01][0-9a-fA-F]"));
-	auto const content = store.repeat(store.any_of(std::array{plain, short_escape, unicode_escape}), 0, regex::unbounded);
-	return store.sequence(std::array{store.byte('"'), content, store.byte('"')});
+	return store.any_of(std::array{plain, short_escape, unicode_escape});
+}
+
+/**
+ * The text of JSON strings of `min` to `max` characters (max `unbounded` for none), quotes included. A `\u` escape
+ * names a control character only, the characters that must be escaped: a printable character is written as itself
+ * (as llguidance does), so a value has one spelling and no escape can name a lone surrogate.
+ */
+[[nodiscard]] auto json_strings(regex::Store& store, std::uint32_t min, std::uint32_t max) -> regex::Expr {
+	return store.sequence(std::array{store.byte('"'), store.repeat(json_string_unit(store), min, max), store.byte('"')});
+}
+
+/** Every JSON string's text. */
+[[nodiscard]] auto any_json_string(regex::Store& store) -> regex::Expr {
+	return json_strings(store, 0, regex::unbounded);
 }
 
 /**

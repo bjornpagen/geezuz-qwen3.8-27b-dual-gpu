@@ -656,7 +656,7 @@ private:
 			return fail(Fault::ClassSyntax);
 		}
 		auto set = CharClass{};
-		// Whether a member written out (not an escape'"'"'s class) lies past ascii.
+		// Whether a member written out (not an escape's class) lies past ascii.
 		auto wide = false;
 		while (true) {
 			auto const c = peek();

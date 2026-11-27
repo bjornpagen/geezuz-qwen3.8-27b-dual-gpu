@@ -229,22 +229,38 @@ private:
 	}
 
 	/**
-	 * A slice's tokens at the committed position. When every string of the slice keeps the lexer going, all of them
-	 * at once. Otherwise branch by branch under the first byte: a branch whose position after its byte keeps the
-	 * lexer going for every rest of the slice is taken whole, the others walked. A position inside a marker (after
-	 * `</thi`) escapes only under the few first bytes that continue the marker, so the walk stays small.
+	 * A slice's tokens at the committed position. Where every string of the slice keeps the lexer going, the bands
+	 * clear of every counted bound are taken at once (they run from the shortest, so one set holds them), the bands
+	 * past the bounds refused whole, and only the bands at a bound taken as below. Elsewhere every band branch by
+	 * branch under the first byte: a branch whose position after its byte keeps the lexer going for every rest of the
+	 * slice taken whole and the others walked. A position inside a marker (after `</thi`) escapes only under the few
+	 * first bytes that continue the marker, and one near a bound only in a band or two, so the walk stays small.
 	 */
 	auto slice(Slice const& slice, std::size_t index) -> void {
-		if (contained(slice, index, committed_.lexer, slice.characters.start()) == Containment::Contained) {
-			bits_.add(slice.bits);
+		if (contained(slice, index, committed_.lexer, slice.characters.start()) != Containment::Contained) {
+			for (auto const& band : slice.bands) {
+				branches(slice, band, index);
+			}
 			return;
 		}
+		auto const clear = std::ranges::find_if(slice.bands, [this](Band const& band) { return !counts_clear(band.max_characters, committed_); });
+		if (clear != slice.bands.begin()) {
+			bits_.add(std::prev(clear)->through);
+		}
+		for (auto const& band : std::ranges::subrange(clear, slice.bands.end())) {
+			if (!overruns(band, committed_)) {
+				branches(slice, band, index);
+			}
+		}
+	}
+
+	auto branches(Slice const& slice, Band const& band, std::size_t index) -> void {
 		auto taken = std::size_t{0};
 		auto total = std::size_t{0};
 		auto& kinds = branch_kinds_;
-		kinds.assign(slice.branches.size(), BranchKind::Refused);
-		for (auto const [number, branch] : std::views::enumerate(slice.branches)) {
-			auto const byte = slice.trie.nodes[branch.node].byte;
+		kinds.assign(band.branches.size(), BranchKind::Refused);
+		for (auto const [number, branch] : std::views::enumerate(band.branches)) {
+			auto const byte = band.trie.nodes[branch.node].byte;
 			total += branch.leaves.size();
 			auto const characters = slice.characters.step(slice.characters.start(), byte);
 			auto const next = parser_.advance(grammar_, committed_, byte);
@@ -254,19 +270,19 @@ private:
 			}
 			// Whole only when the byte stayed inside one lexeme: a lexeme ending or a row pushed is the parser's to judge.
 			auto const inside = next->boundary == Boundary::Inside && next->top == committed_.top;
-			if (inside && contained(slice, index, next->lexer, characters) == Containment::Contained) {
+			if (inside && counts_clear(band.max_characters, *next) && contained(slice, index, next->lexer, characters) == Containment::Contained) {
 				kind = BranchKind::Whole;
 				taken += branch.leaves.size();
 			} else {
 				kind = BranchKind::Walked;
 			}
 		}
-		// Taking the slice whole and clearing what is not pays when most of it is allowed.
+		// Taking the band whole and clearing what is not pays when most of it is allowed.
 		auto const bulk = taken * 2 > total;
 		if (bulk) {
-			bits_.add(slice.bits);
+			bits_.add(band.bits);
 		}
-		for (auto const [number, branch] : std::views::enumerate(slice.branches)) {
+		for (auto const [number, branch] : std::views::enumerate(band.branches)) {
 			auto const kind = kinds[core::narrow<std::size_t>(number)];
 			if (kind == BranchKind::Whole) {
 				if (!bulk) {
@@ -278,9 +294,42 @@ private:
 				std::ranges::for_each(branch.leaves, [this](Leaf leaf) { bits_.clear(leaf); });
 			}
 			if (kind == BranchKind::Walked) {
-				walk(slice.trie, branch.node, branch.end, committed_);
+				walk(band.trie, branch.node, branch.end, committed_);
 			}
 		}
+	}
+
+	/**
+	 * Whether no token of the slice can bring a counted lexeme near its bound from this position: the cached
+	 * containment is the automata's alone, and holds for the counts only this far below every bound.
+	 */
+	[[nodiscard]] auto counts_clear(std::uint32_t characters, Position at) -> bool {
+		auto const& info = parser_.lexer().info(at.lexer);
+		return std::ranges::all_of(info.counted, [&](Entry const& entry) {
+			auto const& counting = grammar_.lexeme(entry.lexeme).counting.value();
+			auto const reach = std::uint64_t{at.units} + characters + grammar_.remainders(counting).slack;
+			return reach <= counting.max;
+		});
+	}
+
+	/**
+	 * Whether every token of a band would take every lexeme under way past its bound, where the slice keeps the lexer
+	 * going: only counted lexemes are under way, no unit is half read, and the band's fewest units overrun every
+	 * maximum. The lexer then dies with any token the unit cannot read, so the band's least count holds for all.
+	 */
+	[[nodiscard]] auto overruns(Band const& band, Position at) -> bool {
+		auto const& info = parser_.lexer().info(at.lexer);
+		if (info.counted.empty() || info.counted.size() != info.entries) {
+			return false;
+		}
+		return std::ranges::all_of(info.counted, [&](Entry const& entry) {
+			auto const& counting = grammar_.lexeme(entry.lexeme).counting.value();
+			if (info.unit != grammar_.unit(counting.unit).start()) {
+				return false;
+			}
+			auto const least = band.min_units.at(std::to_underlying(counting.unit));
+			return std::uint64_t{at.units} + least > counting.max;
+		});
 	}
 
 	/** Whether every rest of the slice's strings keeps the lexer going from a lexer state and a slice state, cached. */

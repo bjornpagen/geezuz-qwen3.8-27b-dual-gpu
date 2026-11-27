@@ -384,7 +384,23 @@ struct AnyString {};
 struct SomeStrings {
 	regex::Expr values;
 };
-using StringLanguage = std::variant<AnyString, SomeStrings>;
+/** Every string of `min` to `max` characters (max `regex::unbounded` for none), and no other constraint. */
+struct BoundedStrings {
+	std::uint32_t min;
+	std::uint32_t max;
+};
+using StringLanguage = std::variant<AnyString, SomeStrings, BoundedStrings>;
+
+/** A string language as an expression over the value's text: a length bound becomes counted characters. */
+[[nodiscard]] auto values_of(regex::Store& store, StringLanguage const& language) -> regex::Expr {
+	if (auto const bounded = core::alternative<BoundedStrings>(language)) {
+		return store.repeat(regex::any_character(store), bounded->min, bounded->max);
+	}
+	if (auto const some = core::alternative<SomeStrings>(language)) {
+		return some->values;
+	}
+	return regex::any_text(store);
+}
 
 /**
  * Compiles JSON schemas into a grammar's rules: each schema into a nonterminal deriving the JSON texts of exactly
@@ -482,7 +498,8 @@ public:
 				if (std::holds_alternative<AnyString>(**language)) {
 					any_string = true;
 				} else {
-					languages.push_back(std::get<SomeStrings>(**language).values);
+					// A union's choices are one lexeme: a length bound among them goes into its expression.
+					languages.push_back(values_of(store_, **language));
 				}
 			}
 			if (any_string) {
@@ -762,12 +779,22 @@ private:
 		return out;
 	}
 
-	/** The JSON text of a string value language. */
-	[[nodiscard]] auto string_text(StringLanguage const& language) -> regex::Expr {
+	/**
+	 * The lexeme of the JSON text of a string value language. A bound on the length alone is counted in JSON
+	 * characters beside the automaton (the quotes are two of them), so no bound grows the automaton.
+	 */
+	[[nodiscard]] auto string_lexeme(StringLanguage const& language) -> Symbol {
 		if (std::holds_alternative<AnyString>(language)) {
-			return builder_.memo("json string", [this] { return any_json_string(store_); });
+			return guarded(builder_.memo("json string", [this] { return any_json_string(store_); }));
 		}
-		return plain_json_string(store_, std::get<SomeStrings>(language).values);
+		if (auto const bounded = core::alternative<BoundedStrings>(language)) {
+			auto const avoid = avoiding(store_, forbidden_);
+			auto const text = store_.both(builder_.memo("json string", [this] { return any_json_string(store_); }), avoid);
+			auto const fallback = store_.both(json_strings(store_, bounded->min, bounded->max), avoid);
+			auto const quotes = std::uint32_t{2};
+			return builder_.counted(text, Mode::Greedy, Count{.unit = Unit::JsonCharacter, .min = widened(bounded->min, quotes), .max = widened(bounded->max, quotes), .fallback = fallback});
+		}
+		return guarded(plain_json_string(store_, std::get<SomeStrings>(language).values));
 	}
 
 	[[nodiscard]] auto string_facets(Facets const& facets, std::string const& path) -> core::Result<std::optional<StringLanguage>, GrammarError> {
@@ -784,6 +811,10 @@ private:
 			if (low > regex::max_repetition || (high != regex::unbounded && high > regex::max_repetition)) {
 				return refuse(Refusal::SchemaTooLarge, pointer(path, "maxLength"));
 			}
+			if (!facets.pattern && !facets.format) {
+				return std::optional<StringLanguage>{BoundedStrings{.min = low, .max = high}};
+			}
+			// With a pattern or a format, the bound joins their expression: no count tracks it beside a pattern.
 			parts.push_back(store_.repeat(regex::any_character(store_), low, high));
 		}
 		if (facets.pattern) {
@@ -841,7 +872,7 @@ private:
 			if (!language) {
 				return std::unexpected(language.error());
 			}
-			return std::optional<Symbol>{guarded(string_text(language->value()))};
+			return std::optional<Symbol>{string_lexeme(language->value())};
 		}
 		case Type::Array: {
 			++nested_;

@@ -42,13 +42,39 @@ export struct Region {
 	[[nodiscard]] constexpr auto operator<=>(Region const&) const = default;
 };
 
-/** A lexeme as written: its language, how it ends, and the region whose guard it runs under, if any. */
+/** What one unit of a counted lexeme's length is. */
+export enum class Unit : std::uint8_t {
+	/** A utf-8 character. */
+	Character,
+	/** A character of JSON string text: a utf-8 character other than `\`, or one escape (`\n`, `\u001e`). */
+	JsonCharacter,
+};
+
+/**
+ * A length bound on a lexeme, in units of its whole text, carried as a count beside the lexer state instead of in
+ * its automaton: a bound of thousands would otherwise multiply the automaton's states by thousands. `fallback` is the
+ * same language with the bound written into the expression, for a shape the count cannot track exactly.
+ */
+export struct Count {
+	Unit unit;
+	std::uint32_t min;
+	std::uint32_t max;
+	regex::Expr fallback;
+
+	[[nodiscard]] constexpr auto operator==(Count const&) const -> bool = default;
+};
+
+/** A bound plus a fixed number of units, `regex::unbounded` staying unbounded. */
+export [[nodiscard]] constexpr auto widened(std::uint32_t bound, std::uint32_t extra) -> std::uint32_t {
+	return bound == regex::unbounded ? bound : bound + extra;
+}
+
+/** A lexeme as written: its language, how it ends, the region whose guard it runs under, and its length bound. */
 struct LexemeSpec {
 	regex::Expr expr;
 	Mode mode;
 	std::optional<Region> region;
-
-	[[nodiscard]] constexpr auto operator==(LexemeSpec const&) const -> bool = default;
+	std::optional<Count> count;
 };
 
 /** A guarded region: the words its text may not contain, and the lexeme that closes it. */
@@ -119,15 +145,24 @@ public:
 			return nonterminal();
 		}
 		if (!store_.nullable(expr)) {
-			return raw_lexeme(LexemeSpec{.expr = expr, .mode = mode, .region = region});
+			return raw_lexeme(LexemeSpec{.expr = expr, .mode = mode, .region = region, .count = std::nullopt});
 		}
 		auto const nonempty = store_.both(expr, store_.concat(store_.bytes(regex::ByteSet::range(0, 255)), regex::everything));
 		auto const out = nonterminal();
 		rule(out, {});
 		if (nonempty != regex::nothing) {
-			rule(out, {raw_lexeme(LexemeSpec{.expr = nonempty, .mode = mode, .region = region})});
+			rule(out, {raw_lexeme(LexemeSpec{.expr = nonempty, .mode = mode, .region = region, .count = std::nullopt})});
 		}
 		return out;
+	}
+
+	/**
+	 * The lexeme matching `expr`, its text's length in `count.unit`s within the bound: `expr` matches no empty string
+	 * and bounds no length of its own.
+	 */
+	[[nodiscard]] auto counted(regex::Expr expr, Mode mode, Count count) -> Symbol {
+		core::invariant(!store_.nullable(expr) && count.min <= count.max);
+		return raw_lexeme(LexemeSpec{.expr = expr, .mode = mode, .region = std::nullopt, .count = count});
 	}
 
 	[[nodiscard]] auto literal(std::string_view text) -> Symbol {
@@ -142,7 +177,7 @@ public:
 	[[nodiscard]] auto region(regex::Expr forbidden, std::string_view closing) -> Region {
 		auto const out = Region{.index = core::narrow<std::uint32_t>(regions_.size())};
 		auto const closing_expr = store_.literal(closing);
-		auto const close = raw_lexeme(LexemeSpec{.expr = closing_expr, .mode = Mode::Greedy, .region = std::nullopt});
+		auto const close = raw_lexeme(LexemeSpec{.expr = closing_expr, .mode = Mode::Greedy, .region = std::nullopt, .count = std::nullopt});
 		regions_.push_back(RegionSpec{.forbidden = forbidden, .closing = closing_expr, .close = std::get<Lexeme>(close)});
 		return out;
 	}
@@ -260,7 +295,14 @@ public:
 
 private:
 	[[nodiscard]] auto raw_lexeme(LexemeSpec spec) -> Symbol {
-		auto const key = std::tuple{spec.expr.id, spec.mode, spec.region ? spec.region->index : std::numeric_limits<std::uint32_t>::max()};
+		auto const none = std::numeric_limits<std::uint32_t>::max();
+		auto const key = std::tuple{spec.expr.id,
+		                            spec.mode,
+		                            spec.region ? spec.region->index : none,
+		                            spec.count ? std::uint32_t{std::to_underlying(spec.count->unit)} : none,
+		                            spec.count ? spec.count->min : none,
+		                            spec.count ? spec.count->max : none,
+		                            spec.count ? spec.count->fallback.id : none};
 		if (auto const found = lexeme_index_.find(key); found != lexeme_index_.end()) {
 			return Lexeme{.index = found->second};
 		}
@@ -283,7 +325,7 @@ private:
 	Bounds bounds_;
 	regex::Store store_;
 	std::vector<LexemeSpec> lexemes_;
-	std::map<std::tuple<std::uint32_t, Mode, std::uint32_t>, std::uint32_t> lexeme_index_;
+	std::map<std::tuple<std::uint32_t, Mode, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, std::uint32_t> lexeme_index_;
 	std::vector<RuleSpec> rules_;
 	std::vector<RegionSpec> regions_;
 	std::map<std::string, regex::Expr> memo_;

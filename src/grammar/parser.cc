@@ -34,6 +34,8 @@ enum class Scan : std::uint8_t {
 struct ScanKey {
 	LexerState lexer;
 	Scan scan;
+	/** Which of the state's ending lexemes the count let end: a row from the same state can differ by it. */
+	std::uint64_t kept;
 
 	[[nodiscard]] constexpr auto operator==(ScanKey const&) const -> bool = default;
 };
@@ -73,6 +75,8 @@ export struct Position {
 	LexerState lexer;
 	std::uint32_t top;
 	Boundary boundary;
+	/** Units counted in the lexeme under way, for its length bound; zero between lexemes. */
+	std::uint32_t units;
 
 	[[nodiscard]] constexpr auto operator==(Position const&) const -> bool = default;
 };
@@ -101,57 +105,70 @@ public:
 		rows_.clear();
 		items_.clear();
 		waits_.clear();
-		auto const index = compute(grammar, std::nullopt, ScanKey{.lexer = dead_lexer, .scan = Scan::Greedy}, {}, std::nullopt);
-		return Position{.lexer = rows_[index].lexer_start, .top = index + 1, .boundary = Boundary::Between};
+		auto const index = compute(grammar, std::nullopt, ScanKey{.lexer = dead_lexer, .scan = Scan::Greedy, .kept = ~std::uint64_t{0}}, {}, std::nullopt);
+		return Position{.lexer = rows_[index].lexer_start, .top = index + 1, .boundary = Boundary::Between, .units = 0};
 	}
 
 	/** The position after one more byte, or nothing when the grammar refuses it there. */
 	[[nodiscard]] auto advance(Grammar const& grammar, Position from, std::uint8_t byte) -> std::optional<Position> {
 		auto next = lexer_.step(grammar, from.lexer, byte);
 		auto top = from.top;
+		auto units = from.units;
 		if (next == dead_lexer) {
 			if (from.boundary == Boundary::Between) {
 				return std::nullopt;
 			}
 			// The lexeme ends before this byte if it can; the byte then starts the next one.
 			auto const& info = lexer_.info(from.lexer);
-			if (info.greedy.empty()) {
+			auto const [ending, kept] = ending_with(grammar, info.greedy, from.units);
+			if (ending.empty()) {
 				return std::nullopt;
 			}
-			top = push(grammar, top, ScanKey{.lexer = from.lexer, .scan = Scan::Greedy}, info.greedy, info.guard) + 1;
-			next = lexer_.step(grammar, rows_[top - 1].lexer_start, byte);
+			top = push(grammar, top, ScanKey{.lexer = from.lexer, .scan = Scan::Greedy, .kept = kept}, ending, info.guard) + 1;
+			auto const start = rows_[top - 1].lexer_start;
+			next = lexer_.step(grammar, start, byte);
 			if (next == dead_lexer) {
 				return std::nullopt;
 			}
+			units = lexer_.ticked(start, byte) ? 1 : 0;
+		} else {
+			units += lexer_.ticked(from.lexer, byte) ? 1 : 0;
+		}
+		auto const& info = lexer_.info(next);
+		if (!feasible(grammar, info, units)) {
+			return std::nullopt;
 		}
 		if (lexer_.ending(next) == Ending::Lazy) {
-			auto const& info = lexer_.info(next);
-			auto inner = std::vector<Lexeme>{};
-			auto close = std::optional<Lexeme>{};
-			for (auto const lexeme : info.lazy) {
-				if (auto const closing = core::alternative<Closing>(grammar.lexeme(lexeme).placement)) {
-					inner.push_back(closing->inner);
-					close = closing->close;
+			auto const [ending, kept] = ending_with(grammar, info.lazy, units);
+			// A lazy lexeme whose count is outside its bound does not end here; the text goes on.
+			if (!ending.empty()) {
+				auto inner = std::vector<Lexeme>{};
+				auto close = std::optional<Lexeme>{};
+				for (auto const lexeme : ending) {
+					if (auto const closing = core::alternative<Closing>(grammar.lexeme(lexeme).placement)) {
+						inner.push_back(closing->inner);
+						close = closing->close;
+					}
 				}
-			}
-			if (close) {
-				// A lexeme joined to its region's closing matched: the lexeme, then the closing, are scanned.
-				std::ranges::sort(inner);
-				top = push(grammar, top, ScanKey{.lexer = next, .scan = Scan::Lazy}, inner, info.guard) + 1;
+				if (close) {
+					// A lexeme joined to its region's closing matched: the lexeme, then the closing, are scanned.
+					std::ranges::sort(inner);
+					top = push(grammar, top, ScanKey{.lexer = next, .scan = Scan::Lazy, .kept = kept}, inner, info.guard) + 1;
+					if (empty(top - 1)) {
+						return std::nullopt;
+					}
+					auto const closes = std::array{*close};
+					top = push(grammar, top, ScanKey{.lexer = next, .scan = Scan::Close, .kept = kept}, closes, std::nullopt) + 1;
+				} else {
+					top = push(grammar, top, ScanKey{.lexer = next, .scan = Scan::Lazy, .kept = kept}, ending, info.guard) + 1;
+				}
 				if (empty(top - 1)) {
 					return std::nullopt;
 				}
-				auto const closes = std::array{*close};
-				top = push(grammar, top, ScanKey{.lexer = next, .scan = Scan::Close}, closes, std::nullopt) + 1;
-			} else {
-				top = push(grammar, top, ScanKey{.lexer = next, .scan = Scan::Lazy}, info.lazy, info.guard) + 1;
+				return Position{.lexer = rows_[top - 1].lexer_start, .top = top, .boundary = Boundary::Between, .units = 0};
 			}
-			if (empty(top - 1)) {
-				return std::nullopt;
-			}
-			return Position{.lexer = rows_[top - 1].lexer_start, .top = top, .boundary = Boundary::Between};
 		}
-		return Position{.lexer = next, .top = top, .boundary = Boundary::Inside};
+		return Position{.lexer = next, .top = top, .boundary = Boundary::Inside, .units = units};
 	}
 
 	/** Whether the output may end at a position: its lexeme, if one is under way, ends there and the parse is complete. */
@@ -160,11 +177,46 @@ public:
 			return rows_[at.top - 1].completion == Completion::Complete;
 		}
 		auto const& info = lexer_.info(at.lexer);
-		if (info.greedy.empty()) {
+		auto const [ending, kept] = ending_with(grammar, info.greedy, at.units);
+		if (ending.empty()) {
 			return false;
 		}
-		auto const index = push(grammar, at.top, ScanKey{.lexer = at.lexer, .scan = Scan::Greedy}, info.greedy, info.guard);
+		auto const index = push(grammar, at.top, ScanKey{.lexer = at.lexer, .scan = Scan::Greedy, .kept = kept}, ending, info.guard);
 		return rows_[index].completion == Completion::Complete;
+	}
+
+	/**
+	 * The lexemes of `list` a lexeme ending with `units` counted may end as: every one but the counted ones whose
+	 * bound the count is outside, with a mask of which were kept (all ones when none is counted).
+	 */
+	[[nodiscard]] auto ending_with(Grammar const& grammar, std::span<Lexeme const> list, std::uint32_t units) -> std::pair<std::span<Lexeme const>, std::uint64_t> {
+		auto const counted = [&grammar](Lexeme lexeme) { return grammar.lexeme(lexeme).counting.has_value(); };
+		if (std::ranges::none_of(list, counted)) {
+			return {list, ~std::uint64_t{0}};
+		}
+		// Counted lexemes accept at most a few at one point (strings of one place in a JSON document).
+		core::invariant(list.size() <= 64);
+		ending_.clear();
+		auto kept = std::uint64_t{0};
+		for (auto const [index, lexeme] : std::views::enumerate(list)) {
+			auto const& counting = grammar.lexeme(lexeme).counting;
+			if (!counting || counting->accepts(units)) {
+				ending_.push_back(lexeme);
+				kept |= std::uint64_t{1} << static_cast<std::uint64_t>(index);
+			}
+		}
+		return {ending_, kept};
+	}
+
+	/** Whether a lexer state can go on with `units` counted: some lexeme in it is uncounted, or within its bound. */
+	[[nodiscard]] static auto feasible(Grammar const& grammar, Info const& info, std::uint32_t units) -> bool {
+		if (info.counted.size() < info.entries) {
+			return true;
+		}
+		return std::ranges::any_of(info.counted, [&](Entry const& entry) {
+			auto const& counting = grammar.lexeme(entry.lexeme).counting.value();
+			return counting.feasible(grammar.remainders(counting), entry.state, info.unit.value(), units);
+		});
 	}
 
 	/** Whether a row holds no items: scanning reached it, but no parse goes on from it. */
@@ -351,6 +403,8 @@ private:
 	std::unordered_set<std::uint64_t> seen_;
 	std::vector<std::uint64_t> predicted_;
 	std::vector<std::uint64_t> scanned_;
+	/** Scratch for the lexemes a count lets end. */
+	std::vector<Lexeme> ending_;
 	std::uint64_t generation_ = 0;
 	std::uint64_t stamps_ = 0;
 	Health health_ = Health::Within;

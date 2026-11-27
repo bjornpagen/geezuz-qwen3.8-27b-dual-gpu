@@ -35,6 +35,8 @@ struct Entry {
 struct Key {
 	std::vector<Entry> entries;
 	std::optional<Guard> guard;
+	/** The unit automaton's state, when a counted lexeme is among the entries: where the current unit has come to. */
+	std::optional<regex::State> unit;
 
 	[[nodiscard]] auto operator==(Key const&) const -> bool = default;
 };
@@ -49,6 +51,9 @@ struct KeyHash {
 		if (key.guard) {
 			mix((std::uint64_t{key.guard->region.index} << 32U) | key.guard->text | (std::uint64_t{1} << 63U));
 			mix(key.guard->closed);
+		}
+		if (key.unit) {
+			mix((std::uint64_t{2} << 62U) | *key.unit);
 		}
 		return static_cast<std::size_t>(hash);
 	}
@@ -66,6 +71,10 @@ struct Info {
 	/** The lazy lexemes that end on entering this state. */
 	std::vector<Lexeme> lazy;
 	std::optional<Guard> guard;
+	/** How many lexemes the state holds, and the counted ones among them with their states, for their counts. */
+	std::size_t entries;
+	std::vector<Entry> counted;
+	std::optional<regex::State> unit;
 };
 
 /** The lexer ran past its state bound. */
@@ -95,10 +104,11 @@ export inline constexpr std::size_t max_lexer_states = 16384;
 class Lexer {
 public:
 	Lexer() {
-		keys_.push_back(Key{.entries = {}, .guard = std::nullopt});
-		info_.push_back(Info{.greedy = {}, .lazy = {}, .guard = std::nullopt});
+		keys_.push_back(Key{.entries = {}, .guard = std::nullopt, .unit = std::nullopt});
+		info_.push_back(Info{.greedy = {}, .lazy = {}, .guard = std::nullopt, .entries = 0, .counted = {}, .unit = std::nullopt});
 		endings_.push_back(Ending::Open);
 		table_.resize(256, dead_lexer);
+		ticks_.resize(256, 0);
 	}
 
 	/**
@@ -106,10 +116,13 @@ public:
 	 * it may take, under the guards carried in, if any.
 	 */
 	[[nodiscard]] auto start(Grammar const& grammar, std::span<Lexeme const> lexemes, std::span<Lexeme const> closings, std::optional<Guard> carried) -> LexerState {
-		auto key = Key{.entries = {}, .guard = std::nullopt};
+		auto key = Key{.entries = {}, .guard = std::nullopt, .unit = std::nullopt};
 		auto const add = [&](Lexeme lexeme) {
 			auto const& compiled = grammar.lexeme(lexeme);
 			key.entries.push_back(Entry{.lexeme = lexeme, .state = compiled.automaton.start()});
+			if (compiled.counting) {
+				key.unit = grammar.unit(compiled.counting->unit).start();
+			}
 			if (auto const region = region_of(compiled.placement); region && !key.guard) {
 				auto const& guards = grammar.guard(*region);
 				key.guard = carried && carried->region == *region ? *carried
@@ -128,9 +141,15 @@ public:
 		if (known != unknown) {
 			return known;
 		}
-		auto const next = compute(grammar, state, byte);
+		auto const [next, tick] = compute(grammar, state, byte);
 		table_[at] = next;
+		ticks_[at] = tick ? 1 : 0;
 		return next;
+	}
+
+	/** Whether the step from `state` by `byte` completed a unit of its counted lexemes. */
+	[[nodiscard]] auto ticked(LexerState state, std::uint8_t byte) const -> bool {
+		return ticks_[(std::size_t{state} * 256) + byte] != 0;
 	}
 
 	[[nodiscard]] auto ending(LexerState state) const -> Ending {
@@ -152,9 +171,23 @@ public:
 private:
 	static constexpr LexerState unknown = std::numeric_limits<LexerState>::max();
 
-	[[nodiscard]] auto compute(Grammar const& grammar, LexerState state, std::uint8_t byte) -> LexerState {
+	/** The state after a byte, and whether the byte completed a unit. */
+	[[nodiscard]] auto compute(Grammar const& grammar, LexerState state, std::uint8_t byte) -> std::pair<LexerState, bool> {
 		auto const& from = keys_[state];
-		auto key = Key{.entries = {}, .guard = std::nullopt};
+		auto key = Key{.entries = {}, .guard = std::nullopt, .unit = std::nullopt};
+		auto tick = false;
+		auto unit_alive = true;
+		if (from.unit) {
+			// The counted entries share one unit: every counted lexeme a parse expects at one point counts one way.
+			auto const& unit = grammar.unit(counted_unit(grammar, from).value());
+			auto next = unit.step(*from.unit, byte);
+			unit_alive = next != regex::dead;
+			if (unit.accepting(next)) {
+				next = unit.start();
+				tick = true;
+			}
+			key.unit = next;
+		}
 		if (from.guard) {
 			auto const& guards = grammar.guard(from.guard->region);
 			key.guard = Guard{.region = from.guard->region,
@@ -170,6 +203,9 @@ private:
 			if (std::holds_alternative<Closing>(compiled.placement) && key.guard.value().closed == regex::dead) {
 				continue;
 			}
+			if (compiled.counting && !unit_alive) {
+				continue;
+			}
 			auto const next = compiled.automaton.step(entry.state, byte);
 			if (next != regex::dead) {
 				key.entries.push_back(Entry{.lexeme = entry.lexeme, .state = next});
@@ -179,7 +215,23 @@ private:
 		if (!guarded) {
 			key.guard = std::nullopt;
 		}
-		return intern(grammar, std::move(key));
+		if (!counted_unit(grammar, key)) {
+			key.unit = std::nullopt;
+			tick = false;
+		}
+		return {intern(grammar, std::move(key)), tick};
+	}
+
+	/** The unit the key's counted entries count in, if it has any. */
+	[[nodiscard]] static auto counted_unit(Grammar const& grammar, Key const& key) -> std::optional<Unit> {
+		auto out = std::optional<Unit>{};
+		for (auto const& entry : key.entries) {
+			if (auto const& counting = grammar.lexeme(entry.lexeme).counting) {
+				core::invariant(!out || *out == counting->unit);
+				out = counting->unit;
+			}
+		}
+		return out;
 	}
 
 	[[nodiscard]] auto intern(Grammar const& grammar, Key key) -> LexerState {
@@ -193,9 +245,12 @@ private:
 			exhaustion_ = Exhaustion::Exhausted;
 			return dead_lexer;
 		}
-		auto info = Info{.greedy = {}, .lazy = {}, .guard = key.guard};
+		auto info = Info{.greedy = {}, .lazy = {}, .guard = key.guard, .entries = key.entries.size(), .counted = {}, .unit = key.unit};
 		for (auto const entry : key.entries) {
 			auto const& compiled = grammar.lexeme(entry.lexeme);
+			if (compiled.counting) {
+				info.counted.push_back(entry);
+			}
 			if (compiled.automaton.accepting(entry.state)) {
 				(compiled.mode == Mode::Lazy ? info.lazy : info.greedy).push_back(entry.lexeme);
 			}
@@ -206,6 +261,7 @@ private:
 		index_.emplace(key, state);
 		keys_.push_back(std::move(key));
 		table_.resize(table_.size() + 256, unknown);
+		ticks_.resize(ticks_.size() + 256, 0);
 		return state;
 	}
 
@@ -214,6 +270,8 @@ private:
 	std::vector<Info> info_;
 	std::vector<Ending> endings_;
 	std::vector<LexerState> table_;
+	/** Per transition, whether it completed a unit. */
+	std::vector<std::uint8_t> ticks_;
 	Exhaustion exhaustion_ = Exhaustion::Within;
 };
 

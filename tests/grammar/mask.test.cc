@@ -156,20 +156,23 @@ struct Sample {
 }
 
 /**
- * For a regular expression the prefix language has an independent oracle: the expression's own automaton, built
- * apart from any grammar. A token is allowed exactly when the text with its bytes still leads to a live state.
+ * A grammar's masks are the prefix language of an independent oracle: a regex compiled to its own automaton, apart
+ * from any grammar. From `prefix`, written byte by byte, a token is allowed exactly when the text with its bytes still
+ * leads to a live oracle state, and the end exactly when the oracle accepts.
  */
-[[nodiscard]] auto regex_masks_match_prefixes(std::string_view pattern, Sample const& sample, std::uint64_t seed) -> bool {
-	auto compiled = grammar::compile_regex(pattern);
-	if (!compiled) {
-		return false;
-	}
-	auto store = regex::Store{std::size_t{1} << 20U};
-	auto const automaton = *regex::Automaton::build(store, *regex::parse(store, pattern, regex::Matching::Whole), 100000);
+[[nodiscard]] auto masks_match_regex(grammar::Grammar compiled, std::string_view oracle, std::string_view prefix, Sample const& sample, std::uint64_t seed, int steps) -> bool {
+	auto store = regex::Store{std::size_t{1} << 22U};
+	auto const automaton = *regex::Automaton::build(store, *regex::parse(store, oracle, regex::Matching::Whole), 200000);
 	auto random = engine::testing::generator(seed);
-	auto matcher = grammar::Matcher::make(std::move(*compiled), sample.layout);
-	auto text = std::string{};
-	for (auto step = 0; step < 40 && !matcher.ended(); ++step) {
+	auto matcher = grammar::Matcher::make(std::move(compiled), sample.layout);
+	auto text = std::string{prefix};
+	for (auto const letter : prefix) {
+		if (!matcher.advance(sample.vocabulary, std::bit_cast<std::uint8_t>(letter))) {
+			std::println("  prefix refused: {:?}", prefix);
+			return false;
+		}
+	}
+	for (auto step = 0; step < steps && !matcher.ended(); ++step) {
 		auto const mask = matcher.mask(sample.vocabulary);
 		auto state = automaton.start();
 		for (auto const letter : text) {
@@ -182,7 +185,7 @@ struct Sample {
 				next = automaton.step(next, std::bit_cast<std::uint8_t>(letter));
 			}
 			if (mask->allows(token) != (next != regex::dead)) {
-				std::println("  {:?} after {:?}: token {:?}", pattern, text, sample.bytes[token]);
+				std::println("  {:?} after {:?}: token {:?}", oracle, text.size() > 80 ? text.substr(text.size() - 80) : text, sample.bytes[token]);
 				return false;
 			}
 			if (next != regex::dead) {
@@ -190,6 +193,7 @@ struct Sample {
 			}
 		}
 		if (mask->allows(sample.end) != automaton.accepting(state)) {
+			std::println("  {:?}: end after {} bytes", oracle, text.size());
 			return false;
 		}
 		if (allowed.empty()) {
@@ -200,6 +204,29 @@ struct Sample {
 		std::ignore = matcher.advance(sample.vocabulary, chosen);
 	}
 	return true;
+}
+
+/** For a regular expression the prefix language's oracle is the expression's own automaton, built apart. */
+[[nodiscard]] auto regex_masks_match_prefixes(std::string_view pattern, Sample const& sample, std::uint64_t seed) -> bool {
+	auto compiled = grammar::compile_regex(pattern);
+	return compiled && masks_match_regex(std::move(*compiled), pattern, "", sample, seed, 40);
+}
+
+/**
+ * Counted strings against the same strings with the bound written into the oracle's expression: a JSON string of
+ * `min` to `max` characters, escapes counting one, written after `prefix`.
+ */
+[[nodiscard]] auto counted_masks_match(std::uint32_t min, std::uint32_t max, std::string_view prefix, Sample const& sample, std::uint64_t seed) -> bool {
+	auto const schema = max == std::numeric_limits<std::uint32_t>::max() ? std::format(R"({{"type": "string", "minLength": {}}})", min)
+	                                                                     : std::format(R"({{"type": "string", "minLength": {}, "maxLength": {}}})", min, max);
+	auto compiled = grammar::compile_schema(schema);
+	if (!compiled) {
+		std::println("  refused {}", schema);
+		return false;
+	}
+	auto const bound = max == std::numeric_limits<std::uint32_t>::max() ? std::format("{{{},}}", min) : std::format("{{{},{}}}", min, max);
+	auto const oracle = std::format(R"("(?:[^"\\\x00-\x1f]|\\["\\/bfnrt]|\\u00[01][0-9a-fA-F]){}")", bound);
+	return masks_match_regex(std::move(*compiled), oracle, prefix, sample, seed, 30);
 }
 
 [[nodiscard]] auto lark(std::string_view text) -> grammar::Grammar {
@@ -259,6 +286,27 @@ auto main() -> int {
 	                                            .tool_choice = grammar::Calls::Required,
 	                                            .parallel = grammar::Parallel::Many,
 	                                            .format = grammar::JsonSchema{.schema = json}};
+	auto const strings_schema = R"({"type": "array", "items": {"type": "string", "minLength": 2, "maxLength": 5}, "maxItems": 3})";
+	auto strings = grammar::compile_schema(strings_schema);
+	auto const string_prefixes = std::vector<std::string_view>{"", R"(["ab)", R"(["abcd)", R"(["abcde)", R"(["a\n)", R"(["a\u001)", "[\"é😀é", R"(["ab", "x)"};
+	auto const counted_tool = grammar::OutputRequest{
+	    .reasoning = grammar::Reasoning::Direct,
+	    .tools = {grammar::FunctionTool{.name = "f", .parameters = R"({"type": "object", "properties": {"s": {"type": "string", "minLength": 2, "maxLength": 4}, "n": {"type": ["string", "null"], "maxLength": 3}}, "required": ["s"], "additionalProperties": false})"}},
+	    .tool_choice = grammar::ForcedTool{.name = "f"},
+	    .parallel = grammar::Parallel::One,
+	    .format = grammar::PlainText{}};
+	auto const counted_prefixes = std::vector<std::string_view>{
+	    "<tool_call>\n<function=f>\n<parameter=s>\n",
+	    "<tool_call>\n<function=f>\n<parameter=s>\na",
+	    "<tool_call>\n<function=f>\n<parameter=s>\nabc",
+	    "<tool_call>\n<function=f>\n<parameter=s>\nabcd",
+	    "<tool_call>\n<function=f>\n<parameter=s>\nabcd\n</par",
+	    "<tool_call>\n<function=f>\n<parameter=s>\nab\n<",
+	    "<tool_call>\n<function=f>\n<parameter=s>\né😀",
+	    "<tool_call>\n<function=f>\n<parameter=s>\nab\n</parameter>\n<parameter=n>\nnu",
+	};
+	auto const long_prefix = "\"" + std::string(545, 'a');
+	auto const across_prefix = "\"" + std::string(507, 'a');
 	auto const cases = std::to_array<engine::testing::Case>({
 	    {.name = "masks match advance: a lark grammar with ignore (seed 1)",
 	     .holds = masks_match_advance(lark("start: item (\",\" item)*\nitem: WORD | \"<\" WORD \">\"\nWORD: /[a-zé😀]+/\n%ignore /[ \\n]+/\n"), small, 1, 8, 40, none)},
@@ -273,6 +321,14 @@ auto main() -> int {
 	    {.name = "regex masks are the prefix language (dates)", .holds = regex_masks_match_prefixes("[0-9]{4}-[0-9]{2}-[0-9]{2}", small, 9)},
 	    {.name = "regex masks are the prefix language (free text)", .holds = regex_masks_match_prefixes("(?s:.*)", other, 10)},
 	    {.name = "regex masks are the prefix language (alternatives and unicode)", .holds = regex_masks_match_prefixes("(?:abc|a(?:é|😀)+|[0-9]+\\.[0-9]+)\\n?", other, 11)},
+	    {.name = "counted strings: masks match advance at and across their bounds (seed 12)", .holds = strings && masks_match_advance(*strings, other, 12, 16, 40, string_prefixes)},
+	    {.name = "counted arguments: masks match advance at and across their bounds (seed 13)", .holds = masks_match_advance(output(counted_tool), other, 13, 16, 40, counted_prefixes)},
+	    {.name = "counted strings are the prefix language of the bounded expression (2 to 5)", .holds = counted_masks_match(2, 5, "", other, 14)},
+	    {.name = "counted strings are the prefix language of the bounded expression (at the bound)", .holds = counted_masks_match(2, 5, R"("ab\tc)", small, 15)},
+	    {.name = "counted strings are the prefix language of the bounded expression (no maximum)", .holds = counted_masks_match(3, std::numeric_limits<std::uint32_t>::max(), "", other, 16)},
+	    {.name = "counted strings are the prefix language of the bounded expression (past the horizon)", .holds = counted_masks_match(550, 600, long_prefix, other, 17)},
+	    {.name = "counted strings are the prefix language of the bounded expression (across the horizon)", .holds = counted_masks_match(500, 520, across_prefix, other, 18)},
+	    {.name = "rollback restores masks exactly in counted strings (seed 19)", .holds = strings && rollback_restores(*strings, other, 19)},
 	});
 	return engine::testing::report(cases);
 }

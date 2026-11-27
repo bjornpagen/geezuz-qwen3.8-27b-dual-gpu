@@ -3,6 +3,7 @@ export module engine.grammar;
 
 export import :error;
 export import :builder;
+export import :counting;
 export import :compiled;
 export import :lexer;
 export import :parser;

@@ -79,6 +79,29 @@ inline constexpr auto call_markers = std::to_array<std::string_view>({"<tool_cal
 /** How a parameter's text ends, as the template writes it. */
 inline constexpr std::string_view parameter_close = "\n</parameter>\n";
 
+// The closing is ascii, so its length in characters is its length in bytes.
+static_assert(std::ranges::none_of(parameter_close, [](char c) { return (static_cast<unsigned char>(c) & 0x80U) != 0; }));
+
+/**
+ * The lexeme of an argument written as its own text, through its closing tag: its values (less `excluded`, the texts
+ * a cast would read as another type) free of call markers. A bound on the length alone is counted in characters
+ * beside the automaton, the closing's characters included, so no bound grows the automaton.
+ */
+[[nodiscard]] auto raw_value(Builder& builder, StringLanguage const& language, regex::Expr excluded) -> Symbol {
+	auto& store = builder.store();
+	auto const forbidden = builder.memo("call markers", [&store] { return any_literal(store, call_markers); });
+	auto const shape = [&](regex::Expr values) {
+		auto const allowed = store.all_of(std::array{values, store.complement(excluded), avoiding(store, forbidden)});
+		return store.concat(allowed, store.literal(parameter_close));
+	};
+	if (auto const bounded = core::alternative<BoundedStrings>(language)) {
+		auto const text = builder.memo("text", [&store] { return regex::any_text(store); });
+		auto const closing = core::narrow<std::uint32_t>(parameter_close.size());
+		return builder.counted(shape(text), Mode::Lazy, Count{.unit = Unit::Character, .min = widened(bounded->min, closing), .max = widened(bounded->max, closing), .fallback = shape(values_of(store, language))});
+	}
+	return builder.lexeme(shape(values_of(store, language)), Mode::Lazy, std::nullopt);
+}
+
 /**
  * The text of one argument, through its closing tag, such that the chat format's parser reads back a value the
  * parameter's schema admits. A string is written as itself; any other type as JSON, read back by the template's
@@ -87,7 +110,6 @@ inline constexpr std::string_view parameter_close = "\n</parameter>\n";
 [[nodiscard]] auto argument(Builder& builder, Value const& root, Value const& schema, std::span<chat::Cast const> casts, std::string const& path, Usage& usage)
     -> core::Result<Symbol, GrammarError> {
 	auto& store = builder.store();
-	auto const forbidden = builder.memo("call markers", [&store] { return any_literal(store, call_markers); });
 	auto compiler = SchemaCompiler{builder, root, "", Place{.markers = call_markers, .readback = Readback::ChatFormat, .top_numbers_excluded = regex::nothing}, usage};
 	auto strings = compiler.strings(schema, path, 0);
 	if (!strings) {
@@ -100,12 +122,8 @@ inline constexpr std::string_view parameter_close = "\n</parameter>\n";
 	auto const out = builder.nonterminal();
 	auto const close = builder.literal(parameter_close);
 	if (*strings) {
-		auto values = std::holds_alternative<AnyString>(**strings) ? builder.memo("text", [&store] { return regex::any_text(store); }) : std::get<SomeStrings>(**strings).values;
-		if (!casts.empty()) {
-			values = store.both(values, store.complement(captured_words(store, casts)));
-		}
-		auto const text = store.both(values, avoiding(store, forbidden));
-		builder.rule(out, {builder.lexeme(store.concat(text, store.literal(parameter_close)), Mode::Lazy, std::nullopt)});
+		auto const excluded = casts.empty() ? regex::nothing : captured_words(store, casts);
+		builder.rule(out, {raw_value(builder, **strings, excluded)});
 	}
 	auto json_types = Types::none();
 	for (auto const type : all_types) {
@@ -199,11 +217,8 @@ inline constexpr std::string_view parameter_close = "\n</parameter>\n";
 		auto const other_names = store.both(store.repeat(name_characters, 1, regex::unbounded), store.complement(store.any_of(names)));
 		auto const extra = builder.nonterminal();
 		if (values) {
-			auto const forbidden = any_literal(store, call_markers);
-			auto const text = std::holds_alternative<AnyString>(*values) ? regex::any_text(store) : std::get<SomeStrings>(*values).values;
 			auto const open = builder.lexeme(store.sequence(std::array{store.literal("<parameter="), other_names, store.literal(">\n")}), Mode::Greedy, std::nullopt);
-			auto const value = builder.lexeme(store.concat(store.both(text, avoiding(store, forbidden)), store.literal(parameter_close)), Mode::Lazy, std::nullopt);
-			builder.rule(extra, {open, value});
+			builder.rule(extra, {open, raw_value(builder, *values, regex::nothing)});
 		}
 		builder.rule(rest[count], {builder.star(extra)});
 	}

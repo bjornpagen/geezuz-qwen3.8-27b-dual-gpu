@@ -4,6 +4,8 @@ export module engine.grammar:tokens;
 import std;
 import engine.core;
 import engine.regex;
+import :builder;
+import :counting;
 
 namespace engine::grammar {
 
@@ -96,13 +98,45 @@ struct Branch {
 	std::vector<Leaf> leaves;
 };
 
+/** How many ways a lexeme's length is counted: one per Unit. */
+inline constexpr std::size_t unit_count = 2;
+
+/**
+ * No token of a band reads whole as units of a kind: the band moves no count, and is never allowed where only counted
+ * lexemes are under way.
+ */
+inline constexpr std::uint32_t no_units = std::numeric_limits<std::uint32_t>::max();
+
+/**
+ * The tokens of a slice with one range of lengths, in characters. Near a counted lexeme's bound a long token could
+ * cross it where a short one cannot, so the short tokens are still taken whole, the ones past the bound refused
+ * whole, and only the few at it walked.
+ */
+struct Band {
+	Trie trie;
+	Bits bits;
+	/** The band's tokens and every shorter band's: bands clear of a bound come in a run from the shortest. */
+	Bits through;
+	/** The trie's subtrees by first byte, so a mask can take most of a band whole and walk only the rest. */
+	std::vector<Branch> branches;
+	/** The most characters of any token in the band: how far one token can move a lexeme's length count. */
+	std::uint32_t max_characters;
+	/**
+	 * Per unit, the fewest units a token of the band completes from a unit's start, among tokens the unit reads
+	 * whole: how far it moves a count at least. A token the unit cannot read is never allowed where only counted
+	 * lexemes are under way, since the lexer dies with the unit.
+	 */
+	std::array<std::uint32_t, unit_count> min_units;
+};
+
+/** The upper ends of the bands' lengths: one length each while tokens are many, wider past; the last has no end. */
+inline constexpr auto band_ends = std::to_array<std::uint32_t>({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 24, 32, 48, 64});
+
 struct Slice {
 	/** Recognizes one or more characters of the class, byte by byte. */
 	regex::Automaton characters;
-	Trie trie;
-	Bits bits;
-	/** The trie's subtrees by first byte, so a mask can take most of a slice whole and walk only the rest. */
-	std::vector<Branch> branches;
+	/** By length, shortest first; the last band's `through` is every token of the slice. */
+	std::vector<Band> bands;
 };
 
 /** A trie's subtrees under the root's children, each with its tokens. */
@@ -119,6 +153,38 @@ struct Slice {
 		branches.push_back(std::move(branch));
 	}
 	return branches;
+}
+
+/** The utf-8 characters of a text: its bytes that are no continuation byte. */
+[[nodiscard]] auto characters_of(std::string_view bytes) -> std::uint32_t {
+	return core::narrow<std::uint32_t>(std::ranges::count_if(bytes, [](char c) { return (std::bit_cast<std::uint8_t>(c) & 0xc0U) != 0x80U; }));
+}
+
+/** The most utf-8 characters any of the tokens holds. */
+[[nodiscard]] auto characters_in(std::span<std::pair<std::string_view, Leaf> const> tokens) -> std::uint32_t {
+	auto most = std::uint32_t{0};
+	for (auto const& entry : tokens) {
+		most = std::max(most, characters_of(entry.first));
+	}
+	return most;
+}
+
+/** How many units a token completes read from a unit's start, unless the unit cannot read it. */
+[[nodiscard]] auto units_of(regex::Automaton const& unit, std::string_view bytes) -> std::optional<std::uint32_t> {
+	auto state = unit.start();
+	auto units = std::uint32_t{0};
+	for (auto const c : bytes) {
+		state = unit.step(state, std::bit_cast<std::uint8_t>(c));
+		if (state == regex::dead) {
+			return std::nullopt;
+		}
+		// As the lexer counts: a unit read whole starts the next.
+		if (unit.accepting(state)) {
+			state = unit.start();
+			++units;
+		}
+	}
+	return units;
 }
 
 /** Builds a trie of tokens in depth-first order from (bytes, leaf) pairs. */
@@ -202,17 +268,46 @@ public:
 			parts.at(core::narrow<std::size_t>(slice - automata.begin())).emplace_back(token.bytes, leaf);
 			out.bytes_.emplace(token.token, token.bytes);
 		}
+		auto units = std::vector<regex::Automaton>{};
+		for (auto const unit : {Unit::Character, Unit::JsonCharacter}) {
+			core::invariant(std::to_underlying(unit) == units.size());
+			auto built = regex::Automaton::build(store, unit_language(store, unit), 4096);
+			core::invariant(built.has_value());
+			units.push_back(std::move(*built));
+		}
 		for (auto const index : {std::size_t{0}, std::size_t{1}}) {
-			auto bits = Bits::sized(layout);
+			auto banded = std::array<std::vector<std::pair<std::string_view, Leaf>>, band_ends.size() + 1>{};
 			for (auto const& entry : parts.at(index)) {
-				bits.set(entry.second);
+				auto const length = characters_of(entry.first);
+				auto const band = std::ranges::find_if(band_ends, [length](std::uint32_t end) { return length <= end; });
+				banded.at(core::narrow<std::size_t>(band - band_ends.begin())).push_back(entry);
 			}
-			auto trie = make_trie(parts.at(index));
-			auto branches = branches_of(trie);
-			out.slices_.push_back(Slice{.characters = std::move(automata.at(index)),
-			                            .trie = std::move(trie),
-			                            .bits = std::move(bits),
-			                            .branches = std::move(branches)});
+			auto slice = Slice{.characters = std::move(automata.at(index)), .bands = {}};
+			auto through = Bits::sized(layout);
+			for (auto const& members : banded) {
+				auto band_bits = Bits::sized(layout);
+				auto min_units = std::array<std::uint32_t, unit_count>{};
+				min_units.fill(no_units);
+				for (auto const& entry : members) {
+					band_bits.set(entry.second);
+					for (auto const [unit, automaton] : std::views::enumerate(units)) {
+						if (auto const read = units_of(automaton, entry.first)) {
+							auto& least = min_units.at(core::narrow<std::size_t>(unit));
+							least = std::min(least, *read);
+						}
+					}
+				}
+				through.add(band_bits);
+				auto trie = make_trie(members);
+				auto branches = branches_of(trie);
+				slice.bands.push_back(Band{.trie = std::move(trie),
+				                           .bits = std::move(band_bits),
+				                           .through = through,
+				                           .branches = std::move(branches),
+				                           .max_characters = characters_in(members),
+				                           .min_units = min_units});
+			}
+			out.slices_.push_back(std::move(slice));
 		}
 		out.rest_ = make_trie(parts.at(2));
 		return out;

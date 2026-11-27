@@ -47,6 +47,18 @@ auto time_compile(std::string_view name, std::size_t runs, Compile compile) -> v
 	std::println("{:<44} best of {}: {:>9.1f}us  {}", name, runs, microseconds(best), outcome);
 }
 
+/** The largest bound up to `ceiling` at which `compiles` holds, by bisection: it fails past a bound and holds below. */
+template<class Compiles>
+auto largest(std::string_view name, std::uint32_t ceiling, Compiles compiles) -> void {
+	auto low = std::uint32_t{0};
+	auto high = ceiling + 1;
+	while (low + 1 < high) {
+		auto const middle = low + ((high - low) / 2);
+		(compiles(middle) ? low : high) = middle;
+	}
+	std::println("{:<44} {}", name, low);
+}
+
 [[nodiscard]] auto many_properties(std::size_t count) -> std::string {
 	auto out = std::string{R"({"type": "object", "properties": {)"};
 	for (auto index = std::size_t{0}; index < count; ++index) {
@@ -124,14 +136,42 @@ auto main() -> int {
 	time_compile("schema nested 31 deep", 3, [&] { return grammar::compile(request({}, grammar::Calls::None, grammar::JsonSchema{.schema = nested}, grammar::Reasoning::Direct)); });
 	auto const rules = many_rules(grammar::request_bounds.lark_rules - 1);
 	time_compile("lark with 1000 definitions (the bound)", 3, [&] { return grammar::compile(request({grammar::CustomTool{.name = "big", .input = grammar::LarkInput{.definition = rules}}}, grammar::Calls::Auto, grammar::PlainText{}, grammar::Reasoning::Direct)); });
-	time_compile("string of maxLength 1000", 3, [&] { return grammar::compile_schema(R"({"type": "string", "maxLength": 1000})"); });
-	time_compile("string of maxLength 5000 (past the bound)", 3, [&] { return grammar::compile_schema(R"({"type": "string", "maxLength": 5000})"); });
+	time_compile("string of maxLength 100000 (the bound)", 3, [&] { return grammar::compile_schema(R"({"type": "string", "maxLength": 100000})"); });
+	time_compile("argument string of maxLength 100000", 3, [&] {
+		return grammar::compile(request({tool("note", R"({"type": "object", "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 100000}}, "required": ["text"], "additionalProperties": false})")},
+		                                grammar::Calls::Auto, grammar::PlainText{}, grammar::Reasoning::Direct));
+	});
+	time_compile("1000 argument strings of distinct bounds", 3, [&] {
+		auto schema = std::string{R"({"type": "object", "properties": {)"};
+		for (auto index = 0; index < 1000; ++index) {
+			schema.append(std::format(R"({}"p{}": {{"type": "string", "maxLength": {}}})", index == 0 ? "" : ", ", index, 100 + index));
+		}
+		schema.append(R"(}, "additionalProperties": false})");
+		return grammar::compile(request({tool("wide", schema)}, grammar::Calls::Auto, grammar::PlainText{}, grammar::Reasoning::Direct));
+	});
+	time_compile("pattern with maxLength 1000 (in the automaton)", 3, [&] { return grammar::compile_schema(R"({"type": "string", "pattern": "^[a-z]+$", "maxLength": 1000})"); });
 	time_compile("regex of 16 KiB", 3, [&] {
 		auto text = std::string{};
 		while (text.size() + 16 < grammar::request_bounds.regex_bytes) {
 			text.append("(?:ab|cd)[0-9]x");
 		}
 		return grammar::compile_regex(text);
+	});
+
+	std::println("\nthe longest maxLength that compiles (a counted string reaches the 100000 bound, a pattern writes it into the automaton):");
+	largest("a string with a pattern", 100000, [](std::uint32_t bound) {
+		return grammar::compile_schema(std::format(R"({{"type": "string", "pattern": "^[a-z]+$", "maxLength": {}}})", bound)).has_value();
+	});
+	largest("a string or null", 100000, [](std::uint32_t bound) {
+		return grammar::compile_schema(std::format(R"({{"type": ["string", "null"], "maxLength": {}}})", bound)).has_value();
+	});
+	largest("an argument with a pattern", 100000, [](std::uint32_t bound) {
+		auto const schema = std::format(R"({{"type": "object", "properties": {{"text": {{"type": "string", "pattern": "^[a-z]+$", "maxLength": {}}}}}, "required": ["text"], "additionalProperties": false}})", bound);
+		return grammar::compile(request({tool("note", schema)}, grammar::Calls::Auto, grammar::PlainText{}, grammar::Reasoning::Direct)).has_value();
+	});
+	largest("an argument string or null", 100000, [](std::uint32_t bound) {
+		auto const schema = std::format(R"({{"type": "object", "properties": {{"text": {{"type": ["string", "null"], "maxLength": {}}}}}, "required": ["text"], "additionalProperties": false}})", bound);
+		return grammar::compile(request({tool("note", schema)}, grammar::Calls::Auto, grammar::PlainText{}, grammar::Reasoning::Direct)).has_value();
 	});
 
 	std::println("\nmask latency over random walks (real tokenizer, {} tokens):", engine::tokenizer::vocabulary);
@@ -141,6 +181,8 @@ auto main() -> int {
 	    {"tool call required", request({tool("get_weather", std::string{weather})}, grammar::Calls::Required, grammar::PlainText{}, grammar::Reasoning::Direct)},
 	    {"json schema content", request({}, grammar::Calls::None, grammar::JsonSchema{.schema = std::string{answer}}, grammar::Reasoning::Direct)},
 	    {"json object content", request({}, grammar::Calls::None, grammar::JsonObject{}, grammar::Reasoning::Direct)},
+	    {"bounded strings (maxLength 2000)", request({}, grammar::Calls::None, grammar::JsonSchema{.schema = R"({"type": "object", "properties": {"a": {"type": "string", "maxLength": 2000}, "b": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 40}}}, "required": ["a", "b"], "additionalProperties": false})"}, grammar::Reasoning::Direct)},
+	    {"bounded argument (maxLength 4000)", request({tool("note", R"({"type": "object", "properties": {"text": {"type": "string", "maxLength": 4000}}, "required": ["text"], "additionalProperties": false})")}, grammar::Calls::Required, grammar::PlainText{}, grammar::Reasoning::Direct)},
 	});
 	auto everything = std::vector<Clock::duration>{};
 	for (auto const& [name, scenario] : scenarios) {
