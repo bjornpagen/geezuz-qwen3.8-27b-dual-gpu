@@ -214,6 +214,8 @@ There is no NVIDIA GPU and no CUDA toolkit on the development mac, and none is n
 - also: `tests/soak/cards.test.cc`, which crashed the same way and carries the PIN comment.
 - also: in `tests/cards`, clang-tidy's optional-access dataflow crashed every time on `(**first).name` (a member read
   through a dereferenced optional of a model-backed type); binding the member to a named reference first avoids it.
+- also: `tests/http/server.test.cc` (`read_error`): the same `(**first).name` shape, crashing every time under the
+  scribbling allocator; the member is bound by name.
 - also: `bench/ubench/lanes.cc` (`attention_on`, `deltanet_on`): crashed every time under the scribbling allocator
   (5 of 5 with `MallocScribble=1`, 0 of 5 without) because `attention_on` held results while reading fields of
   attention's device structs, whose header reaches the unit through two `engine.attn` partitions. the device params are

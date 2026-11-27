@@ -289,10 +289,16 @@ using ErrorReader = engine::json::Reader<engine::json::request_bounds>;
 	auto root = reader.read_copy(body);
 	auto outer = root ? root->as_object() : std::unexpected(root.error());
 	auto first = outer ? outer->next() : std::unexpected(outer.error());
-	if (!first || !*first || (**first).name != "error") {
+	if (!first || !*first) {
 		return std::nullopt;
 	}
-	auto inner = (**first).value.as_object();
+	/* PIN(clang-tidy-optional-merged-record): the member is bound by name; reading it through `(**first).name` crashes
+	   clang-tidy's optional-access analysis. */
+	auto& [root_name, root_value] = **first;
+	if (root_name != "error") {
+		return std::nullopt;
+	}
+	auto inner = root_value.as_object();
 	if (!inner) {
 		return std::nullopt;
 	}
