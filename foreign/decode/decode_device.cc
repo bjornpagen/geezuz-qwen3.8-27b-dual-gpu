@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // The persistent decode kernel as the host sees it: its ptx image and launch declaration, and the device headers it
-// shares with the host re-exported unchanged: what crosses the ring, the mask buffer and the logits buffer, the
-// workspace and shared layouts, the ranking's keys, and the cycle's walk. The kernel's budget is the very value it
-// `static_assert`s.
+// shares with the host re-exported unchanged: what crosses the ring, the mask buffer, the logits buffer and the
+// profile, the workspace and shared layouts, the ranking's keys, and the cycle's walk. The kernel's budget is the
+// very value it `static_assert`s.
 module;
 
 #include "decode/key.h"
+#include "decode/profile.h"
 #include "decode/shared.h"
 #include "decode/walk.h"
 #include "decode/wire.h"
@@ -37,7 +38,9 @@ export using device::MaskFlag;
 export using device::MaskHalf;
 export using device::Masks;
 export using device::Params;
+export using device::PhaseCounters;
 export using device::Point;
+export using device::Profile;
 export using device::Result;
 export using device::Shared;
 export using device::SlotOutcome;
@@ -60,6 +63,7 @@ export using device::max_committed;
 export using device::max_drafts;
 export using device::max_rows;
 export using device::no_candidate;
+export using device::profile_phases;
 export using device::ring_slots;
 export using device::row_tiles;
 export using device::row_token_bytes;
@@ -76,6 +80,7 @@ export using device::logits_half;
 export using device::mask_half;
 export using device::normalizes;
 export using device::ordered;
+export using device::profile_slot;
 export using device::ranked_rows;
 export using device::segments;
 export using device::walk_cycle;

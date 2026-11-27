@@ -784,6 +784,15 @@ struct CycleMasks {
 	});
 }
 
+/** The fake loops write no profile, as a kernel built without the profiler: the session has no table to give. */
+[[nodiscard]] auto unprofiled_loops_have_no_table() -> bool {
+	return with_loops(Honesty::Truthful, [](decode::Session& session, std::array<Seen, 2>& /*seen*/) {
+		auto random = engine::testing::generator(16);
+		auto const live = std::array{std::size_t{0}};
+		return run_cycle(session, live, random) && !session.profile(Card::Zero).has_value() && !session.profile(Card::One).has_value();
+	});
+}
+
 }
 
 auto main() -> int {
@@ -808,6 +817,7 @@ auto main() -> int {
 	    Case{.name = "a logits ticket hands back every token of both cards in token order, and forgets its slots (seed 2)",
 	         .holds = logits_tickets_hand_back_every_token(2)},
 	    Case{.name = "a shutdown collects a begun logits ticket and forgets its slots", .holds = shutdown_from_a_begun_logits_ticket()},
+	    Case{.name = "loops that wrote no profile give no table", .holds = unprofiled_loops_have_no_table()},
 	};
 	return engine::testing::report(cases);
 }

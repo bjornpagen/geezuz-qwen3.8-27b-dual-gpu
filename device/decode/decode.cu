@@ -7,6 +7,7 @@
 // ticket itself and, right before it ranks the lm_head's rows, the masks the host fills while the body streams. A
 // logits ticket runs the same verify pass and hands the lm_head's logits to the host where a cycle ranks them.
 #include "decode/machine.h"
+#include "decode/profile.h"
 #include "decode/tasks.h"
 #include "decode/walk.h"
 #include "decode/wire.h"
@@ -216,6 +217,158 @@ struct Runner {
 	}
 };
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The profile build's ticket: the same walk under a visitor that times every phase on every block and counts it into
+// the phase's slot of the card's profile, then the profile copied to the host. Nothing here runs in any other build.
+
+/** Each image phase's weight bytes on each card, as the schedule places them. */
+struct PhaseWeights {
+	unsigned long long bytes[model::cards][schedule::image_phases];
+};
+
+[[nodiscard]] consteval auto plan_phase_weights() -> PhaseWeights {
+	auto weights = PhaseWeights{};
+	for (Count card = 0; card < model::cards; ++card) {
+		auto const layout = schedule::image(card);
+		for (Count phase = 0; phase < schedule::image_phases; ++phase) {
+			weights.bytes[card][phase] = schedule::phase_bytes(layout, layout.phases[phase]);
+		}
+	}
+	return weights;
+}
+
+inline constexpr PhaseWeights phase_weights = plan_phase_weights();
+
+/** Bytes a phase streams by its shape: its weights on this card, and for a core the state or kv its rows read. */
+[[nodiscard]] __attribute__((device)) inline auto streamed(Machine const& machine, Step step, Pass pass, Count image_phase) -> unsigned long long {
+	unsigned long long bytes = phase_weights.bytes[machine.params.card][image_phase];
+	if (step.op == Op::DeltanetCore || step.op == Op::AttentionCore) {
+		PassRows const rows = pass_rows(machine, pass);
+		for (unsigned live = 0; live < rows.cycle.live; ++live) {
+			attn::SlotWork const& work = rows.cycle.work[live];
+			bytes += step.op == Op::DeltanetCore ? schedule::deltanet_state_bytes_per_layer_per_slot
+			                                     : Count{work.position + work.rows} * schedule::kv_bytes_per_position_per_layer;
+		}
+	}
+	return bytes;
+}
+
+/**
+ * Raises a 64-bit counter on this card to at least `value`; relaxed, and order-free like a sum, so concurrent raises
+ * from every block land in any order.
+ */
+__attribute__((device, always_inline)) inline void raise(unsigned long long* counter, unsigned long long value) {
+	static_cast<void>(__nvvm_atom_max_gen_ull(counter, value));
+}
+
+/** No phase is open: before a walk's first phase and after its end. */
+inline constexpr Count no_phase = profile_phases;
+
+/** The kernel's own visitor, every phase timed on each block by its thread 0 and counted into the phase's slot. */
+struct Timed {
+	Runner const* runner;
+	Control* control;
+	Count slot;
+	unsigned long long entered;
+
+	__attribute__((device)) void phase(Step step, Pass pass, Count image_phase, Count phase_tiles) {
+		close();
+		slot = profile_slot(pass, image_phase);
+		entered = prims::cycles();
+		if (prims::block() == 0 && prims::thread_in_block() == 0) {
+			PhaseCounters& counters = control->profile.phase[slot];
+			prims::accumulate(&counters.visits, 1);
+			prims::accumulate(&counters.bytes, streamed(*runner->machine, step, pass, image_phase));
+		}
+		runner->phase(step, pass, image_phase, phase_tiles);
+	}
+
+	__attribute__((device)) void task(Point const& point) const {
+		runner->task(point);
+	}
+
+	__attribute__((device)) void barrier() const {
+		unsigned long long const since = prims::cycles();
+		runner->barrier();
+		if (prims::thread_in_block() == 0) {
+			prims::accumulate(&control->profile.phase[slot].barrier, prims::cycles() - since);
+		}
+	}
+
+	/**
+	 * Ends the open phase on this block: its time in the phase, and the waits its warps noted, into the phase's
+	 * counters. A phase ends right after the barrier closing its last task, which ordered every warp's notes before it.
+	 */
+	__attribute__((device)) void close() {
+		if (slot == no_phase) {
+			return;
+		}
+		if (prims::thread_in_block() == 0) {
+			unsigned long long const spent = prims::cycles() - entered;
+			PhaseCounters& counters = control->profile.phase[slot];
+			prims::accumulate(&counters.cycles, spent);
+			raise(&counters.slowest, spent);
+			raise(&counters.fastest_complement, ~spent);
+			BlockWaits& waits = control->waits[prims::block()];
+			prims::accumulate(&counters.peer, prims::load_relaxed<prims::Scope::Gpu>(&waits.peer));
+			prims::accumulate(&counters.masks, prims::load_relaxed<prims::Scope::Gpu>(&waits.masks));
+			prims::store_relaxed<prims::Scope::Gpu>(&waits.peer, 0);
+			prims::store_relaxed<prims::Scope::Gpu>(&waits.masks, 0);
+		}
+		slot = no_phase;
+	}
+};
+
+/**
+ * A profile build's ticket: the walk under `Timed`, block 0's cycles and nanoseconds over it (the SM clock's rate), and
+ * then, once every block has counted, the card's profile copied by block 0 into the host's buffer before it answers.
+ */
+__attribute__((device)) inline void walk_timed(Machine const& machine, Runner const& runner, Grid grid) {
+	Descriptor const& descriptor = machine.descriptor();
+	if (descriptor.work == Work::Apply) {
+		return;
+	}
+	auto* const control = at<Control>(machine.params.control);
+	Timed timed = {.runner = &runner, .control = control, .slot = no_phase, .entered = 0};
+	unsigned long long const first_cycle = prims::cycles();
+	unsigned long long const first_nanosecond = now();
+	switch (descriptor.work) {
+	case Work::Apply:
+		break;
+	case Work::Cycle:
+		walk_cycle(descriptor.depth, timed);
+		break;
+	case Work::PromptEnd:
+		walk_prompt_end(descriptor.depth, timed);
+		break;
+	case Work::Logits:
+		walk_logits(timed);
+		break;
+	}
+	timed.close();
+	unsigned long long const cycles = prims::cycles() - first_cycle;
+	unsigned long long const nanoseconds = now() - first_nanosecond;
+	grid.sync(prims::remote_backoff);
+	if (prims::block() != 0) {
+		return;
+	}
+	if (prims::thread_in_block() == 0) {
+		prims::accumulate(&control->profile.tickets, 1);
+		prims::accumulate(&control->profile.ticket_cycles, cycles);
+		prims::accumulate(&control->profile.ticket_nanoseconds, nanoseconds);
+	}
+	prims::sync_block();
+	auto const once = prims::policy<Eviction::First>();
+	auto const written = prims::policy<Eviction::Normal>();
+	/* SAFETY: the profile is whole chunks, in the control block and in the host's buffer alike. */
+	auto const* from = reinterpret_cast<Chunk const*>(&control->profile);
+	auto* to = at<Chunk>(prims::load_relaxed<prims::Scope::Gpu>(&control->profile_buffer.word));
+	for (Count chunk = prims::thread_in_block(); chunk < sizeof(Profile) / 16; chunk += static_cast<Count>(decode_budget.threads)) {
+		prims::store(to + chunk, prims::load(from + chunk, once), written);
+	}
+	prims::sync_block();
+}
+
 static_assert(ring::Layout<Descriptor, Result>::descriptor % 16 == 0, "the descriptor copies in whole chunks");
 static_assert(sizeof(Result) % 4 == 0 && sizeof(SlotOutcome) % 4 == 0, "the result copies in whole words");
 
@@ -298,19 +451,23 @@ decode_loop(decode::Params params) {
 			return;
 		}
 		apply_commands(machine, shared, grid);
-		Descriptor const& descriptor = machine.descriptor();
-		switch (descriptor.work) {
-		case Work::Apply:
-			break;
-		case Work::Cycle:
-			walk_cycle(descriptor.depth, runner);
-			break;
-		case Work::PromptEnd:
-			walk_prompt_end(descriptor.depth, runner);
-			break;
-		case Work::Logits:
-			walk_logits(runner);
-			break;
+		if constexpr (engine::device::profiler == engine::device::Profiler::On) {
+			walk_timed(machine, runner, grid);
+		} else {
+			Descriptor const& descriptor = machine.descriptor();
+			switch (descriptor.work) {
+			case Work::Apply:
+				break;
+			case Work::Cycle:
+				walk_cycle(descriptor.depth, runner);
+				break;
+			case Work::PromptEnd:
+				walk_prompt_end(descriptor.depth, runner);
+				break;
+			case Work::Logits:
+				walk_logits(runner);
+				break;
+			}
 		}
 		if (prims::block() == 0 && prims::thread_in_block() == 0) {
 			answer(machine, epochs.ticket, started);

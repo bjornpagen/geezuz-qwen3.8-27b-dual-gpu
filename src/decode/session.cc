@@ -23,6 +23,7 @@ import engine.vocabulary;
 import :commands;
 import :error;
 import :ledger;
+import :profile;
 
 namespace engine::decode {
 
@@ -35,6 +36,8 @@ export using Ring = device::Ring<Descriptor, Result, decode_device::ring_slots>;
 export using MaskBuffer = device::MappedArray<decode_device::Masks, 1>;
 /** Each card's logits buffer: two halves by ticket parity, each a logits ticket's rows in the card's row order. */
 export using LogitsMemory = device::MappedArray<decode_device::LogitsBuffer, 1>;
+/** Each card's profile, as a profile build's kernel copies it after every ticket; zero in any other build. */
+export using ProfileBuffer = device::MappedArray<decode_device::Profile, 1>;
 
 static_assert(model::card_mask_words * 2 == decode_device::mask_words, "a host word is two of the card's words, low first");
 
@@ -80,6 +83,7 @@ export struct HostAddresses {
 	std::uint64_t ring;
 	std::uint64_t masks;
 	std::uint64_t logits;
+	std::uint64_t profile;
 };
 
 /**
@@ -217,20 +221,28 @@ public:
 		auto logits_one = logits_zero.and_then([&](LogitsMemory const&) {
 			return devices.context(model::Card::One).allocate_mapped<decode_device::LogitsBuffer, 1>();
 		});
-		if (!logits_one) {
-			return fail(logits_one.error());
+		auto profile_zero = logits_one.and_then([&](LogitsMemory const&) {
+			return devices.context(model::Card::Zero).allocate_mapped<decode_device::Profile, 1>();
+		});
+		auto profile_one = profile_zero.and_then([&](ProfileBuffer const&) {
+			return devices.context(model::Card::One).allocate_mapped<decode_device::Profile, 1>();
+		});
+		if (!profile_one) {
+			return fail(profile_one.error());
 		}
 		return Session{
 		    {std::move(*zero), std::move(*one)},
 		    {std::move(*masks_zero), std::move(*masks_one)},
 		    {std::move(*logits_zero), std::move(*logits_one)},
+		    {std::move(*profile_zero), std::move(*profile_one)},
 		};
 	}
 
 	[[nodiscard]] auto addresses(model::Card card) const -> HostAddresses {
 		return {.ring = rings_.at(card_index(card)).device_address(),
 		        .masks = masks_.at(card_index(card)).device_address(),
-		        .logits = logits_.at(card_index(card)).device_address()};
+		        .logits = logits_.at(card_index(card)).device_address(),
+		        .profile = profiles_.at(card_index(card)).device_address()};
 	}
 
 	/**
@@ -531,6 +543,15 @@ public:
 		return {};
 	}
 
+	/**
+	 * Card `card`'s per-phase profile since the engine opened, as of the last ticket answered; none when no profiled
+	 * ticket ran (any build but the profile build). Read with no ticket in flight, so no copy is half written.
+	 */
+	[[nodiscard]] auto profile(model::Card card) const -> std::optional<ProfileTable> {
+		core::invariant(outgoing_.empty() && awaited_.empty());
+		return profile_table(profiles_.at(card_index(card)).host()[0]);
+	}
+
 	/** The card's mask buffer as the host wrote it. */
 	[[nodiscard]] auto masks(model::Card card) const -> decode_device::Masks const& {
 		return masks_.at(card_index(card)).host()[0];
@@ -541,10 +562,12 @@ public:
 	}
 
 private:
-	Session(std::array<Ring, model::cards> rings, std::array<MaskBuffer, model::cards> masks, std::array<LogitsMemory, model::cards> logits)
+	Session(std::array<Ring, model::cards> rings, std::array<MaskBuffer, model::cards> masks, std::array<LogitsMemory, model::cards> logits,
+	        std::array<ProfileBuffer, model::cards> profiles)
 	    : rings_{std::move(rings)},
 	      masks_{std::move(masks)},
 	      logits_{std::move(logits)},
+	      profiles_{std::move(profiles)},
 	      row_tokens_{vocabulary::row_tokens(model::Card::Zero), vocabulary::row_tokens(model::Card::One)},
 	      descriptor_{std::make_unique<Descriptor>()},
 	      begun_descriptor_{std::make_unique<Descriptor>()} {}
@@ -795,6 +818,7 @@ private:
 	std::array<Ring, model::cards> rings_;
 	std::array<MaskBuffer, model::cards> masks_;
 	std::array<LogitsMemory, model::cards> logits_;
+	std::array<ProfileBuffer, model::cards> profiles_;
 	/** Each card's lm_head row-to-token table, for putting a logits ticket's halves back in token order. */
 	std::array<std::vector<vocabulary::Token>, model::cards> row_tokens_;
 	/** Descriptor staging, 8.7 KB each: a command-only ticket's, built as it is submitted, and the begun ticket's. */

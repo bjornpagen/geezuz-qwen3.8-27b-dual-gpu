@@ -702,7 +702,7 @@ struct WorkspacePlan {
 inline constexpr WorkspacePlan workspace_plan = {
     .decode = 210'562'560,
     .row_tokens = vocab_per_card * sizeof(unsigned),
-    .control = 384,
+    .control = 30'208,
     .prefill = 460'775'424,
 };
 

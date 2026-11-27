@@ -140,20 +140,24 @@ template<device::Wire T, std::size_t Count>
 	return {};
 }
 
-/** Zeroes a card's control block, the words its loop must find zero when it starts. */
+/**
+ * Zeroes a card's control block, the words its loop must find zero when it starts, all but the address of the host's
+ * profile buffer, where a profile build's kernel copies its counters.
+ */
 [[nodiscard]] auto zero_control(device::Context const& context, model::Card card, device::Stream const& stream, Control control,
-                                std::chrono::steady_clock::time_point deadline) -> core::Result<Control, DecodeError> {
+                                std::uint64_t profile, std::chrono::steady_clock::time_point deadline) -> core::Result<Control, DecodeError> {
 	auto staged = context.allocate_mapped<device_layout::Control, 1>();
 	if (!staged) {
 		return fail(staged.error());
 	}
+	staged->host()[0].profile_buffer.word = profile;
 	return finish(context.upload(stream, std::move(control), std::move(*staged), 0), deadline, TimedOut{.card = card, .waiting = Waiting::Control});
 }
 
 /** Opens, verifies and copies one card's image, and allocates and fills the rest of the card's memories. */
 template<image::Catalog C>
 [[nodiscard]] auto load_card(device::Context const& context, model::Card card, std::filesystem::path const& path, image::Checkpoint const& checkpoint,
-                             std::chrono::steady_clock::time_point deadline) -> core::Result<Card<C>, DecodeError> {
+                             std::uint64_t profile, std::chrono::steady_clock::time_point deadline) -> core::Result<Card<C>, DecodeError> {
 	auto opened = image::Image<C>::open(path, checkpoint);
 	if (!opened) {
 		return fail(Unloadable{.image = card == model::Card::Zero ? ImageOf::CardZero : ImageOf::CardOne, .error = opened.error()});
@@ -186,7 +190,7 @@ template<image::Catalog C>
 	if (!allocated) {
 		return fail(allocated.error());
 	}
-	auto control = zero_control(context, card, *stream, std::move(*allocated), deadline);
+	auto control = zero_control(context, card, *stream, std::move(*allocated), profile, deadline);
 	if (!control) {
 		return std::unexpected(control.error());
 	}
@@ -292,17 +296,20 @@ public:
 			return fail(host.error());
 		}
 		std::ranges::copy(host_image->payload(), host->host().begin());
-		auto zero = load_card<typename C::CardZero>(devices.context(model::Card::Zero), model::Card::Zero, paths.card_zero, checkpoint, deadline);
-		if (!zero) {
-			return std::unexpected(zero.error());
-		}
-		auto one = load_card<typename C::CardOne>(devices.context(model::Card::One), model::Card::One, paths.card_one, checkpoint, deadline);
-		if (!one) {
-			return std::unexpected(one.error());
-		}
+		// The session's buffers come first: each card's control block names its profile buffer.
 		auto session = Session::create(devices);
 		if (!session) {
 			return std::unexpected(session.error());
+		}
+		auto zero = load_card<typename C::CardZero>(devices.context(model::Card::Zero), model::Card::Zero, paths.card_zero, checkpoint,
+		                                            session->addresses(model::Card::Zero).profile, deadline);
+		if (!zero) {
+			return std::unexpected(zero.error());
+		}
+		auto one = load_card<typename C::CardOne>(devices.context(model::Card::One), model::Card::One, paths.card_one, checkpoint,
+		                                          session->addresses(model::Card::One).profile, deadline);
+		if (!one) {
+			return std::unexpected(one.error());
 		}
 		return Engine{std::move(devices), std::move(*host), std::move(*zero), std::move(*one), std::move(*session)};
 	}
@@ -531,6 +538,14 @@ public:
 		auto const gave_up = *ended ? std::nullopt : core::alternative<Abandoned>(ended->error().reason);
 		return end(Loops::Abandoned,
 		           DecodeError{.reason = Abandoned{.ticket = gave_up ? gave_up->ticket : std::nullopt, .kernels = Kernels::MayRun}});
+	}
+
+	/**
+	 * Card `card`'s per-phase profile since the engine opened; none unless this is a profile build and a ticket ran.
+	 * Read with no ticket in flight: between a completion and the next begin, or with the loops stopped.
+	 */
+	[[nodiscard]] auto profile(model::Card card) const -> std::optional<ProfileTable> {
+		return session_.profile(card);
 	}
 
 	[[nodiscard]] auto session() const -> Session const& {

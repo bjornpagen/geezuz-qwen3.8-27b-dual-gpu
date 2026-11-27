@@ -7,8 +7,10 @@
 // standard headers so that it compiles unchanged as device code and inside a module purview.
 #pragma once
 
+#include "decode/profile.h"
 #include "model.h"
 #include "sampling/draw.h"
+#include "schedule/geometry.h"
 #include "schedule/program.h"
 
 namespace engine::device::decode {
@@ -190,8 +192,9 @@ struct LogitsBuffer {
 static_assert(model::vocab_per_card * sizeof(float) % 16 == 0, "a row of logits copies in whole chunks");
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The control block, zeroed once when the engine opens: a loop that exits leaves its barrier's arrivals at zero, its
-// generation may stand anywhere, and each launch meets the peer on its own epoch, so a relaunch needs no zeroing.
+// The control block, zeroed once when the engine opens (all but the profile buffer's address): a loop that exits leaves
+// its barrier's arrivals at zero, its generation may stand anywhere, and each launch meets the peer on its own epoch, so
+// a relaunch needs no zeroing. A profile build's counters accumulate over every launch.
 
 struct alignas(128) Line {
 	unsigned long long word;
@@ -207,6 +210,11 @@ struct Control {
 	Line generation;
 	/** Written by the peer card once it has cleared its own flags: the cards meet here before serving tickets. */
 	Line peer_ready;
+	/** The host's mapped profile buffer, as a device address the host writes at open: where a profile build copies to. */
+	Line profile_buffer;
+	/** A profile build's counters, and each block's waits within its phase; no other build's kernel touches them. */
+	Profile profile;
+	BlockWaits waits[schedule::sms];
 };
 
 // ---------------------------------------------------------------------------------------------------------------------

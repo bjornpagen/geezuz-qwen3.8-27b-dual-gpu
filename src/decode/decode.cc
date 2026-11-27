@@ -9,5 +9,6 @@ export module engine.decode;
 export import :error;
 export import :ledger;
 export import :commands;
+export import :profile;
 export import :session;
 export import :engine;

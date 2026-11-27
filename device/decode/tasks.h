@@ -432,6 +432,17 @@ __attribute__((device, always_inline)) inline void placement(Machine const& mach
 }
 
 /**
+ * A profile build's wait that began at cycle `since`, added to this block's waits of `kind` once per waiting warp; the
+ * phase's end moves the block's waits into the phase's counters.
+ */
+template<unsigned long long BlockWaits::*kind>
+__attribute__((device, always_inline)) inline void note_wait(Machine const& machine, unsigned long long since) {
+	if (prims::lane() == 0) {
+		prims::accumulate(&(at<Control>(machine.params.control)->waits[prims::block()].*kind), prims::cycles() - since);
+	}
+}
+
+/**
  * After an exchange phase's matmul: for each output tile this SM finished, the peer's partial is awaited and both
  * cards' sums meet the residual, one consumer warp per tile.
  */
@@ -454,8 +465,15 @@ __attribute__((device, always_inline)) inline void meet(Machine const& machine, 
 			continue;
 		}
 		if (finished % static_cast<unsigned>(Consumers::count) == Consumers::rank(g.warp)) {
-			prims::EpochReader<prims::Scope::System>{.flag = machine.local<unsigned long long const>(partial_flag_offset(exchange, tile))}.await(
-			    exchange.epoch, prims::remote_backoff);
+			if constexpr (profiler == Profiler::On) {
+				unsigned long long const since = prims::cycles();
+				prims::EpochReader<prims::Scope::System>{.flag = machine.local<unsigned long long const>(partial_flag_offset(exchange, tile))}.await(
+				    exchange.epoch, prims::remote_backoff);
+				note_wait<&BlockWaits::peer>(machine, since);
+			} else {
+				prims::EpochReader<prims::Scope::System>{.flag = machine.local<unsigned long long const>(partial_flag_offset(exchange, tile))}.await(
+				    exchange.epoch, prims::remote_backoff);
+			}
 			auto const* own = machine.local<Chunk const>(workspace.own_partials) + Count{tile} * static_cast<Count>(S::fixup_floats / 4);
 			auto const* peer = machine.local<Chunk const>(partial_tile_offset(exchange, tile));
 			float* const tile_squares_out = machine.local<float>(squares) + Count{tile} * max_rows;
@@ -954,7 +972,13 @@ __attribute__((device)) inline void hand_logits(Machine const& machine, unsigned
 __attribute__((device)) inline void await_masks(Machine const& machine, unsigned long long ticket) {
 	if (prims::thread_in_block() == 0) {
 		auto* masks = at<Masks>(machine.params.masks);
-		prims::EpochReader<prims::Scope::System>{.flag = &masks->flag[mask_half(ticket)].ticket}.await(ticket, prims::remote_backoff);
+		if constexpr (profiler == Profiler::On) {
+			unsigned long long const since = prims::cycles();
+			prims::EpochReader<prims::Scope::System>{.flag = &masks->flag[mask_half(ticket)].ticket}.await(ticket, prims::remote_backoff);
+			note_wait<&BlockWaits::masks>(machine, since);
+		} else {
+			prims::EpochReader<prims::Scope::System>{.flag = &masks->flag[mask_half(ticket)].ticket}.await(ticket, prims::remote_backoff);
+		}
 	}
 	prims::sync_block();
 }
@@ -1091,8 +1115,15 @@ __attribute__((device)) inline void exchange_candidates(Machine const& machine, 
 		if (prims::block() == 0) {
 			prims::EpochWriter<prims::Scope::System>{.flag = machine.peer<unsigned long long>(candidate_flag(slot))}.publish(epochs.candidates);
 		}
-		prims::EpochReader<prims::Scope::System>{.flag = machine.local<unsigned long long const>(candidate_flag(slot))}.await(
-		    epochs.candidates, prims::remote_backoff);
+		if constexpr (profiler == Profiler::On) {
+			unsigned long long const since = prims::cycles();
+			prims::EpochReader<prims::Scope::System>{.flag = machine.local<unsigned long long const>(candidate_flag(slot))}.await(
+			    epochs.candidates, prims::remote_backoff);
+			note_wait<&BlockWaits::peer>(machine, since);
+		} else {
+			prims::EpochReader<prims::Scope::System>{.flag = machine.local<unsigned long long const>(candidate_flag(slot))}.await(
+			    epochs.candidates, prims::remote_backoff);
+		}
 	}
 	prims::sync_block();
 }
